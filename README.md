@@ -1,2 +1,30 @@
+# central-gps-api
 
-## pip install -r requirements.txt
+`central-gps-api` es una API REST desarrollada con Flask y PostgreSQL, actualmente en esta versión cuenta con la autenticación de usuarios.
+
+Actualmente, el proyecto ya cuenta con rutas para consulta de usuarios y autenticación inicial mediante login.
+
+---
+
+## Características actuales
+
+- API REST construida con Flask
+- Conexión a PostgreSQL
+- Configuración mediante variables de entorno
+- Endpoint de verificación de estado
+- Endpoint para consulta de usuarios
+- Endpoint para autenticación de usuarios
+
+---
+
+## Requisitos
+
+- Python 3.10+
+- PostgreSQL
+- pip
+
+## Instalación
+
+```bash
+pip install -r requirements.txt
+```
