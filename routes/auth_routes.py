@@ -1,5 +1,5 @@
 from flask import Blueprint, jsonify, request
-from services.auth_services import authenticate_user
+from services.auth_service import authenticate_user
 
 auth_bp = Blueprint("auth", __name__)
 
@@ -12,8 +12,8 @@ def login():
         if not data:
             return jsonify({"error": "El cuerpo de la solicitud es requerido"}), 400
 
-        username = data.get("usuario")
-        password = data.get("clave")
+        username = data.get("username")
+        password = data.get("password")
 
         if not username or not password:
             return jsonify({"error": "Faltan credenciales"}), 400

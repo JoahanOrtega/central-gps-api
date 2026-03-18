@@ -10,14 +10,18 @@ def authenticate_user(username, password):
         connection = get_db_connection()
         cursor = connection.cursor()
 
-        query = 'SELECT id, "usuario", clave FROM t_usuarios WHERE "usuario" = %s;'
+        query = """
+            SELECT id, usuario, clave
+            FROM t_usuarios
+            WHERE usuario = %s;
+        """
         cursor.execute(query, (username,))
         row = cursor.fetchone()
 
         if not row:
             return None, "Usuario no encontrado"
 
-        user_id, db_user, stored_password_hash = row
+        user_id, db_username, stored_password_hash = row
         calculated_password_hash = hashlib.md5(
             password.encode("utf-8")
         ).hexdigest()
@@ -27,7 +31,7 @@ def authenticate_user(username, password):
 
         return {
             "id": user_id,
-            "username": db_user
+            "username": db_username
         }, None
 
     finally:

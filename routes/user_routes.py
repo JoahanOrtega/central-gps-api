@@ -13,12 +13,12 @@ def get_users():
         connection = get_db_connection()
         cursor = connection.cursor()
 
-        query = 'SELECT id, "user" FROM t_usuarios;'
+        query = "SELECT id, usuario FROM t_usuarios;"
         cursor.execute(query)
 
         rows = cursor.fetchall()
 
-        users = [{"id": row[0], "user": row[1]} for row in rows]
+        users = [{"id": row[0], "username": row[1]} for row in rows]
 
         return jsonify(users), 200
 

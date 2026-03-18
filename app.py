@@ -1,12 +1,13 @@
 from flask import Flask
 from flask_cors import CORS
-from routes import auth_bp, users_bp
+from routes import auth_bp, users_bp, units_bp
 
 app = Flask(__name__)
 CORS(app)
 
 app.register_blueprint(auth_bp)
 app.register_blueprint(users_bp)
+app.register_blueprint(units_bp)
 
 
 @app.route("/", methods=["GET"])
