@@ -12,8 +12,8 @@ def login():
         if not data:
             return jsonify({"error": "El cuerpo de la solicitud es requerido"}), 400
 
-        username = data.get("username")
-        password = data.get("password")
+        username = data.get("usuario")
+        password = data.get("clave")
 
         if not username or not password:
             return jsonify({"error": "Faltan credenciales"}), 400

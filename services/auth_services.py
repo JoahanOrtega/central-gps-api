@@ -10,7 +10,7 @@ def authenticate_user(username, password):
         connection = get_db_connection()
         cursor = connection.cursor()
 
-        query = 'SELECT id, "user", password FROM t_usuarios WHERE "user" = %s;'
+        query = 'SELECT id, "usuario", clave FROM t_usuarios WHERE "usuario" = %s;'
         cursor.execute(query, (username,))
         row = cursor.fetchone()
 
