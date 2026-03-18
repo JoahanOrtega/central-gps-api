@@ -16,9 +16,12 @@ def login():
         password = data.get("password")
 
         if not username or not password:
-            return jsonify({"error": "Usuario y contraseña son requeridos"}), 400
+            return jsonify({"error": "Faltan credenciales"}), 400
 
         user, error = authenticate_user(username, password)
+
+        if error == "Usuario no encontrado":
+            return jsonify({"error": error}), 404
 
         if error:
             return jsonify({"error": error}), 401

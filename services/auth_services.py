@@ -1,3 +1,4 @@
+import hashlib
 from db.connection import get_db_connection
 
 
@@ -9,17 +10,20 @@ def authenticate_user(username, password):
         connection = get_db_connection()
         cursor = connection.cursor()
 
-        query = 'SELECT id, "user", password FROM t_users WHERE "user" = %s;'
+        query = 'SELECT id, "user", password FROM t_usuarios WHERE "user" = %s;'
         cursor.execute(query, (username,))
         row = cursor.fetchone()
 
         if not row:
-            return None, "Credenciales incorrectas"
+            return None, "Usuario no encontrado"
 
-        user_id, db_user, db_password = row
+        user_id, db_user, stored_password_hash = row
+        calculated_password_hash = hashlib.md5(
+            password.encode("utf-8")
+        ).hexdigest()
 
-        if password != db_password:
-            return None, "Credenciales incorrectas"
+        if calculated_password_hash != stored_password_hash:
+            return None, "Credenciales inválidas"
 
         return {
             "id": user_id,

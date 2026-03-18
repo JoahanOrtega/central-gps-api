@@ -13,7 +13,7 @@ def get_users():
         connection = get_db_connection()
         cursor = connection.cursor()
 
-        query = 'SELECT id, "user" FROM t_users;'
+        query = 'SELECT id, "user" FROM t_usuarios;'
         cursor.execute(query)
 
         rows = cursor.fetchall()
