@@ -1,5 +1,6 @@
 import hashlib
-from db.connection import get_db_connection
+from db.connection import get_main_db_connection
+from utils.jwt_handler import generate_jwt
 
 
 def authenticate_user(username, password):
@@ -7,7 +8,7 @@ def authenticate_user(username, password):
     cursor = None
 
     try:
-        connection = get_db_connection()
+        connection = get_main_db_connection()
         cursor = connection.cursor()
 
         query = """
@@ -19,20 +20,19 @@ def authenticate_user(username, password):
         row = cursor.fetchone()
 
         if not row:
-            return None, "Usuario no encontrado"
+            return None, None, "Usuario no encontrado"
 
         user_id, db_username, stored_password_hash = row
-        calculated_password_hash = hashlib.md5(
-            password.encode("utf-8")
-        ).hexdigest()
+        calculated_password_hash = hashlib.md5(password.encode("utf-8")).hexdigest()
 
         if calculated_password_hash != stored_password_hash:
-            return None, "Credenciales inválidas"
+            return None, None, "Credenciales inválidas"
 
-        return {
-            "id": user_id,
-            "username": db_username
-        }, None
+        user = {"id": user_id, "username": db_username}
+
+        token = generate_jwt(user)
+
+        return user, token, None
 
     finally:
         if cursor:

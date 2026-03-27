@@ -4,7 +4,12 @@ from routes import auth_bp, users_bp, units_bp
 from routes.poi_routes import poi_bp
 
 app = Flask(__name__)
-CORS(app)
+
+CORS(
+    app,
+    resources={r"/*": {"origins": ["http://localhost:5173", "http://127.0.0.1:5173"]}},
+    supports_credentials=False,
+)
 
 app.register_blueprint(auth_bp)
 app.register_blueprint(users_bp)

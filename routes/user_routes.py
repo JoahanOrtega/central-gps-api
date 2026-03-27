@@ -1,10 +1,13 @@
 from flask import Blueprint, jsonify
 from db.connection import get_db_connection
+from utils.auth_guard import jwt_required
 
 users_bp = Blueprint("users", __name__)
 
 
 @users_bp.route("/users", methods=["GET"])
+# ruta protegida
+# @jwt_required
 def get_users():
     connection = None
     cursor = None

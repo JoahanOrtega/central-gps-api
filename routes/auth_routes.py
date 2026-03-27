@@ -26,10 +26,16 @@ def login():
         if error:
             return jsonify({"error": error}), 401
 
-        return jsonify({
-            "message": "Login correcto",
-            "user": user
-        }), 200
+        return (
+            jsonify(
+                {
+                    "message": "Login correcto",
+                    "token": "temporary-session-token",
+                    "user": user,
+                }
+            ),
+            200,
+        )
 
     except Exception as error:
         return jsonify({"error": str(error)}), 500
