@@ -1,0 +1,50 @@
+from flask import Blueprint, jsonify, request
+from services.telemetry_service import (
+    get_latest_position_by_imei,
+    get_positions_history_by_imei,
+)
+from utils.auth_guard import jwt_required
+
+telemetry_bp = Blueprint("telemetry", __name__)
+
+
+@telemetry_bp.route("/telemetry/latest/<string:imei>", methods=["GET"])
+# @jwt_required
+def get_latest_telemetry(imei):
+    try:
+        result = get_latest_position_by_imei(imei)
+
+        if not result:
+            return (
+                jsonify({"error": "No se encontró telemetría para el IMEI indicado"}),
+                404,
+            )
+
+        return jsonify(result), 200
+
+    except Exception as error:
+        print("ERROR EN /telemetry/latest:", error)
+        return jsonify({"error": "Error interno del servidor"}), 500
+
+
+@telemetry_bp.route("/telemetry/history/<string:imei>", methods=["GET"])
+# @jwt_required
+def get_telemetry_history(imei):
+    try:
+        start_date = request.args.get("start")
+        end_date = request.args.get("end")
+        limit = request.args.get("limit", default=500, type=int)
+
+        if not start_date or not end_date:
+            return jsonify({"error": "Los parámetros start y end son requeridos"}), 400
+
+        if limit <= 0 or limit > 2000:
+            return jsonify({"error": "El límite debe estar entre 1 y 2000"}), 400
+
+        result = get_positions_history_by_imei(imei, start_date, end_date, limit)
+
+        return jsonify(result), 200
+
+    except Exception as error:
+        print("ERROR EN /telemetry/history:", error)
+        return jsonify({"error": "Error interno del servidor"}), 500

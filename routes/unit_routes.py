@@ -1,10 +1,12 @@
 from flask import Blueprint, jsonify, request
 from services.unit_service import get_units, create_unit
+from utils.auth_guard import jwt_required
 
 units_bp = Blueprint("units", __name__)
 
 
 @units_bp.route("/units", methods=["GET"])
+@jwt_required
 def list_units():
     try:
         search = request.args.get("search", "").strip()
@@ -38,10 +40,15 @@ def create_new_unit():
         missing_fields = [field for field in required_fields if not data.get(field)]
 
         if missing_fields:
-            return jsonify({
-                "error": "Faltan campos requeridos",
-                "missingFields": missing_fields
-            }), 400
+            return (
+                jsonify(
+                    {
+                        "error": "Faltan campos requeridos",
+                        "missingFields": missing_fields,
+                    }
+                ),
+                400,
+            )
 
         payload = {
             "id_empresa": 2,
@@ -65,7 +72,9 @@ def create_new_unit():
             "telefono_aseguradora": data.get("telefono_aseguradora"),
             "no_poliza_seguro": data.get("no_poliza_seguro"),
             "vigencia_poliza_seguro": data.get("vigencia_poliza_seguro"),
-            "vigencia_verificacion_vehicular": data.get("vigencia_verificacion_vehicular"),
+            "vigencia_verificacion_vehicular": data.get(
+                "vigencia_verificacion_vehicular"
+            ),
             "input1": data.get("input1"),
             "input2": data.get("input2"),
             "input3": data.get("input3"),
@@ -82,10 +91,7 @@ def create_new_unit():
 
         result = create_unit(payload)
 
-        return jsonify({
-            "message": "Unidad creada correctamente",
-            "unit": result
-        }), 201
+        return jsonify({"message": "Unidad creada correctamente", "unit": result}), 201
 
     except Exception as error:
         return jsonify({"error": str(error)}), 500
