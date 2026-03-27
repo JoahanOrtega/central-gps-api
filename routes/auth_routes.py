@@ -1,10 +1,12 @@
 from flask import Blueprint, jsonify, request
 from services.auth_service import authenticate_user
+from utils.auth_guard import jwt_required
 
 auth_bp = Blueprint("auth", __name__)
 
 
 @auth_bp.route("/login", methods=["POST"])
+# @jwt_required
 def login():
     try:
         data = request.get_json(silent=True)
