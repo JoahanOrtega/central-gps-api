@@ -2,6 +2,8 @@ from flask import Blueprint, jsonify, request
 from services.telemetry_service import (
     get_latest_position_by_imei,
     get_positions_history_by_imei,
+    get_route_by_mode,
+    get_recent_trips_by_imei,
 )
 from utils.auth_guard import jwt_required
 
@@ -9,7 +11,7 @@ telemetry_bp = Blueprint("telemetry", __name__)
 
 
 @telemetry_bp.route("/telemetry/latest/<string:imei>", methods=["GET"])
-# @jwt_required
+@jwt_required
 def get_latest_telemetry(imei):
     try:
         result = get_latest_position_by_imei(imei)
@@ -23,12 +25,12 @@ def get_latest_telemetry(imei):
         return jsonify(result), 200
 
     except Exception as error:
-        print("ERROR EN /telemetry/latest:", error)
+        print("ERROR EN /telemetry/latest:", repr(error))
         return jsonify({"error": "Error interno del servidor"}), 500
 
 
 @telemetry_bp.route("/telemetry/history/<string:imei>", methods=["GET"])
-# @jwt_required
+@jwt_required
 def get_telemetry_history(imei):
     try:
         start_date = request.args.get("start")
@@ -46,5 +48,34 @@ def get_telemetry_history(imei):
         return jsonify(result), 200
 
     except Exception as error:
-        print("ERROR EN /telemetry/history:", error)
+        print("ERROR EN /telemetry/history:", repr(error))
+        return jsonify({"error": "Error interno del servidor"}), 500
+
+
+@telemetry_bp.route("/telemetry/route/<string:imei>", methods=["GET"])
+@jwt_required
+def get_route(imei):
+    try:
+        mode = request.args.get("mode", "").strip()
+
+        if mode not in ("latest", "today", "yesterday", "day_before_yesterday"):
+            return jsonify({"error": "El parámetro mode no es válido"}), 400
+
+        result = get_route_by_mode(imei, mode)
+        return jsonify(result), 200
+
+    except Exception as error:
+        print("ERROR EN /telemetry/route:", repr(error))
+        return jsonify({"error": "Error interno del servidor"}), 500
+
+
+@telemetry_bp.route("/telemetry/recent-trips/<string:imei>", methods=["GET"])
+@jwt_required
+def get_recent_trips(imei):
+    try:
+        result = get_recent_trips_by_imei(imei)
+        return jsonify(result), 200
+
+    except Exception as error:
+        print("ERROR EN /telemetry/recent-trips:", repr(error))
         return jsonify({"error": "Error interno del servidor"}), 500
