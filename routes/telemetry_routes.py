@@ -4,6 +4,7 @@ from services.telemetry_service import (
     get_positions_history_by_imei,
     get_route_by_mode,
     get_recent_trips_by_imei,
+    get_trip_by_id,
 )
 from utils.auth_guard import jwt_required
 
@@ -78,4 +79,19 @@ def get_recent_trips(imei):
 
     except Exception as error:
         print("ERROR EN /telemetry/recent-trips:", repr(error))
+        return jsonify({"error": "Error interno del servidor"}), 500
+    
+@telemetry_bp.route("/telemetry/trip/<string:imei>/<string:trip_id>", methods=["GET"])
+@jwt_required
+def get_trip(imei, trip_id):
+    try:
+        result = get_trip_by_id(imei, trip_id)
+
+        if result is None:
+            return jsonify({"error": "Recorrido no encontrado"}), 404
+
+        return jsonify(result), 200
+
+    except Exception as error:
+        print("ERROR EN /telemetry/trip:", repr(error))
         return jsonify({"error": "Error interno del servidor"}), 500

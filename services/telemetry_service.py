@@ -242,6 +242,51 @@ def get_route_by_mode(imei, mode):
 
     return []
 
+def get_trip_by_id(imei, trip_id):
+    connection = None
+    cursor = None
+
+    try:
+        connection = get_db_telemetry_connection()
+        cursor = connection.cursor()
+
+        start_date = datetime.now() - timedelta(days=2)
+        end_date = datetime.now()
+
+        query = """
+            SELECT
+                fecha_hora_gps,
+                latitud,
+                longitud,
+                velocidad,
+                grados,
+                status
+            FROM public.t_data
+            WHERE imei = %s
+              AND fecha_hora_gps >= %s
+              AND fecha_hora_gps <= %s
+              AND latitud IS NOT NULL
+              AND longitud IS NOT NULL
+            ORDER BY fecha_hora_gps ASC;
+        """
+
+        cursor.execute(query, (imei, start_date, end_date))
+        rows = cursor.fetchall()
+
+        trips = build_recent_trips_from_rows(rows, limit=50)
+
+        selected_trip = next((trip for trip in trips if trip["id"] == trip_id), None)
+
+        if not selected_trip:
+            return None
+
+        return [map_route_row(row) for row in selected_trip["rows"]]
+
+    finally:
+        if cursor:
+            cursor.close()
+        if connection:
+            connection.close()
 
 def get_recent_trips_by_imei(imei, limit=10):
     connection = None
@@ -274,79 +319,94 @@ def get_recent_trips_by_imei(imei, limit=10):
         cursor.execute(query, (imei, start_date, end_date))
         rows = cursor.fetchall()
 
-        if not rows:
-            return []
+        trips = build_recent_trips_from_rows(rows, limit)
 
-        trips = []
-        current_trip = []
-
-        for row in rows:
-            if not current_trip:
-                current_trip.append(row)
-                continue
-
-            previous_row = current_trip[-1]
-            current_time = row[0]
-            previous_time = previous_row[0]
-
-            if (current_time - previous_time).total_seconds() > 600:
-                if len(current_trip) >= 2:
-                    trips.append(current_trip)
-                current_trip = [row]
-                continue
-
-            current_trip.append(row)
-
-        if len(current_trip) >= 2:
-            trips.append(current_trip)
-
-        recent_trip_items = []
-
-        recent_trips = list(reversed(trips))[:limit]
-
-        for index, trip_rows in enumerate(recent_trips, start=1):
-            start_row = trip_rows[0]
-            end_row = trip_rows[-1]
-
-            distance_km = 0.0
-
-            for point_index in range(1, len(trip_rows)):
-                prev_point = trip_rows[point_index - 1]
-                next_point = trip_rows[point_index]
-
-                distance_km += haversine_km(
-                    float(prev_point[1]),
-                    float(prev_point[2]),
-                    float(next_point[1]),
-                    float(next_point[2]),
-                )
-
-            duration_seconds = int((end_row[0] - start_row[0]).total_seconds())
-
-            trip_date = start_row[0].date()
-            today = datetime.now().date()
-            yesterday = today - timedelta(days=1)
-
-            if trip_date == today:
-                label = "HOY"
-            elif trip_date == yesterday:
-                label = "AYER"
-            else:
-                label = trip_date.strftime("%d/%m/%Y")
-
-            recent_trip_items.append({
-                "id": f"trip_{index}",
-                "label": label,
-                "start_time": start_row[0].isoformat(),
-                "end_time": end_row[0].isoformat(),
-                "duration_seconds": duration_seconds,
-                "distance_km": round(distance_km, 2),
-            })
-
-        return recent_trip_items
+        return [
+            {
+                "id": trip["id"],
+                "label": trip["label"],
+                "start_time": trip["start_time"],
+                "end_time": trip["end_time"],
+                "duration_seconds": trip["duration_seconds"],
+                "distance_km": trip["distance_km"],
+            }
+            for trip in trips
+        ]
 
     finally:
         if cursor:
             cursor.close()
         if connection:
             connection.close()
+
+def build_recent_trips_from_rows(rows, limit=10):
+    if not rows:
+        return []
+
+    trips = []
+    current_trip = []
+
+    for row in rows:
+        if not current_trip:
+            current_trip.append(row)
+            continue
+
+        previous_row = current_trip[-1]
+        current_time = row[0]
+        previous_time = previous_row[0]
+
+        if (current_time - previous_time).total_seconds() > 600:
+            if len(current_trip) >= 2:
+                trips.append(current_trip)
+            current_trip = [row]
+            continue
+
+        current_trip.append(row)
+
+    if len(current_trip) >= 2:
+        trips.append(current_trip)
+
+    recent_trip_items = []
+    recent_trips = list(reversed(trips))[:limit]
+
+    for index, trip_rows in enumerate(recent_trips, start=1):
+        start_row = trip_rows[0]
+        end_row = trip_rows[-1]
+
+        distance_km = 0.0
+
+        for point_index in range(1, len(trip_rows)):
+            prev_point = trip_rows[point_index - 1]
+            next_point = trip_rows[point_index]
+
+            distance_km += haversine_km(
+                float(prev_point[1]),
+                float(prev_point[2]),
+                float(next_point[1]),
+                float(next_point[2]),
+            )
+
+        duration_seconds = int((end_row[0] - start_row[0]).total_seconds())
+
+        trip_date = start_row[0].date()
+        today = datetime.now().date()
+        yesterday = today - timedelta(days=1)
+
+        if trip_date == today:
+            label = "HOY"
+        elif trip_date == yesterday:
+            label = "AYER"
+        else:
+            label = trip_date.strftime("%d/%m/%Y")
+
+        recent_trip_items.append({
+            "id": f"trip_{index}",
+            "label": label,
+            "start_time": start_row[0].isoformat(),
+            "end_time": end_row[0].isoformat(),
+            "duration_seconds": duration_seconds,
+            "distance_km": round(distance_km, 2),
+            "rows": trip_rows,
+        })
+
+    return recent_trip_items
