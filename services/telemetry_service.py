@@ -2,6 +2,36 @@ from datetime import datetime, timedelta, time
 from math import radians, sin, cos, sqrt, atan2
 from db.connection import get_db_telemetry_connection
 
+STATUS_OFF = "000000000"
+STATUS_ON = "100000000"
+MIN_MOVING_SPEED = 1.0
+
+
+def get_status_code(status):
+    return (status or "").strip()
+
+
+def is_unit_off(status):
+    return get_status_code(status) == STATUS_OFF
+
+
+def is_unit_on(status):
+    return get_status_code(status) == STATUS_ON
+
+
+def get_safe_speed(speed):
+    try:
+        return float(speed) if speed is not None else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def is_real_moving(status, speed):
+    return is_unit_on(status) and get_safe_speed(speed) >= MIN_MOVING_SPEED
+
+
+def is_stop(status, speed):
+    return is_unit_on(status) and get_safe_speed(speed) < MIN_MOVING_SPEED
 
 def haversine_km(lat1, lon1, lat2, lon2):
     earth_radius_km = 6371.0
@@ -19,15 +49,27 @@ def haversine_km(lat1, lon1, lat2, lon2):
 
 
 def map_route_row(row):
+    speed = float(row[3]) if row[3] is not None else None
+    status_code = row[5]
+
+    if is_unit_off(status_code):
+        movement_state = "apagado"
+    elif is_stop(status_code, speed):
+        movement_state = "stop"
+    elif is_real_moving(status_code, speed):
+        movement_state = "movimiento"
+    else:
+        movement_state = "desconocido"
+
     return {
         "fecha_hora_gps": row[0].isoformat() if row[0] else None,
         "latitud": float(row[1]) if row[1] is not None else None,
         "longitud": float(row[2]) if row[2] is not None else None,
-        "velocidad": float(row[3]) if row[3] is not None else None,
+        "velocidad": speed,
         "grados": float(row[4]) if row[4] is not None else None,
-        "status": row[5],
+        "status": status_code,
+        "movement_state": movement_state,
     }
-
 
 def get_day_range(day_offset=0):
     target_day = datetime.now().date() - timedelta(days=day_offset)
@@ -35,7 +77,83 @@ def get_day_range(day_offset=0):
     end_dt = datetime.combine(target_day, time.max)
     return start_dt, end_dt
 
+def get_latest_route_between_last_two_power_offs(imei):
+    connection = None
+    cursor = None
 
+    try:
+        connection = get_db_telemetry_connection()
+        cursor = connection.cursor()
+
+        last_two_offs_query = """
+            SELECT fecha_hora_gps
+            FROM public.t_data
+            WHERE imei = %s
+              AND fecha_hora_gps IS NOT NULL
+              AND status = %s
+            ORDER BY fecha_hora_gps DESC
+            LIMIT 2;
+        """
+
+        cursor.execute(last_two_offs_query, (imei, STATUS_OFF))
+        off_rows = cursor.fetchall()
+
+        if len(off_rows) == 0:
+            return []
+
+        if len(off_rows) == 1:
+            latest_off_time = off_rows[0][0]
+
+            route_query = """
+                SELECT
+                    fecha_hora_gps,
+                    latitud,
+                    longitud,
+                    velocidad,
+                    grados,
+                    status
+                FROM public.t_data
+                WHERE imei = %s
+                  AND fecha_hora_gps >= %s
+                  AND latitud IS NOT NULL
+                  AND longitud IS NOT NULL
+                ORDER BY fecha_hora_gps ASC;
+            """
+
+            cursor.execute(route_query, (imei, latest_off_time))
+            rows = cursor.fetchall()
+            return [map_route_row(row) for row in rows]
+
+        latest_off_time = off_rows[0][0]
+        previous_off_time = off_rows[1][0]
+
+        route_query = """
+            SELECT
+                fecha_hora_gps,
+                latitud,
+                longitud,
+                velocidad,
+                grados,
+                status
+            FROM public.t_data
+            WHERE imei = %s
+              AND fecha_hora_gps > %s
+              AND fecha_hora_gps <= %s
+              AND latitud IS NOT NULL
+              AND longitud IS NOT NULL
+            ORDER BY fecha_hora_gps ASC;
+        """
+
+        cursor.execute(route_query, (imei, previous_off_time, latest_off_time))
+        rows = cursor.fetchall()
+
+        return [map_route_row(row) for row in rows]
+
+    finally:
+        if cursor:
+            cursor.close()
+        if connection:
+            connection.close()
 def get_latest_position_by_imei(imei):
     connection = None
     cursor = None
@@ -226,19 +344,7 @@ def get_route_by_mode(imei, mode):
         return get_positions_history_by_imei(imei, start_date, end_date, 2000)
 
     if mode == "latest":
-        recent_trips = get_recent_trips_by_imei(imei, limit=1)
-
-        if not recent_trips:
-            return []
-
-        latest_trip = recent_trips[0]
-
-        return get_positions_history_by_imei(
-            imei,
-            latest_trip["start_time"],
-            latest_trip["end_time"],
-            2000,
-        )
+        return get_latest_route_between_last_two_power_offs(imei)
 
     return []
 
@@ -250,7 +356,7 @@ def get_trip_by_id(imei, trip_id):
         connection = get_db_telemetry_connection()
         cursor = connection.cursor()
 
-        start_date = datetime.now() - timedelta(days=2)
+        start_date = datetime.now() - timedelta(days=7)
         end_date = datetime.now()
 
         query = """
@@ -265,8 +371,6 @@ def get_trip_by_id(imei, trip_id):
             WHERE imei = %s
               AND fecha_hora_gps >= %s
               AND fecha_hora_gps <= %s
-              AND latitud IS NOT NULL
-              AND longitud IS NOT NULL
             ORDER BY fecha_hora_gps ASC;
         """
 
@@ -274,7 +378,6 @@ def get_trip_by_id(imei, trip_id):
         rows = cursor.fetchall()
 
         trips = build_recent_trips_from_rows(rows, limit=50)
-
         selected_trip = next((trip for trip in trips if trip["id"] == trip_id), None)
 
         if not selected_trip:
@@ -296,7 +399,7 @@ def get_recent_trips_by_imei(imei, limit=10):
         connection = get_db_telemetry_connection()
         cursor = connection.cursor()
 
-        start_date = datetime.now() - timedelta(days=2)
+        start_date = datetime.now() - timedelta(days=7)
         end_date = datetime.now()
 
         query = """
@@ -311,8 +414,6 @@ def get_recent_trips_by_imei(imei, limit=10):
             WHERE imei = %s
               AND fecha_hora_gps >= %s
               AND fecha_hora_gps <= %s
-              AND latitud IS NOT NULL
-              AND longitud IS NOT NULL
             ORDER BY fecha_hora_gps ASC;
         """
 
@@ -329,6 +430,8 @@ def get_recent_trips_by_imei(imei, limit=10):
                 "end_time": trip["end_time"],
                 "duration_seconds": trip["duration_seconds"],
                 "distance_km": trip["distance_km"],
+                "movement_state": trip["movement_state"],
+                "stop_count": trip["stop_count"],
             }
             for trip in trips
         ]
@@ -347,21 +450,21 @@ def build_recent_trips_from_rows(rows, limit=10):
     current_trip = []
 
     for row in rows:
-        if not current_trip:
-            current_trip.append(row)
-            continue
+        fecha_hora_gps = row[0]
+        latitud = row[1]
+        longitud = row[2]
+        velocidad = row[3]
+        status = row[5]
 
-        previous_row = current_trip[-1]
-        current_time = row[0]
-        previous_time = previous_row[0]
-
-        if (current_time - previous_time).total_seconds() > 600:
-            if len(current_trip) >= 2:
-                trips.append(current_trip)
-            current_trip = [row]
+        if latitud is None or longitud is None:
             continue
 
         current_trip.append(row)
+
+        if is_unit_off(status):
+            if len(current_trip) >= 2:
+                trips.append(current_trip)
+            current_trip = []
 
     if len(current_trip) >= 2:
         trips.append(current_trip)
@@ -374,10 +477,21 @@ def build_recent_trips_from_rows(rows, limit=10):
         end_row = trip_rows[-1]
 
         distance_km = 0.0
+        has_real_movement = False
+        stop_count = 0
 
         for point_index in range(1, len(trip_rows)):
             prev_point = trip_rows[point_index - 1]
             next_point = trip_rows[point_index]
+
+            prev_status = prev_point[5]
+            prev_speed = prev_point[3]
+
+            if is_real_moving(prev_status, prev_speed):
+                has_real_movement = True
+
+            if is_stop(prev_status, prev_speed):
+                stop_count += 1
 
             distance_km += haversine_km(
                 float(prev_point[1]),
@@ -385,6 +499,15 @@ def build_recent_trips_from_rows(rows, limit=10):
                 float(next_point[1]),
                 float(next_point[2]),
             )
+
+        end_status = end_row[5]
+        end_speed = end_row[3]
+
+        if is_real_moving(end_status, end_speed):
+            has_real_movement = True
+
+        if is_stop(end_status, end_speed):
+            stop_count += 1
 
         duration_seconds = int((end_row[0] - start_row[0]).total_seconds())
 
@@ -399,13 +522,23 @@ def build_recent_trips_from_rows(rows, limit=10):
         else:
             label = trip_date.strftime("%d/%m/%Y")
 
+        movement_state = "stop" if not has_real_movement else "movimiento"
+
+        rounded_distance_km = round(distance_km, 2)
+
+        # Ignorar recorridos sin movimiento real o con distancia insignificante
+        if not has_real_movement or rounded_distance_km <= 0.05:
+            continue
+
         recent_trip_items.append({
             "id": f"trip_{index}",
             "label": label,
             "start_time": start_row[0].isoformat(),
             "end_time": end_row[0].isoformat(),
             "duration_seconds": duration_seconds,
-            "distance_km": round(distance_km, 2),
+            "distance_km": rounded_distance_km,
+            "movement_state": movement_state,
+            "stop_count": stop_count,
             "rows": trip_rows,
         })
 
