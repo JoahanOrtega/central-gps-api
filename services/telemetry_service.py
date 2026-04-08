@@ -1,9 +1,12 @@
-from datetime import datetime, timedelta, time
+from datetime import datetime, timedelta, time, timezone
 from math import radians, sin, cos, sqrt, atan2
 from db.connection import get_db_telemetry_connection
 
-STATUS_OFF = "000000000"
+UTC_TIMEZONE = timezone.utc
+APP_TIMEZONE = timezone(timedelta(hours=-6))
+
 STATUS_ON = "100000000"
+STATUS_OFF = "000000000"
 MIN_MOVING_SPEED = 1.0
 
 
@@ -47,6 +50,18 @@ def haversine_km(lat1, lon1, lat2, lon2):
 
     return earth_radius_km * c
 
+def to_app_iso(dt):
+    if dt is None:
+        return None
+
+    # La BD viene naive, pero realmente representa UTC
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC_TIMEZONE)
+
+    dt = dt.astimezone(APP_TIMEZONE)
+
+    return dt.isoformat(timespec="seconds")
+
 
 def map_route_row(row):
     speed = float(row[3]) if row[3] is not None else None
@@ -62,7 +77,7 @@ def map_route_row(row):
         movement_state = "desconocido"
 
     return {
-        "fecha_hora_gps": row[0].isoformat() if row[0] else None,
+        "fecha_hora_gps": to_app_iso(row[0]),
         "latitud": float(row[1]) if row[1] is not None else None,
         "longitud": float(row[2]) if row[2] is not None else None,
         "velocidad": speed,
@@ -200,9 +215,9 @@ def get_latest_position_by_imei(imei):
 
         return {
             "id_data": row[0],
-            "fecha_hora_sistema": row[1].isoformat() if row[1] else None,
-            "fecha_hora_gmt": row[2].isoformat() if row[2] else None,
-            "fecha_hora_gps": row[3].isoformat() if row[3] else None,
+            "fecha_hora_sistema": to_app_iso(row[1]),
+            "fecha_hora_gmt": to_app_iso(row[2]),
+            "fecha_hora_gps": to_app_iso(row[3]),
             "imei": row[4],
             "tipo_alerta": row[5],
             "latitud": float(row[6]) if row[6] is not None else None,
@@ -271,7 +286,7 @@ def get_latest_positions_by_imeis(imeis):
         for row in rows:
             items.append({
                 "imei": row[0],
-                "fecha_hora_gps": row[1].isoformat() if row[1] else None,
+                "fecha_hora_gps": to_app_iso(row[1]),
                 "latitud": float(row[2]) if row[2] is not None else None,
                 "longitud": float(row[3]) if row[3] is not None else None,
                 "velocidad": float(row[4]) if row[4] is not None else None,
@@ -533,8 +548,8 @@ def build_recent_trips_from_rows(rows, limit=10):
         recent_trip_items.append({
             "id": f"trip_{index}",
             "label": label,
-            "start_time": start_row[0].isoformat(),
-            "end_time": end_row[0].isoformat(),
+            "start_time": to_app_iso(start_row[0]),
+            "end_time": to_app_iso(end_row[0]),
             "duration_seconds": duration_seconds,
             "distance_km": rounded_distance_km,
             "movement_state": movement_state,
