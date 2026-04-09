@@ -169,6 +169,7 @@ def get_latest_route_between_last_two_power_offs(imei):
             cursor.close()
         if connection:
             connection.close()
+            
 def get_latest_position_by_imei(imei):
     connection = None
     cursor = None
@@ -456,6 +457,44 @@ def get_recent_trips_by_imei(imei, limit=10):
             cursor.close()
         if connection:
             connection.close()
+
+def get_route_by_custom_range(imei, start_date, start_time, end_date, end_time, limit=5000):
+    """
+    Obtiene puntos de ruta para un rango personalizado.
+    Las fechas/horas se reciben en hora local (America/Mexico_City) y se convierten a UTC
+    antes de consultar la base de datos.
+    """
+    def normalize_time(time_str):
+        if not time_str:
+            return "00:00:00"
+        parts = time_str.strip().split(":")
+        if len(parts) == 2:
+            return f"{time_str}:00"
+        return time_str
+
+    start_datetime_str = f"{start_date} {normalize_time(start_time)}"
+    end_datetime_str = f"{end_date} {normalize_time(end_time)}"
+
+    try:
+        start_naive = datetime.strptime(start_datetime_str, "%Y-%m-%d %H:%M:%S")
+        end_naive = datetime.strptime(end_datetime_str, "%Y-%m-%d %H:%M:%S")
+    except ValueError as e:
+        raise ValueError(f"Formato de fecha/hora inválido: {e}")
+
+    # Asignar zona horaria local (America/Mexico_City)
+    start_local = start_naive.replace(tzinfo=APP_TIMEZONE)
+    end_local = end_naive.replace(tzinfo=APP_TIMEZONE)
+
+    # Convertir a UTC para consultar la BD
+    start_utc = start_local.astimezone(UTC_TIMEZONE)
+    end_utc = end_local.astimezone(UTC_TIMEZONE)
+
+    # Eliminar tzinfo para compatibilidad con funciones existentes
+    start_utc_naive = start_utc.replace(tzinfo=None)
+    end_utc_naive = end_utc.replace(tzinfo=None)
+
+    return get_positions_history_by_imei(imei, start_utc_naive, end_utc_naive, limit)
+
 
 def build_recent_trips_from_rows(rows, limit=10):
     if not rows:

@@ -5,6 +5,7 @@ from services.telemetry_service import (
     get_route_by_mode,
     get_recent_trips_by_imei,
     get_trip_by_id,
+    get_route_by_custom_range
 )
 from utils.auth_guard import jwt_required
 
@@ -94,4 +95,32 @@ def get_trip(imei, trip_id):
 
     except Exception as error:
         print("ERROR EN /telemetry/trip:", repr(error))
+        return jsonify({"error": "Error interno del servidor"}), 500
+    
+@telemetry_bp.route("/telemetry/route-custom/<string:imei>", methods=["GET"])
+@jwt_required
+def get_route_custom(imei):
+    try:
+        start_date = request.args.get("start_date")
+        start_time = request.args.get("start_time")
+        end_date = request.args.get("end_date")
+        end_time = request.args.get("end_time")
+
+        if not start_date or not end_date:
+            return jsonify({"error": "start_date y end_date son obligatorios"}), 400
+
+        points = get_route_by_custom_range(
+            imei,
+            start_date,
+            start_time,
+            end_date,
+            end_time,
+            limit=5000
+        )
+        return jsonify(points), 200
+
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as error:
+        print("ERROR EN /telemetry/route-custom:", repr(error))
         return jsonify({"error": "Error interno del servidor"}), 500
