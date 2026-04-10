@@ -5,10 +5,9 @@ from services.telemetry_service import (
 )
 
 
-def get_units_with_latest_telemetry(search=None):
+def get_units_with_latest_telemetry(id_empresa, search=None):
     connection = None
     cursor = None
-
     try:
         connection = get_db_connection()
         cursor = connection.cursor()
@@ -28,26 +27,21 @@ def get_units_with_latest_telemetry(search=None):
                 id_operador,
                 status
             FROM t_unidades
-            WHERE status = 1
+            WHERE id_empresa = %s AND status = 1
         """
-
-        params = []
-
+        params = [id_empresa]
         if search:
             query += " AND LOWER(numero) LIKE LOWER(%s)"
             params.append(f"%{search}%")
-
-        query += " ORDER BY id_unidad ASC;"
+        query += " ORDER BY id_unidad ASC"
 
         cursor.execute(query, tuple(params))
         rows = cursor.fetchall()
 
         units = []
         imeis = []
-
         for row in rows:
             unit_imei = str(row[8]).strip() if row[8] else ""
-
             unit = {
                 "id": row[0],
                 "numero": row[1],
@@ -62,9 +56,7 @@ def get_units_with_latest_telemetry(search=None):
                 "id_operador": row[10],
                 "status": row[11],
             }
-
             units.append(unit)
-
             if unit_imei:
                 imeis.append(unit_imei)
 
@@ -73,17 +65,11 @@ def get_units_with_latest_telemetry(search=None):
 
         result = []
         for unit in units:
-            result.append({
-                **unit,
-                "telemetry": telemetry_map.get(unit["imei"])
-            })
-
+            result.append({**unit, "telemetry": telemetry_map.get(unit["imei"])})
         return result
-
     except Exception as error:
         print("ERROR EN get_units_with_latest_telemetry:", repr(error))
         raise
-
     finally:
         if cursor:
             cursor.close()
@@ -91,10 +77,9 @@ def get_units_with_latest_telemetry(search=None):
             connection.close()
 
 
-def get_unit_summary_by_imei(imei):
+def get_unit_summary_by_imei(imei, id_empresa):
     connection = None
     cursor = None
-
     try:
         connection = get_db_connection()
         cursor = connection.cursor()
@@ -107,13 +92,11 @@ def get_unit_summary_by_imei(imei):
                 modelo,
                 imei
             FROM t_unidades
-            WHERE imei = %s
+            WHERE imei = %s AND id_empresa = %s
             LIMIT 1;
         """
-
-        cursor.execute(query, (imei,))
+        cursor.execute(query, (imei, id_empresa))
         row = cursor.fetchone()
-
         if not row:
             return None
 
@@ -126,15 +109,19 @@ def get_unit_summary_by_imei(imei):
             "imei": clean_imei,
             "marca": row[2] or "",
             "modelo": row[3] or "",
-            "status": latest_telemetry.get("status", "Sin información") if latest_telemetry else "Sin información",
-            "last_report": latest_telemetry.get("fecha_hora_gps") if latest_telemetry else None,
+            "status": (
+                latest_telemetry.get("status", "Sin información")
+                if latest_telemetry
+                else "Sin información"
+            ),
+            "last_report": (
+                latest_telemetry.get("fecha_hora_gps") if latest_telemetry else None
+            ),
             "hasTelemetry": latest_telemetry is not None,
         }
-
     except Exception as error:
         print("ERROR EN get_unit_summary_by_imei:", repr(error))
         raise
-
     finally:
         if cursor:
             cursor.close()

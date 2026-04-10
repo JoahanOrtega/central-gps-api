@@ -9,8 +9,11 @@ units_bp = Blueprint("units", __name__)
 @jwt_required
 def list_units():
     try:
+        id_empresa = request.user.get("id_empresa")
+        if not id_empresa:
+            return jsonify({"error": "Empresa no definida"}), 400
         search = request.args.get("search", "").strip()
-        units = get_units(search=search if search else None)
+        units = get_units(id_empresa, search if search else None)
         return jsonify(units), 200
     except Exception as error:
         return jsonify({"error": str(error)}), 500
@@ -20,16 +23,15 @@ def list_units():
 @jwt_required
 def create_new_unit():
     try:
-        # Obtener id_usuario del payload del token
-        user_payload = getattr(request, "user", {})
-        id_usuario = user_payload.get("sub")  # porque en jwt_handler.py usaste 'sub'
-        if not id_usuario:
-            return jsonify({"error": "No se pudo identificar al usuario"}), 401
+        user_payload = request.user
+        id_usuario = user_payload.get("sub")
+        id_empresa = user_payload.get("id_empresa")
+        if not id_usuario or not id_empresa:
+            return jsonify({"error": "Datos de autenticación incompletos"}), 400
 
         data = request.get_json()
         # validaciones...
-
-        result = create_unit(data, id_usuario)
+        result = create_unit(data, id_usuario, id_empresa)
         return jsonify({"message": "Unidad creada correctamente", "unit": result}), 201
     except Exception as error:
         return jsonify({"error": str(error)}), 500

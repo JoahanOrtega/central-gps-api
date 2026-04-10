@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta, time, timezone
 from math import radians, sin, cos, sqrt, atan2
 from db.connection import get_db_telemetry_connection
+from db.connection import get_db_connection as get_main_db_connection
 
 UTC_TIMEZONE = timezone.utc
 APP_TIMEZONE = timezone(timedelta(hours=-6))
@@ -8,6 +9,23 @@ APP_TIMEZONE = timezone(timedelta(hours=-6))
 STATUS_ON = "100000000"
 STATUS_OFF = "000000000"
 MIN_MOVING_SPEED = 1.0
+
+
+def check_unit_belongs_to_company(imei, id_empresa):
+    """Verifica que el IMEI pertenezca a una unidad de la empresa dada."""
+    connection = None
+    cursor = None
+    try:
+        connection = get_main_db_connection()
+        cursor = connection.cursor()
+        query = "SELECT id_unidad FROM t_unidades WHERE imei = %s AND id_empresa = %s LIMIT 1"
+        cursor.execute(query, (imei, id_empresa))
+        return cursor.fetchone() is not None
+    finally:
+        if cursor:
+            cursor.close()
+        if connection:
+            connection.close()
 
 
 def get_status_code(status):
@@ -36,6 +54,7 @@ def is_real_moving(status, speed):
 def is_stop(status, speed):
     return is_unit_on(status) and get_safe_speed(speed) < MIN_MOVING_SPEED
 
+
 def haversine_km(lat1, lon1, lat2, lon2):
     earth_radius_km = 6371.0
 
@@ -49,6 +68,7 @@ def haversine_km(lat1, lon1, lat2, lon2):
     c = 2 * atan2(sqrt(a), sqrt(1 - a))
 
     return earth_radius_km * c
+
 
 def to_app_iso(dt):
     if dt is None:
@@ -86,11 +106,13 @@ def map_route_row(row):
         "movement_state": movement_state,
     }
 
+
 def get_day_range(day_offset=0):
     target_day = datetime.now().date() - timedelta(days=day_offset)
     start_dt = datetime.combine(target_day, time.min)
     end_dt = datetime.combine(target_day, time.max)
     return start_dt, end_dt
+
 
 def get_latest_route_between_last_two_power_offs(imei):
     connection = None
@@ -169,8 +191,12 @@ def get_latest_route_between_last_two_power_offs(imei):
             cursor.close()
         if connection:
             connection.close()
-            
-def get_latest_position_by_imei(imei):
+
+
+def get_latest_position_by_imei(imei, id_empresa=None):
+    # Si se proporciona id_empresa, validar pertenencia
+    if id_empresa is not None and not check_unit_belongs_to_company(imei, id_empresa):
+        return None
     connection = None
     cursor = None
 
@@ -285,19 +311,21 @@ def get_latest_positions_by_imeis(imeis):
 
         items = []
         for row in rows:
-            items.append({
-                "imei": row[0],
-                "fecha_hora_gps": to_app_iso(row[1]),
-                "latitud": float(row[2]) if row[2] is not None else None,
-                "longitud": float(row[3]) if row[3] is not None else None,
-                "velocidad": float(row[4]) if row[4] is not None else None,
-                "grados": float(row[5]) if row[5] is not None else None,
-                "status": row[6],
-                "voltaje": float(row[7]) if row[7] is not None else None,
-                "voltaje_bateria": float(row[8]) if row[8] is not None else None,
-                "odometro": row[9],
-                "tipo_alerta": row[10],
-            })
+            items.append(
+                {
+                    "imei": row[0],
+                    "fecha_hora_gps": to_app_iso(row[1]),
+                    "latitud": float(row[2]) if row[2] is not None else None,
+                    "longitud": float(row[3]) if row[3] is not None else None,
+                    "velocidad": float(row[4]) if row[4] is not None else None,
+                    "grados": float(row[5]) if row[5] is not None else None,
+                    "status": row[6],
+                    "voltaje": float(row[7]) if row[7] is not None else None,
+                    "voltaje_bateria": float(row[8]) if row[8] is not None else None,
+                    "odometro": row[9],
+                    "tipo_alerta": row[10],
+                }
+            )
 
         return items
 
@@ -346,7 +374,10 @@ def get_positions_history_by_imei(imei, start_date, end_date, limit=500):
             connection.close()
 
 
-def get_route_by_mode(imei, mode):
+def get_route_by_mode(imei, mode, id_empresa=None):
+    if id_empresa is not None and not check_unit_belongs_to_company(imei, id_empresa):
+        return []
+
     if mode == "today":
         start_date, end_date = get_day_range(0)
         return get_positions_history_by_imei(imei, start_date, end_date, 2000)
@@ -364,7 +395,11 @@ def get_route_by_mode(imei, mode):
 
     return []
 
-def get_trip_by_id(imei, trip_id):
+
+def get_trip_by_id(imei, trip_id, id_empresa=None):
+    if id_empresa is not None and not check_unit_belongs_to_company(imei, id_empresa):
+        return None
+
     connection = None
     cursor = None
 
@@ -407,7 +442,11 @@ def get_trip_by_id(imei, trip_id):
         if connection:
             connection.close()
 
-def get_recent_trips_by_imei(imei, limit=10):
+
+def get_recent_trips_by_imei(imei, limit=10, id_empresa=None):
+    if id_empresa is not None and not check_unit_belongs_to_company(imei, id_empresa):
+        return []
+
     connection = None
     cursor = None
 
@@ -458,12 +497,18 @@ def get_recent_trips_by_imei(imei, limit=10):
         if connection:
             connection.close()
 
-def get_route_by_custom_range(imei, start_date, start_time, end_date, end_time, limit=5000):
+
+def get_route_by_custom_range(
+    imei, start_date, start_time, end_date, end_time, limit=5000, id_empresa=None
+):
     """
     Obtiene puntos de ruta para un rango personalizado.
     Las fechas/horas se reciben en hora local (America/Mexico_City) y se convierten a UTC
     antes de consultar la base de datos.
     """
+    if id_empresa is not None and not check_unit_belongs_to_company(imei, id_empresa):
+        return []
+
     def normalize_time(time_str):
         if not time_str:
             return "00:00:00"
@@ -584,16 +629,18 @@ def build_recent_trips_from_rows(rows, limit=10):
         if not has_real_movement or rounded_distance_km <= 0.05:
             continue
 
-        recent_trip_items.append({
-            "id": f"trip_{index}",
-            "label": label,
-            "start_time": to_app_iso(start_row[0]),
-            "end_time": to_app_iso(end_row[0]),
-            "duration_seconds": duration_seconds,
-            "distance_km": rounded_distance_km,
-            "movement_state": movement_state,
-            "stop_count": stop_count,
-            "rows": trip_rows,
-        })
+        recent_trip_items.append(
+            {
+                "id": f"trip_{index}",
+                "label": label,
+                "start_time": to_app_iso(start_row[0]),
+                "end_time": to_app_iso(end_row[0]),
+                "duration_seconds": duration_seconds,
+                "distance_km": rounded_distance_km,
+                "movement_state": movement_state,
+                "stop_count": stop_count,
+                "rows": trip_rows,
+            }
+        )
 
     return recent_trip_items

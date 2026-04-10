@@ -12,10 +12,12 @@ monitor_bp = Blueprint("monitor", __name__)
 @jwt_required
 def get_units_live():
     try:
+        id_empresa = request.user.get("id_empresa")
+        if not id_empresa:
+            return jsonify({"error": "Empresa no definida"}), 400
         search = request.args.get("search", "").strip()
-        result = get_units_with_latest_telemetry(search if search else None)
+        result = get_units_with_latest_telemetry(id_empresa, search if search else None)
         return jsonify(result), 200
-
     except Exception as error:
         print("ERROR EN /monitor/units-live:", repr(error))
         return jsonify({"error": "Error interno del servidor"}), 500
@@ -25,13 +27,13 @@ def get_units_live():
 @jwt_required
 def get_unit_summary(imei):
     try:
-        result = get_unit_summary_by_imei(imei)
-
+        id_empresa = request.user.get("id_empresa")
+        if not id_empresa:
+            return jsonify({"error": "Empresa no definida"}), 400
+        result = get_unit_summary_by_imei(imei, id_empresa)
         if not result:
             return jsonify({"error": "Unidad no encontrada"}), 404
-
         return jsonify(result), 200
-
     except Exception as error:
         print("ERROR EN /monitor/unit-summary:", repr(error))
         return jsonify({"error": "Error interno del servidor"}), 500

@@ -23,7 +23,6 @@ def get_user_companies(user_id):
             query = """
                 SELECT id_empresa, nombre
                 FROM t_empresas
-                WHERE status = 1
                 ORDER BY nombre
             """
             cursor.execute(query)

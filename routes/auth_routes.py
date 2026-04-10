@@ -47,6 +47,8 @@ def switch_company():
 
         # Verificar que el usuario tenga acceso a la empresa solicitada
         companies = get_user_companies(user_id)
+        print("User payload:", user_payload)
+        print("Companies:", companies)
         target_company = next(
             (c for c in companies if c["id_empresa"] == new_company_id), None
         )

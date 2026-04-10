@@ -1,10 +1,9 @@
 from db.connection import get_db_connection
 
 
-def get_units(search=None):
+def get_units(id_empresa, search=None):
     connection = None
     cursor = None
-
     try:
         connection = get_db_connection()
         cursor = connection.cursor()
@@ -24,20 +23,16 @@ def get_units(search=None):
                 id_operador,
                 status
             FROM t_unidades
-            WHERE status = 1
+            WHERE id_empresa = %s AND status = 1
         """
-
-        params = []
-
+        params = [id_empresa]
         if search:
             query += " AND LOWER(numero) LIKE LOWER(%s)"
             params.append(f"%{search}%")
-
-        query += " ORDER BY id_unidad ASC;"
+        query += " ORDER BY id_unidad ASC"
 
         cursor.execute(query, tuple(params))
         rows = cursor.fetchall()
-
         units = []
         for row in rows:
             units.append(
@@ -56,9 +51,7 @@ def get_units(search=None):
                     "status": row[11],
                 }
             )
-
         return units
-
     finally:
         if cursor:
             cursor.close()
@@ -66,19 +59,12 @@ def get_units(search=None):
             connection.close()
 
 
-def create_unit(payload, id_usuario_registro):
-    """
-    Crea una nueva unidad.
-    payload: diccionario con los campos del frontend (CreateUnitPayload)
-    id_usuario_registro: ID del usuario autenticado
-    """
+def create_unit(payload, id_usuario_registro, id_empresa):
     connection = None
     cursor = None
     try:
         connection = get_db_connection()
         cursor = connection.cursor()
-
-        # 1. Insertar en t_unidades
         query = """
             INSERT INTO t_unidades (
                 id_empresa,
@@ -114,17 +100,11 @@ def create_unit(payload, id_usuario_registro):
                 fecha_registro,
                 status
             )
-            VALUES (
-                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                NOW(), %s
-            )
-            RETURNING id_unidad;
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s)
+            RETURNING id_unidad
         """
-        # Valores para la inserción (convertir tipos según sea necesario)
         values = (
-            2,  # id_empresa fijo por ahora (idealmente del token JWT)
+            id_empresa,
             payload["numero"],
             payload["marca"],
             payload["modelo"],
@@ -132,7 +112,7 @@ def create_unit(payload, id_usuario_registro):
             payload["matricula"],
             int(payload["tipo"]) if payload.get("tipo") else 1,
             payload.get("imagen", ""),
-            90,  # vel_max por defecto
+            90,
             payload.get("id_modelo_avl"),
             payload["imei"],
             payload["chip"],
@@ -154,28 +134,19 @@ def create_unit(payload, id_usuario_registro):
             float(payload.get("temp_max", 5.0)),
             payload["fecha_instalacion"],
             id_usuario_registro,
-            1,  # status activo
+            1,
         )
-
         cursor.execute(query, values)
         new_unit_id = cursor.fetchone()[0]
-        # 2. Si se proporcionó id_operador, insertar en r_unidad_operador
+
         id_operador = payload.get("id_operador")
         fecha_asignacion = payload.get("fecha_asignacion_operador")
-
         if id_operador:
-            query_op = """
-                INSERT INTO r_unidad_operador (
-                    id_unidad,
-                    id_operador,
-                    fecha_asignacion,
-                    id_usuario_registro,
-                    fecha_registro
-                )
-                VALUES (%s, %s, %s, %s, NOW())
-            """
             cursor.execute(
-                query_op,
+                """
+                INSERT INTO r_unidad_operador (id_unidad, id_operador, fecha_asignacion, id_usuario_registro, fecha_registro)
+                VALUES (%s, %s, %s, %s, NOW())
+            """,
                 (
                     new_unit_id,
                     id_operador,
@@ -184,18 +155,18 @@ def create_unit(payload, id_usuario_registro):
                 ),
             )
 
-        # 3. Si se proporcionó id_grupo_unidades, insertar en r_grupo_unidades_unidades
         id_grupo = payload.get("id_grupo_unidades")
         if id_grupo:
-            query_grupo = """
+            cursor.execute(
+                """
                 INSERT INTO r_grupo_unidades_unidades (id_grupo_unidades, id_unidad)
                 VALUES (%s, %s)
-            """
-            cursor.execute(query_grupo, (id_grupo, new_unit_id))
+            """,
+                (id_grupo, new_unit_id),
+            )
 
         connection.commit()
         return {"id": new_unit_id}
-
     except Exception as e:
         if connection:
             connection.rollback()

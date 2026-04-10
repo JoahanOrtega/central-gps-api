@@ -14,8 +14,8 @@ CORS(
     resources={r"/*": {"origins": ["http://localhost:5173", "http://127.0.0.1:5173"]}},
 )
 
-app.register_blueprint(auth_bp)
-app.register_blueprint(users_bp)
+app.register_blueprint(auth_bp, url_prefix="/auth")
+app.register_blueprint(users_bp, url_prefix="/users")
 app.register_blueprint(catalogs_bp)
 app.register_blueprint(units_bp)
 app.register_blueprint(poi_bp)

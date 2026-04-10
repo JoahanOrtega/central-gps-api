@@ -1,10 +1,5 @@
 from flask import Blueprint, jsonify, request
-from services.catalog_service import (
-    get_operators,
-    get_unit_groups,
-    get_avl_models,
-    get_protocols,
-)
+from services.catalog_service import get_operators, get_unit_groups, get_avl_models
 from utils.auth_guard import jwt_required
 
 catalogs_bp = Blueprint("catalogs", __name__)
@@ -14,8 +9,11 @@ catalogs_bp = Blueprint("catalogs", __name__)
 @jwt_required
 def list_operators():
     try:
+        id_empresa = request.user.get("id_empresa")
+        if not id_empresa:
+            return jsonify({"error": "Empresa no definida"}), 400
         search = request.args.get("search", "").strip()
-        operators = get_operators(search if search else None)
+        operators = get_operators(id_empresa, search if search else None)
         return jsonify(operators), 200
     except Exception as error:
         print("ERROR EN /catalogs/operators:", repr(error))
@@ -26,8 +24,11 @@ def list_operators():
 @jwt_required
 def list_unit_groups():
     try:
+        id_empresa = request.user.get("id_empresa")
+        if not id_empresa:
+            return jsonify({"error": "Empresa no definida"}), 400
         search = request.args.get("search", "").strip()
-        groups = get_unit_groups(search if search else None)
+        groups = get_unit_groups(id_empresa, search if search else None)
         return jsonify(groups), 200
     except Exception as error:
         print("ERROR EN /catalogs/unit-groups:", repr(error))
@@ -42,18 +43,4 @@ def list_avl_models():
         return jsonify(models), 200
     except Exception as error:
         print("ERROR EN /catalogs/avl-models:", repr(error))
-        return jsonify({"error": "Error interno del servidor"}), 500
-
-
-@catalogs_bp.route("/catalogs/protocols", methods=["GET"])
-@jwt_required
-def list_protocols():
-    try:
-        tipo = request.args.get("tipo", "").strip()
-        if tipo not in ("in", "out", "rs232"):
-            return jsonify({"error": "El parámetro 'tipo' debe ser 'in', 'out' o 'rs232'"}), 400
-        protocols = get_protocols(tipo)
-        return jsonify(protocols), 200
-    except Exception as error:
-        print("ERROR EN /catalogs/protocols:", repr(error))
         return jsonify({"error": "Error interno del servidor"}), 500

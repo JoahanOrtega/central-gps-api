@@ -10,6 +10,7 @@ company_bp = Blueprint("company", __name__)
 def list_companies():
     try:
         # Obtener id_usuario del token (request.user['sub'])
+
         user_id = request.user.get("sub")
         companies = get_user_companies(user_id)
         return jsonify(companies), 200
