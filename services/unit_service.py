@@ -40,20 +40,22 @@ def get_units(search=None):
 
         units = []
         for row in rows:
-            units.append({
-                "id": row[0],
-                "numero": row[1],
-                "marca": row[2],
-                "modelo": row[3],
-                "anio": row[4],
-                "matricula": row[5],
-                "tipo": row[6],
-                "imagen": row[7],
-                "imei": row[8],
-                "chip": row[9],
-                "id_operador": row[10],
-                "status": row[11],
-            })
+            units.append(
+                {
+                    "id": row[0],
+                    "numero": row[1],
+                    "marca": row[2],
+                    "modelo": row[3],
+                    "anio": row[4],
+                    "matricula": row[5],
+                    "tipo": row[6],
+                    "imagen": row[7],
+                    "imei": row[8],
+                    "chip": row[9],
+                    "id_operador": row[10],
+                    "status": row[11],
+                }
+            )
 
         return units
 
@@ -62,19 +64,24 @@ def get_units(search=None):
             cursor.close()
         if connection:
             connection.close()
-            
-def create_unit(payload):
+
+
+def create_unit(payload, id_usuario_registro):
+    """
+    Crea una nueva unidad.
+    payload: diccionario con los campos del frontend (CreateUnitPayload)
+    id_usuario_registro: ID del usuario autenticado
+    """
     connection = None
     cursor = None
-
     try:
         connection = get_db_connection()
         cursor = connection.cursor()
 
+        # 1. Insertar en t_unidades
         query = """
             INSERT INTO t_unidades (
                 id_empresa,
-                id_operador,
                 numero,
                 marca,
                 modelo,
@@ -82,6 +89,7 @@ def create_unit(payload):
                 matricula,
                 tipo,
                 imagen,
+                vel_max,
                 id_modelo_avl,
                 imei,
                 chip,
@@ -97,13 +105,10 @@ def create_unit(payload):
                 vigencia_verificacion_vehicular,
                 input1,
                 input2,
-                input3,
-                input4,
                 output1,
                 output2,
-                output3,
-                output4,
-                rs232,
+                temp_min,
+                temp_max,
                 fecha_instalacion,
                 id_usuario_registro,
                 fecha_registro,
@@ -113,59 +118,88 @@ def create_unit(payload):
                 %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
                 %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
                 %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                %s, %s, %s, NOW(), %s
+                NOW(), %s
             )
             RETURNING id_unidad;
         """
-
+        # Valores para la inserción (convertir tipos según sea necesario)
         values = (
-            payload["id_empresa"],
-            payload.get("id_operador"),
+            2,  # id_empresa fijo por ahora (idealmente del token JWT)
             payload["numero"],
             payload["marca"],
             payload["modelo"],
             payload["anio"],
             payload["matricula"],
-            payload["tipo"],
+            int(payload["tipo"]) if payload.get("tipo") else 1,
             payload.get("imagen", ""),
+            90,  # vel_max por defecto
             payload.get("id_modelo_avl"),
             payload["imei"],
             payload["chip"],
-            payload["odometro_inicial"],
-            payload.get("tipo_combustible"),
+            float(payload.get("odometro_inicial", 0)),
+            payload.get("tipo_combustible", "1"),
             payload.get("capacidad_tanque"),
             payload.get("rendimiento_establecido"),
-            payload.get("no_serie"),
-            payload.get("nombre_aseguradora"),
-            payload.get("telefono_aseguradora"),
-            payload.get("no_poliza_seguro"),
+            payload.get("no_serie", ""),
+            payload.get("nombre_aseguradora", ""),
+            payload.get("telefono_aseguradora", ""),
+            payload.get("no_poliza_seguro", ""),
             payload.get("vigencia_poliza_seguro"),
             payload.get("vigencia_verificacion_vehicular"),
-            payload.get("input1", "sin uso"),
-            payload.get("input2", "sin uso"),
-            payload.get("input3", "sin uso"),
-            payload.get("input4", "sin uso"),
-            payload.get("output1", "sin uso"),
-            payload.get("output2", "sin uso"),
-            payload.get("output3", "sin uso"),
-            payload.get("output4", "sin uso"),
-            payload.get("rs232", "sin uso"),
+            int(payload.get("input1", 0)),
+            int(payload.get("input2", 0)),
+            int(payload.get("output1", 0)),
+            int(payload.get("output2", 0)),
+            float(payload.get("temp_min", -10.0)),
+            float(payload.get("temp_max", 5.0)),
             payload["fecha_instalacion"],
-            payload["id_usuario_registro"],
-            payload["status"],
+            id_usuario_registro,
+            1,  # status activo
         )
 
         cursor.execute(query, values)
         new_unit_id = cursor.fetchone()[0]
-        connection.commit()
+        # 2. Si se proporcionó id_operador, insertar en r_unidad_operador
+        id_operador = payload.get("id_operador")
+        fecha_asignacion = payload.get("fecha_asignacion_operador")
 
+        if id_operador:
+            query_op = """
+                INSERT INTO r_unidad_operador (
+                    id_unidad,
+                    id_operador,
+                    fecha_asignacion,
+                    id_usuario_registro,
+                    fecha_registro
+                )
+                VALUES (%s, %s, %s, %s, NOW())
+            """
+            cursor.execute(
+                query_op,
+                (
+                    new_unit_id,
+                    id_operador,
+                    fecha_asignacion if fecha_asignacion else None,
+                    id_usuario_registro,
+                ),
+            )
+
+        # 3. Si se proporcionó id_grupo_unidades, insertar en r_grupo_unidades_unidades
+        id_grupo = payload.get("id_grupo_unidades")
+        if id_grupo:
+            query_grupo = """
+                INSERT INTO r_grupo_unidades_unidades (id_grupo_unidades, id_unidad)
+                VALUES (%s, %s)
+            """
+            cursor.execute(query_grupo, (id_grupo, new_unit_id))
+
+        connection.commit()
         return {"id": new_unit_id}
 
-    except Exception:
+    except Exception as e:
         if connection:
             connection.rollback()
-        raise
-
+        raise e
     finally:
         if cursor:
             cursor.close()

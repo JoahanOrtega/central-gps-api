@@ -5,6 +5,7 @@ from routes.poi_routes import poi_bp
 from routes.telemetry_routes import telemetry_bp
 from routes.monitor_routes import monitor_bp
 from routes.catalogs_routes import catalogs_bp
+from routes.company_routes import company_bp
 
 app = Flask(__name__)
 
@@ -20,6 +21,7 @@ app.register_blueprint(units_bp)
 app.register_blueprint(poi_bp)
 app.register_blueprint(telemetry_bp)
 app.register_blueprint(monitor_bp)
+app.register_blueprint(company_bp)
 
 
 @app.route("/", methods=["GET"])
