@@ -18,6 +18,7 @@ def list_pois():
         id_empresa = request.user.get("id_empresa")
         if not id_empresa:
             return jsonify({"error": "Empresa no definida"}), 400
+        # print("aaaaaaaaaaaaaa ", id_empresa)
         search = request.args.get("search", "").strip()
         return jsonify(get_pois(id_empresa, search if search else None)), 200
     except Exception as error:

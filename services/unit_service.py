@@ -155,15 +155,13 @@ def create_unit(payload, id_usuario_registro, id_empresa):
                 ),
             )
 
-        id_grupo = payload.get("id_grupo_unidades")
-        if id_grupo:
-            cursor.execute(
-                """
-                INSERT INTO r_grupo_unidades_unidades (id_grupo_unidades, id_unidad)
-                VALUES (%s, %s)
-            """,
-                (id_grupo, new_unit_id),
-            )
+        id_grupo_list = payload.get("id_grupo_unidades", [])
+        if id_grupo_list:
+            for id_grupo in id_grupo_list:
+                cursor.execute(
+                    "INSERT INTO r_grupo_unidades_unidades (id_grupo_unidades, id_unidad) VALUES (%s, %s)",
+                    (id_grupo, new_unit_id),
+                )
 
         connection.commit()
         return {"id": new_unit_id}
