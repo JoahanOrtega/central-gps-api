@@ -93,14 +93,12 @@ def create_unit(payload, id_usuario_registro, id_empresa):
                 input2,
                 output1,
                 output2,
-                temp_min,
-                temp_max,
                 fecha_instalacion,
                 id_usuario_registro,
                 fecha_registro,
                 status
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s)
             RETURNING id_unidad
         """
         values = (
@@ -110,7 +108,7 @@ def create_unit(payload, id_usuario_registro, id_empresa):
             payload["modelo"],
             payload["anio"],
             payload["matricula"],
-            int(payload["tipo"]) if payload.get("tipo") else 1,
+            int(payload["tipo"]),
             payload.get("imagen", ""),
             90,
             payload.get("id_modelo_avl"),
@@ -130,8 +128,6 @@ def create_unit(payload, id_usuario_registro, id_empresa):
             int(payload.get("input2", 0)),
             int(payload.get("output1", 0)),
             int(payload.get("output2", 0)),
-            float(payload.get("temp_min", -10.0)),
-            float(payload.get("temp_max", 5.0)),
             payload["fecha_instalacion"],
             id_usuario_registro,
             1,
