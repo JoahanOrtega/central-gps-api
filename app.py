@@ -1,3 +1,4 @@
+# app.py — agregar el import y registro del blueprint ERP
 from flask import Flask
 from flask_cors import CORS
 from routes import auth_bp, users_bp, units_bp
@@ -6,6 +7,7 @@ from routes.telemetry_routes import telemetry_bp
 from routes.monitor_routes import monitor_bp
 from routes.catalogs_routes import catalogs_bp
 from routes.company_routes import company_bp
+from routes.erp_routes import erp_bp  # ← NUEVO
 
 app = Flask(__name__)
 
@@ -22,6 +24,7 @@ app.register_blueprint(poi_bp)
 app.register_blueprint(telemetry_bp)
 app.register_blueprint(monitor_bp)
 app.register_blueprint(company_bp)
+app.register_blueprint(erp_bp)  # ← NUEVO
 
 
 @app.route("/", methods=["GET"])
