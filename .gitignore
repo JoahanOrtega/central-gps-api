@@ -1,8 +1,5 @@
 __pycache__/
-*/__pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
 venv/
 .env
 .idea/
