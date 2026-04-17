@@ -1,4 +1,4 @@
-from db.connection import get_db_connection
+from db.connection import get_db_connection, release_db_connection
 
 
 def get_user_companies(user_id: int) -> list[dict]:
@@ -58,7 +58,7 @@ def get_user_companies(user_id: int) -> list[dict]:
         if cursor:
             cursor.close()
         if connection:
-            connection.close()
+            release_db_connection(connection)
 
 
 def get_company_details(id_empresa: int) -> dict | None:
@@ -90,4 +90,4 @@ def get_company_details(id_empresa: int) -> dict | None:
         if cursor:
             cursor.close()
         if connection:
-            connection.close()
+            release_db_connection(connection)

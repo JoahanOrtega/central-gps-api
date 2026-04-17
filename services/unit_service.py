@@ -1,4 +1,7 @@
-from db.connection import get_db_connection
+import logging
+from db.connection import get_db_connection, release_db_connection
+
+logger = logging.getLogger(__name__)
 
 
 def get_units(id_empresa, search=None):
@@ -56,7 +59,7 @@ def get_units(id_empresa, search=None):
         if cursor:
             cursor.close()
         if connection:
-            connection.close()
+            release_db_connection(connection)
 
 
 def create_unit(payload, id_usuario_registro, id_empresa):
@@ -164,9 +167,15 @@ def create_unit(payload, id_usuario_registro, id_empresa):
     except Exception as e:
         if connection:
             connection.rollback()
-        raise e
+        logger.error(
+            "Error en create_unit id_empresa=%s numero=%s: %s",
+            id_empresa,
+            payload.get("numero"),
+            repr(e),
+        )
+        raise
     finally:
         if cursor:
             cursor.close()
         if connection:
-            connection.close()
+            release_db_connection(connection)

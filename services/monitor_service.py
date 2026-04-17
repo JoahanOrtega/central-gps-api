@@ -1,4 +1,4 @@
-from db.connection import get_db_connection
+from db.connection import get_db_connection, release_db_connection
 from services.telemetry_service import (
     get_latest_positions_by_imeis,
     get_latest_position_by_imei,
@@ -74,7 +74,7 @@ def get_units_with_latest_telemetry(id_empresa, search=None):
         if cursor:
             cursor.close()
         if connection:
-            connection.close()
+            release_db_connection(connection)
 
 
 def get_unit_summary_by_imei(imei, id_empresa):
@@ -126,4 +126,4 @@ def get_unit_summary_by_imei(imei, id_empresa):
         if cursor:
             cursor.close()
         if connection:
-            connection.close()
+            release_db_connection(connection)

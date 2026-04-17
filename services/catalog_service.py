@@ -1,4 +1,7 @@
-from db.connection import get_db_connection
+import logging
+from db.connection import get_db_connection, release_db_connection
+
+logger = logging.getLogger(__name__)
 
 
 def get_operators(id_empresa, search=None):
@@ -26,7 +29,7 @@ def get_operators(id_empresa, search=None):
         if cursor:
             cursor.close()
         if connection:
-            connection.close()
+            release_db_connection(connection)
 
 
 def get_unit_groups(id_empresa, search=None):
@@ -54,7 +57,7 @@ def get_unit_groups(id_empresa, search=None):
         if cursor:
             cursor.close()
         if connection:
-            connection.close()
+            release_db_connection(connection)
 
 
 def get_avl_models():
@@ -71,8 +74,13 @@ def get_avl_models():
         cursor.execute(query)
         rows = cursor.fetchall()
         return [{"id_modelo_avl": row[0], "modelo": row[1]} for row in rows]
+    except Exception as e:
+        # Loguear el error real para diagnosticar — tabla inexistente, etc.
+        logger.error("Error en get_avl_models: %s", repr(e))
+        # Retornar lista vacía para no bloquear el formulario de nueva unidad
+        return []
     finally:
         if cursor:
             cursor.close()
         if connection:
-            connection.close()
+            release_db_connection(connection)

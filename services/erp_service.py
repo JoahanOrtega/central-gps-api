@@ -19,18 +19,16 @@ def get_all_companies():
         cursor.execute("""
             SELECT
                 id_empresa,
-                nombre,
-                direccion,
-                telefonos,
-                lat,
-                lng,
-                logo,
+                empresa,
                 status,
                 total_unidades,
                 total_usuarios,
+                total_clientes,
+                total_admins_empresa,
+                email_principal,
                 fecha_registro
             FROM v_erp_resumen_empresas
-            ORDER BY nombre ASC
+            ORDER BY empresa ASC
         """)
         rows = cursor.fetchall()
         cols = [desc[0] for desc in cursor.description]
@@ -38,6 +36,7 @@ def get_all_companies():
         return [dict(zip(cols, row)) for row in rows], None
 
     except Exception as e:
+        logger.error("Error en get_all_companies: %s", repr(e))
         return None, str(e)
     finally:
         if cursor:
@@ -210,16 +209,22 @@ def get_users_by_company(id_empresa: int):
         cursor.execute(
             """
             SELECT
-                id_usuario,
-                usuario,
-                nombre,
                 id_empresa,
+                empresa,
+                id_usuario,
+                email_login,
+                nombre_usuario,
+                rol,
+                nombre_rol,
                 es_admin_empresa,
-                status,
-                fecha_registro
+                status_relacion,
+                status_usuario,
+                autenticacion_2f,
+                fecha_asignacion,
+                total_permisos
             FROM v_erp_usuarios_empresa
             WHERE id_empresa = %s
-            ORDER BY nombre ASC
+            ORDER BY nombre_usuario ASC
             """,
             (id_empresa,),
         )
@@ -229,6 +234,9 @@ def get_users_by_company(id_empresa: int):
         return [dict(zip(cols, row)) for row in rows], None
 
     except Exception as e:
+        logger.error(
+            "Error en get_users_by_company id_empresa=%s: %s", id_empresa, repr(e)
+        )
         return None, str(e)
     finally:
         if cursor:
@@ -293,7 +301,7 @@ def set_admin_empresa(
 
 
 def get_all_permissions():
-    """Devuelve el catálogo completo de permisos con conteo de uso."""
+    """Devuelve el catálogo completo de permisos del sistema."""
     connection = None
     cursor = None
     try:
@@ -307,7 +315,9 @@ def get_all_permissions():
                 nombre,
                 modulo,
                 descripcion,
-                total_usuarios
+                status,
+                usuarios_con_permiso,
+                empresas_con_permiso
             FROM v_erp_catalogo_permisos
             ORDER BY modulo ASC, nombre ASC
         """)
@@ -317,6 +327,7 @@ def get_all_permissions():
         return [dict(zip(cols, row)) for row in rows], None
 
     except Exception as e:
+        logger.error("Error en get_all_permissions: %s", repr(e))
         return None, str(e)
     finally:
         if cursor:
@@ -378,13 +389,15 @@ def get_audit_log(limit: int = 100, entidad: str = None):
                 """
                 SELECT
                     id_auditoria,
-                    id_usuario,
-                    usuario,
+                    email_usuario,
+                    nombre_usuario,
+                    rol_usuario,
                     entidad,
                     id_entidad,
                     accion,
                     datos_anteriores,
                     datos_nuevos,
+                    ip_origen,
                     fecha_registro
                 FROM v_erp_auditoria
                 WHERE entidad = %s
@@ -398,13 +411,15 @@ def get_audit_log(limit: int = 100, entidad: str = None):
                 """
                 SELECT
                     id_auditoria,
-                    id_usuario,
-                    usuario,
+                    email_usuario,
+                    nombre_usuario,
+                    rol_usuario,
                     entidad,
                     id_entidad,
                     accion,
                     datos_anteriores,
                     datos_nuevos,
+                    ip_origen,
                     fecha_registro
                 FROM v_erp_auditoria
                 ORDER BY fecha_registro DESC
@@ -419,6 +434,7 @@ def get_audit_log(limit: int = 100, entidad: str = None):
         return [dict(zip(cols, row)) for row in rows], None
 
     except Exception as e:
+        logger.error("Error en get_audit_log: %s", repr(e))
         return None, str(e)
     finally:
         if cursor:
