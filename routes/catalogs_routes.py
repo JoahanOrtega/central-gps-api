@@ -1,8 +1,11 @@
 from flask import Blueprint, jsonify, request
+import logging
 from services.catalog_service import get_operators, get_unit_groups, get_avl_models
 from utils.auth_guard import jwt_required
 
 catalogs_bp = Blueprint("catalogs", __name__)
+
+logger = logging.getLogger(__name__)
 
 
 @catalogs_bp.route("/catalogs/operators", methods=["GET"])
@@ -18,7 +21,7 @@ def list_operators():
         operators = get_operators(id_empresa, search if search else None)
         return jsonify(operators), 200
     except Exception as error:
-        print("ERROR EN /catalogs/operators:", repr(error))
+        logger.error("Error en /catalogs/operators: %s", repr(error), exc_info=True)
         return jsonify({"error": "Error interno del servidor"}), 500
 
 
@@ -35,7 +38,7 @@ def list_unit_groups():
         groups = get_unit_groups(id_empresa, search if search else None)
         return jsonify(groups), 200
     except Exception as error:
-        print("ERROR EN /catalogs/unit-groups:", repr(error))
+        logger.error("Error en /catalogs/unit-groups: %s", repr(error), exc_info=True)
         return jsonify({"error": "Error interno del servidor"}), 500
 
 
@@ -46,5 +49,5 @@ def list_avl_models():
         models = get_avl_models()
         return jsonify(models), 200
     except Exception as error:
-        print("ERROR EN /catalogs/avl-models:", repr(error))
+        logger.error("Error en /catalogs/avl-models: %s", repr(error), exc_info=True)
         return jsonify({"error": "Error interno del servidor"}), 500

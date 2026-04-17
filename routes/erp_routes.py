@@ -1,94 +1,191 @@
+import logging
 from flask import Blueprint, request, jsonify
 from utils.auth_guard import sudo_erp_required
 from services import erp_service
+
+logger = logging.getLogger(__name__)
 
 # Blueprint con prefijo /admin-erp para todas las rutas del panel ERP
 erp_bp = Blueprint("erp", __name__, url_prefix="/admin-erp")
 
 
-# ─────────────────────────────────────────────
-# EMPRESAS
-# ─────────────────────────────────────────────
+# ── Helpers de validación ──────────────────────────────────────────────────────
+
+
+def _parse_limit(
+    raw: str | None, default: int = 100, max_value: int = 500
+) -> tuple[int | None, str | None]:
+    """
+    Parsea y valida el parámetro 'limit' de una query string.
+
+    Reglas:
+      - Si no se provee, usa el default.
+      - Si no es un entero válido, retorna error.
+      - El valor se clampea entre 1 y max_value — nunca permite valores
+        fuera de rango que puedan devolver tablas enteras o valores negativos.
+
+    Args:
+        raw:       Valor crudo del query param (puede ser None).
+        default:   Valor por defecto si no se provee el parámetro.
+        max_value: Cota máxima permitida.
+
+    Returns:
+        Tupla (valor_int, None) en éxito o (None, mensaje_error) en fallo.
+    """
+    if raw is None:
+        return default, None
+
+    try:
+        value = int(raw)
+    except (ValueError, TypeError):
+        return (
+            None,
+            f"El parámetro 'limit' debe ser un número entero, se recibió: '{raw}'",
+        )
+
+    # Clampear al rango [1, max_value] — silenciosamente, sin error.
+    # Valores negativos o cero no tienen sentido semántico.
+    # Valores superiores al máximo se recortan para proteger la BD.
+    return max(1, min(value, max_value)), None
+
+
+# ── EMPRESAS ───────────────────────────────────────────────────────────────────
 
 
 @erp_bp.route("/empresas", methods=["GET"])
 @sudo_erp_required
 def list_companies():
     """Dashboard: resumen de todas las empresas."""
-    data, error = erp_service.get_all_companies()
-    if error:
-        return jsonify({"error": error}), 500
-    return jsonify(data), 200
+    try:
+        data, error = erp_service.get_all_companies()
+        if error:
+            # No exponer el mensaje interno al cliente — puede contener
+            # nombres de tablas, queries o información del schema de BD.
+            logger.error("Error en GET /admin-erp/empresas: %s", error)
+            return jsonify({"error": "No fue posible obtener las empresas"}), 500
+        return jsonify(data), 200
+    except Exception as exc:
+        logger.error("Error en GET /admin-erp/empresas: %s", repr(exc), exc_info=True)
+        return jsonify({"error": "Error interno del servidor"}), 500
 
 
 @erp_bp.route("/empresas", methods=["POST"])
 @sudo_erp_required
 def create_company():
     """Crear una nueva empresa."""
-    body = request.get_json() or {}
+    try:
+        body = request.get_json(silent=True) or {}
 
-    # Validar campo obligatorio
-    if not body.get("nombre"):
-        return jsonify({"error": "El campo 'nombre' es obligatorio"}), 400
+        # Validar campo obligatorio antes de tocar el servicio
+        nombre = body.get("nombre", "").strip()
+        if not nombre:
+            return jsonify({"error": "El campo 'nombre' es obligatorio"}), 400
 
-    data, error = erp_service.create_company(
-        nombre=body.get("nombre"),
-        direccion=body.get("direccion"),
-        telefonos=body.get("telefonos"),
-        lat=body.get("lat"),
-        lng=body.get("lng"),
-        logo=body.get("logo"),
-        id_usuario_registro=int(request.user["sub"]),
-    )
-    if error:
-        return jsonify({"error": error}), 500
-    return jsonify(data), 201
+        data, error = erp_service.create_company(
+            nombre=nombre,
+            direccion=body.get("direccion"),
+            telefonos=body.get("telefonos"),
+            lat=body.get("lat"),
+            lng=body.get("lng"),
+            logo=body.get("logo"),
+            id_usuario_registro=int(request.user["sub"]),
+        )
+        if error:
+            logger.error("Error en POST /admin-erp/empresas: %s", error)
+            return jsonify({"error": "No fue posible crear la empresa"}), 500
+        return jsonify(data), 201
+
+    except Exception as exc:
+        logger.error("Error en POST /admin-erp/empresas: %s", repr(exc), exc_info=True)
+        return jsonify({"error": "Error interno del servidor"}), 500
 
 
 @erp_bp.route("/empresas/<int:id_empresa>", methods=["PUT"])
 @sudo_erp_required
 def update_company(id_empresa):
     """Actualizar datos de una empresa."""
-    body = request.get_json() or {}
-    data, error = erp_service.update_company(
-        id_empresa=id_empresa, datos=body, id_usuario_cambio=int(request.user["sub"])
-    )
-    if error:
-        return jsonify({"error": error}), 500
-    return jsonify(data), 200
+    try:
+        body = request.get_json(silent=True) or {}
+        data, error = erp_service.update_company(
+            id_empresa=id_empresa,
+            datos=body,
+            id_usuario_cambio=int(request.user["sub"]),
+        )
+        if error:
+            logger.error("Error en PUT /admin-erp/empresas/%s: %s", id_empresa, error)
+            return jsonify({"error": "No fue posible actualizar la empresa"}), 500
+        return jsonify(data), 200
+
+    except Exception as exc:
+        logger.error(
+            "Error en PUT /admin-erp/empresas/%s: %s",
+            id_empresa,
+            repr(exc),
+            exc_info=True,
+        )
+        return jsonify({"error": "Error interno del servidor"}), 500
 
 
 @erp_bp.route("/empresas/<int:id_empresa>/status", methods=["PATCH"])
 @sudo_erp_required
 def toggle_company(id_empresa):
     """Activar o suspender una empresa. Body: { status: 0|1 }"""
-    body = request.get_json() or {}
-    status = body.get("status")
+    try:
+        body = request.get_json(silent=True) or {}
+        status = body.get("status")
 
-    if status not in (0, 1):
-        return jsonify({"error": "El campo 'status' debe ser 0 o 1"}), 400
+        if status not in (0, 1):
+            return jsonify({"error": "El campo 'status' debe ser 0 o 1"}), 400
 
-    data, error = erp_service.toggle_company_status(
-        id_empresa=id_empresa, status=status, id_usuario_cambio=int(request.user["sub"])
-    )
-    if error:
-        return jsonify({"error": error}), 500
-    return jsonify(data), 200
+        data, error = erp_service.toggle_company_status(
+            id_empresa=id_empresa,
+            status=status,
+            id_usuario_cambio=int(request.user["sub"]),
+        )
+        if error:
+            logger.error(
+                "Error en PATCH /admin-erp/empresas/%s/status: %s", id_empresa, error
+            )
+            return (
+                jsonify({"error": "No fue posible cambiar el status de la empresa"}),
+                500,
+            )
+        return jsonify(data), 200
+
+    except Exception as exc:
+        logger.error(
+            "Error en PATCH /admin-erp/empresas/%s/status: %s",
+            id_empresa,
+            repr(exc),
+            exc_info=True,
+        )
+        return jsonify({"error": "Error interno del servidor"}), 500
 
 
-# ─────────────────────────────────────────────
-# USUARIOS Y ADMINS DE EMPRESA
-# ─────────────────────────────────────────────
+# ── USUARIOS Y ADMINS DE EMPRESA ──────────────────────────────────────────────
 
 
 @erp_bp.route("/empresas/<int:id_empresa>/usuarios", methods=["GET"])
 @sudo_erp_required
 def list_company_users(id_empresa):
     """Lista todos los usuarios de una empresa."""
-    data, error = erp_service.get_users_by_company(id_empresa)
-    if error:
-        return jsonify({"error": error}), 500
-    return jsonify(data), 200
+    try:
+        data, error = erp_service.get_users_by_company(id_empresa)
+        if error:
+            logger.error(
+                "Error en GET /admin-erp/empresas/%s/usuarios: %s", id_empresa, error
+            )
+            return jsonify({"error": "No fue posible obtener los usuarios"}), 500
+        return jsonify(data), 200
+
+    except Exception as exc:
+        logger.error(
+            "Error en GET /admin-erp/empresas/%s/usuarios: %s",
+            id_empresa,
+            repr(exc),
+            exc_info=True,
+        )
+        return jsonify({"error": "Error interno del servidor"}), 500
 
 
 @erp_bp.route(
@@ -100,61 +197,99 @@ def set_admin(id_empresa, id_usuario):
     Promueve o revoca el rol admin de empresa a un usuario.
     Body: { es_admin: true|false }
     """
-    body = request.get_json() or {}
-    es_admin = body.get("es_admin")
+    try:
+        body = request.get_json(silent=True) or {}
+        es_admin = body.get("es_admin")
 
-    if es_admin is None:
-        return jsonify({"error": "El campo 'es_admin' es obligatorio"}), 400
+        if es_admin is None:
+            return jsonify({"error": "El campo 'es_admin' es obligatorio"}), 400
 
-    data, error = erp_service.set_admin_empresa(
-        id_usuario=id_usuario,
-        id_empresa=id_empresa,
-        es_admin=bool(es_admin),
-        id_usuario_cambio=int(request.user["sub"]),
-    )
-    if error:
-        return jsonify({"error": error}), 500
-    return jsonify(data), 200
+        data, error = erp_service.set_admin_empresa(
+            id_usuario=id_usuario,
+            id_empresa=id_empresa,
+            es_admin=bool(es_admin),
+            id_usuario_cambio=int(request.user["sub"]),
+        )
+        if error:
+            logger.error("Error en PATCH .../usuarios/%s/admin: %s", id_usuario, error)
+            return (
+                jsonify({"error": "No fue posible actualizar el rol de administrador"}),
+                500,
+            )
+        return jsonify(data), 200
+
+    except Exception as exc:
+        logger.error(
+            "Error en PATCH .../usuarios/%s/admin: %s",
+            id_usuario,
+            repr(exc),
+            exc_info=True,
+        )
+        return jsonify({"error": "Error interno del servidor"}), 500
 
 
-# ─────────────────────────────────────────────
-# PERMISOS DEL SISTEMA
-# ─────────────────────────────────────────────
+# ── PERMISOS DEL SISTEMA ───────────────────────────────────────────────────────
 
 
 @erp_bp.route("/permisos", methods=["GET"])
 @sudo_erp_required
 def list_permissions():
     """Catálogo de todos los permisos del sistema."""
-    data, error = erp_service.get_all_permissions()
-    if error:
-        return jsonify({"error": error}), 500
-    return jsonify(data), 200
+    try:
+        data, error = erp_service.get_all_permissions()
+        if error:
+            logger.error("Error en GET /admin-erp/permisos: %s", error)
+            return jsonify({"error": "No fue posible obtener los permisos"}), 500
+        return jsonify(data), 200
+
+    except Exception as exc:
+        logger.error("Error en GET /admin-erp/permisos: %s", repr(exc), exc_info=True)
+        return jsonify({"error": "Error interno del servidor"}), 500
 
 
 @erp_bp.route("/permisos", methods=["POST"])
 @sudo_erp_required
 def create_permission():
     """Agregar un nuevo permiso al catálogo."""
-    body = request.get_json() or {}
+    try:
+        body = request.get_json(silent=True) or {}
 
-    if not body.get("clave") or not body.get("nombre"):
-        return jsonify({"error": "Los campos 'clave' y 'nombre' son obligatorios"}), 400
+        clave = body.get("clave", "").strip()
+        nombre = body.get("nombre", "").strip()
 
-    data, error = erp_service.create_permission(
-        clave=body.get("clave"),
-        nombre=body.get("nombre"),
-        modulo=body.get("modulo"),
-        descripcion=body.get("descripcion"),
-    )
-    if error:
-        return jsonify({"error": error}), 500
-    return jsonify(data), 201
+        if not clave or not nombre:
+            return (
+                jsonify({"error": "Los campos 'clave' y 'nombre' son obligatorios"}),
+                400,
+            )
+
+        data, error = erp_service.create_permission(
+            clave=clave,
+            nombre=nombre,
+            modulo=body.get("modulo"),
+            descripcion=body.get("descripcion"),
+        )
+        if error:
+            logger.error("Error en POST /admin-erp/permisos: %s", error)
+            return jsonify({"error": "No fue posible crear el permiso"}), 500
+        return jsonify(data), 201
+
+    except Exception as exc:
+        logger.error("Error en POST /admin-erp/permisos: %s", repr(exc), exc_info=True)
+        return jsonify({"error": "Error interno del servidor"}), 500
 
 
-# ─────────────────────────────────────────────
-# AUDITORÍA
-# ─────────────────────────────────────────────
+# ── AUDITORÍA ──────────────────────────────────────────────────────────────────
+
+
+# Entidades válidas para filtrar el log de auditoría.
+# Lista explícita para prevenir que se pasen valores arbitrarios al servicio
+# que podrían causar comportamientos inesperados en la query de BD.
+_ENTIDADES_VALIDAS = frozenset({"empresa", "usuario", "permiso", "unidad", "poi"})
+
+# Límite máximo de registros de auditoría por request.
+# Protege contra queries que devuelvan la tabla completa de una vez.
+_AUDIT_LIMIT_MAX = 500
 
 
 @erp_bp.route("/auditoria", methods=["GET"])
@@ -162,12 +297,44 @@ def create_permission():
 def get_audit():
     """
     Log de auditoría del sistema.
-    Query params opcionales: ?limit=100&entidad=empresa
-    """
-    limit = int(request.args.get("limit", 100))
-    entidad = request.args.get("entidad", None)
 
-    data, error = erp_service.get_audit_log(limit=limit, entidad=entidad)
-    if error:
-        return jsonify({"error": error}), 500
-    return jsonify(data), 200
+    Query params opcionales:
+      ?limit=100   → número de registros (1–500, default 100)
+      ?entidad=empresa → filtrar por tipo de entidad
+    """
+    try:
+        # Parsear y validar limit — previene 500 por valor no numérico
+        # y evita queries sin cota que devuelvan toda la tabla
+        limit, limit_error = _parse_limit(
+            request.args.get("limit"),
+            default=100,
+            max_value=_AUDIT_LIMIT_MAX,
+        )
+        if limit_error:
+            return jsonify({"error": limit_error}), 400
+
+        # Validar entidad contra lista blanca — previene pasar valores
+        # arbitrarios al servicio que podrían afectar la query de BD
+        entidad_raw = request.args.get("entidad", "").strip().lower() or None
+        if entidad_raw and entidad_raw not in _ENTIDADES_VALIDAS:
+            return (
+                jsonify(
+                    {
+                        "error": (
+                            f"Entidad '{entidad_raw}' no válida. "
+                            f"Valores permitidos: {', '.join(sorted(_ENTIDADES_VALIDAS))}"
+                        )
+                    }
+                ),
+                400,
+            )
+
+        data, error = erp_service.get_audit_log(limit=limit, entidad=entidad_raw)
+        if error:
+            logger.error("Error en GET /admin-erp/auditoria: %s", error)
+            return jsonify({"error": "No fue posible obtener el log de auditoría"}), 500
+        return jsonify(data), 200
+
+    except Exception as exc:
+        logger.error("Error en GET /admin-erp/auditoria: %s", repr(exc), exc_info=True)
+        return jsonify({"error": "Error interno del servidor"}), 500

@@ -1,4 +1,5 @@
 from flask import Blueprint, jsonify, request
+import logging
 from services.telemetry_service import (
     get_latest_position_by_imei,
     get_positions_history_by_imei,
@@ -10,6 +11,8 @@ from services.telemetry_service import (
 from utils.auth_guard import jwt_required
 
 telemetry_bp = Blueprint("telemetry", __name__)
+
+logger = logging.getLogger(__name__)
 
 
 def get_required_empresa():
@@ -29,7 +32,7 @@ def get_latest_telemetry(imei):
             return jsonify({"error": "No se encontró telemetría o no autorizado"}), 404
         return jsonify(result), 200
     except Exception as error:
-        print("ERROR EN /telemetry/latest:", repr(error))
+        logger.error("Error en /telemetry/latest: %s", repr(error), exc_info=True)
         return jsonify({"error": "Error interno del servidor"}), 500
 
 
@@ -43,12 +46,10 @@ def get_telemetry_history(imei):
         limit = request.args.get("limit", default=500, type=int)
         if not start_date or not end_date:
             return jsonify({"error": "Los parámetros start y end son requeridos"}), 400
-        # Verificar pertenencia (opcional, pero recomendado)
-        # get_positions_history_by_imei no tiene id_empresa, deberíamos agregarlo similar a otros
         result = get_positions_history_by_imei(imei, start_date, end_date, limit)
         return jsonify(result), 200
     except Exception as error:
-        print("ERROR EN /telemetry/history:", repr(error))
+        logger.error("Error en /telemetry/history: %s", repr(error), exc_info=True)
         return jsonify({"error": "Error interno del servidor"}), 500
 
 
@@ -63,7 +64,7 @@ def get_route(imei):
         result = get_route_by_mode(imei, mode, id_empresa)
         return jsonify(result), 200
     except Exception as error:
-        print("ERROR EN /telemetry/route:", repr(error))
+        logger.error("Error en /telemetry/route: %s", repr(error), exc_info=True)
         return jsonify({"error": "Error interno del servidor"}), 500
 
 
@@ -75,7 +76,7 @@ def get_recent_trips(imei):
         result = get_recent_trips_by_imei(imei, limit=10, id_empresa=id_empresa)
         return jsonify(result), 200
     except Exception as error:
-        print("ERROR EN /telemetry/recent-trips:", repr(error))
+        logger.error("Error en /telemetry/recent-trips: %s", repr(error), exc_info=True)
         return jsonify({"error": "Error interno del servidor"}), 500
 
 
@@ -89,7 +90,7 @@ def get_trip(imei, trip_id):
             return jsonify({"error": "Recorrido no encontrado"}), 404
         return jsonify(result), 200
     except Exception as error:
-        print("ERROR EN /telemetry/trip:", repr(error))
+        logger.error("Error en /telemetry/trip: %s", repr(error), exc_info=True)
         return jsonify({"error": "Error interno del servidor"}), 500
 
 
@@ -117,5 +118,5 @@ def get_route_custom(imei):
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     except Exception as error:
-        print("ERROR EN /telemetry/route-custom:", repr(error))
+        logger.error("Error en /telemetry/route-custom: %s", repr(error), exc_info=True)
         return jsonify({"error": "Error interno del servidor"}), 500

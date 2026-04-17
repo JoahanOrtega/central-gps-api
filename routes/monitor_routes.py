@@ -1,4 +1,5 @@
 from flask import Blueprint, jsonify, request
+import logging
 from services.monitor_service import (
     get_units_with_latest_telemetry,
     get_unit_summary_by_imei,
@@ -6,6 +7,8 @@ from services.monitor_service import (
 from utils.auth_guard import jwt_required
 
 monitor_bp = Blueprint("monitor", __name__)
+
+logger = logging.getLogger(__name__)
 
 
 @monitor_bp.route("/monitor/units-live", methods=["GET"])
@@ -19,7 +22,7 @@ def get_units_live():
         result = get_units_with_latest_telemetry(id_empresa, search if search else None)
         return jsonify(result), 200
     except Exception as error:
-        print("ERROR EN /monitor/units-live:", repr(error))
+        logger.error("Error en /monitor/units-live: %s", repr(error), exc_info=True)
         return jsonify({"error": "Error interno del servidor"}), 500
 
 
@@ -35,5 +38,5 @@ def get_unit_summary(imei):
             return jsonify({"error": "Unidad no encontrada"}), 404
         return jsonify(result), 200
     except Exception as error:
-        print("ERROR EN /monitor/unit-summary:", repr(error))
+        logger.error("Error en /monitor/unit-summary: %s", repr(error), exc_info=True)
         return jsonify({"error": "Error interno del servidor"}), 500
