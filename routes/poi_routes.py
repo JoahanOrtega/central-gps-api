@@ -6,7 +6,7 @@ from services.poi_service import (
     create_poi_group,
     get_clients,
 )
-from utils.auth_guard import jwt_required
+from utils.auth_guard import jwt_required, validate_empresa_access
 
 poi_bp = Blueprint("poi", __name__)
 
@@ -30,13 +30,16 @@ def list_pois():
 @jwt_required
 def save_poi():
     try:
-        id_empresa = request.args.get("id_empresa", type=int) or request.user.get(
-            "id_empresa"
-        )
+        data = request.get_json()
+        id_empresa = data.get("id_empresa") or request.user.get("id_empresa")
         id_usuario = request.user.get("sub")
+
         if not id_empresa or not id_usuario:
             return jsonify({"error": "Datos de autenticación incompletos"}), 400
-        data = request.get_json()
+
+        if not validate_empresa_access(id_empresa, request.user):
+            return jsonify({"error": "Acceso no autorizado a esta empresa"}), 403
+
         result = create_poi(data, id_empresa, id_usuario)
         return jsonify({"message": "POI creado correctamente", "poi": result}), 201
     except Exception as error:
@@ -62,15 +65,19 @@ def list_poi_groups():
 @jwt_required
 def save_poi_group():
     try:
-        id_empresa = request.args.get("id_empresa", type=int) or request.user.get(
-            "id_empresa"
-        )
+        data = request.get_json()
+        id_empresa = data.get("id_empresa") or request.user.get("id_empresa")
         id_usuario = request.user.get("sub")
+
         if not id_empresa or not id_usuario:
             return jsonify({"error": "Datos de autenticación incompletos"}), 400
-        data = request.get_json()
+
+        if not validate_empresa_access(id_empresa, request.user):
+            return jsonify({"error": "Acceso no autorizado a esta empresa"}), 403
+
         if not data.get("nombre"):
             return jsonify({"error": "El nombre es requerido"}), 400
+
         result = create_poi_group(data, id_empresa, id_usuario)
         return jsonify({"message": "Grupo creado correctamente", "group": result}), 201
     except Exception as error:

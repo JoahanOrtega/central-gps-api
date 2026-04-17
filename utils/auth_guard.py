@@ -112,3 +112,27 @@ def permiso_required(clave_permiso: str):
         return decorated
 
     return decorator
+
+
+def validate_empresa_access(id_empresa_solicitada: int, user_payload: dict) -> bool:
+    """
+    Valida que el usuario tenga acceso real a la empresa solicitada.
+
+    Reglas:
+      - sudo_erp → acceso total a cualquier empresa
+      - admin_empresa / usuario → solo su propia empresa del JWT
+
+    Uso en endpoints que reciben id_empresa del cliente:
+      id_empresa = data.get("id_empresa") or request.user.get("id_empresa")
+      if not validate_empresa_access(id_empresa, request.user):
+          return jsonify({"error": "Acceso no autorizado a esta empresa"}), 403
+    """
+    rol = user_payload.get("rol")
+
+    # sudo_erp puede operar en cualquier empresa
+    if rol == "sudo_erp":
+        return True
+
+    # Otros roles solo pueden operar en su propia empresa
+    empresa_del_token = user_payload.get("id_empresa")
+    return empresa_del_token == id_empresa_solicitada
