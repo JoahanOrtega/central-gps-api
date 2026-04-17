@@ -55,7 +55,9 @@ def get_telemetry_history(imei):
         limit = request.args.get("limit", default=500, type=int)
         if not start_date or not end_date:
             return jsonify({"error": "Los parámetros start y end son requeridos"}), 400
-        result = get_positions_history_by_imei(imei, start_date, end_date, limit)
+        result = get_positions_history_by_imei(
+            imei, start_date, end_date, limit, id_empresa
+        )
         return jsonify(result), 200
     except Exception as error:
         logger.error("Error en /telemetry/history: %s", repr(error), exc_info=True)
