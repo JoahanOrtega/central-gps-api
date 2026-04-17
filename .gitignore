@@ -4,3 +4,7 @@ venv/
 .env
 .idea/
 .vscode/
+.pytest_cache/
+dist/
+build/
+*.log
