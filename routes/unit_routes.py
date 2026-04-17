@@ -9,9 +9,14 @@ units_bp = Blueprint("units", __name__)
 @jwt_required
 def list_units():
     try:
-        id_empresa = request.user.get("id_empresa")
+        # request.user lo inyecta tu decorador jwt_required
+        id_empresa = request.args.get("id_empresa", type=int) or request.user.get(
+            "id_empresa"
+        )
+
         if not id_empresa:
-            return jsonify({"error": "Empresa no definida"}), 400
+            return {"error": "Empresa no definida"}, 400
+
         search = request.args.get("search", "").strip()
         units = get_units(id_empresa, search if search else None)
         return jsonify(units), 200
@@ -23,14 +28,16 @@ def list_units():
 @jwt_required
 def create_new_unit():
     try:
-        user_payload = request.user
-        id_usuario = user_payload.get("sub")
-        id_empresa = user_payload.get("id_empresa")
+        id_usuario = request.user.get("sub")
+        data = request.get_json()
+
+        # Leer id_empresa del body primero (para sudo_erp),
+        # luego del JWT como fallback (para usuarios normales)
+        id_empresa = data.get("id_empresa") or request.user.get("id_empresa")
+
         if not id_usuario or not id_empresa:
             return jsonify({"error": "Datos de autenticación incompletos"}), 400
 
-        data = request.get_json()
-        # validaciones...
         result = create_unit(data, id_usuario, id_empresa)
         return jsonify({"message": "Unidad creada correctamente", "unit": result}), 201
     except Exception as error:

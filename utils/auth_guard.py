@@ -1,4 +1,3 @@
-# utils/auth_guard.py
 from functools import wraps
 from flask import request, jsonify
 from utils.jwt_handler import decode_jwt

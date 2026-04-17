@@ -15,10 +15,11 @@ poi_bp = Blueprint("poi", __name__)
 @jwt_required
 def list_pois():
     try:
-        id_empresa = request.user.get("id_empresa")
+        id_empresa = request.args.get("id_empresa", type=int) or request.user.get(
+            "id_empresa"
+        )
         if not id_empresa:
             return jsonify({"error": "Empresa no definida"}), 400
-        # print("aaaaaaaaaaaaaa ", id_empresa)
         search = request.args.get("search", "").strip()
         return jsonify(get_pois(id_empresa, search if search else None)), 200
     except Exception as error:
@@ -29,13 +30,13 @@ def list_pois():
 @jwt_required
 def save_poi():
     try:
-        id_empresa = request.user.get("id_empresa")
+        id_empresa = request.args.get("id_empresa", type=int) or request.user.get(
+            "id_empresa"
+        )
         id_usuario = request.user.get("sub")
         if not id_empresa or not id_usuario:
             return jsonify({"error": "Datos de autenticación incompletos"}), 400
-
         data = request.get_json()
-        # validaciones...
         result = create_poi(data, id_empresa, id_usuario)
         return jsonify({"message": "POI creado correctamente", "poi": result}), 201
     except Exception as error:
@@ -46,7 +47,9 @@ def save_poi():
 @jwt_required
 def list_poi_groups():
     try:
-        id_empresa = request.user.get("id_empresa")
+        id_empresa = request.args.get("id_empresa", type=int) or request.user.get(
+            "id_empresa"
+        )
         if not id_empresa:
             return jsonify({"error": "Empresa no definida"}), 400
         search = request.args.get("search", "").strip()
@@ -59,15 +62,15 @@ def list_poi_groups():
 @jwt_required
 def save_poi_group():
     try:
-        id_empresa = request.user.get("id_empresa")
+        id_empresa = request.args.get("id_empresa", type=int) or request.user.get(
+            "id_empresa"
+        )
         id_usuario = request.user.get("sub")
         if not id_empresa or not id_usuario:
             return jsonify({"error": "Datos de autenticación incompletos"}), 400
-
         data = request.get_json()
         if not data.get("nombre"):
             return jsonify({"error": "El nombre es requerido"}), 400
-
         result = create_poi_group(data, id_empresa, id_usuario)
         return jsonify({"message": "Grupo creado correctamente", "group": result}), 201
     except Exception as error:
@@ -78,7 +81,9 @@ def save_poi_group():
 @jwt_required
 def list_clients():
     try:
-        id_empresa = request.user.get("id_empresa")
+        id_empresa = request.args.get("id_empresa", type=int) or request.user.get(
+            "id_empresa"
+        )
         if not id_empresa:
             return jsonify({"error": "Empresa no definida"}), 400
         return jsonify(get_clients(id_empresa)), 200

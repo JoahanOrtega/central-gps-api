@@ -9,7 +9,9 @@ catalogs_bp = Blueprint("catalogs", __name__)
 @jwt_required
 def list_operators():
     try:
-        id_empresa = request.user.get("id_empresa")
+        id_empresa = request.args.get("id_empresa", type=int) or request.user.get(
+            "id_empresa"
+        )
         if not id_empresa:
             return jsonify({"error": "Empresa no definida"}), 400
         search = request.args.get("search", "").strip()
@@ -24,7 +26,9 @@ def list_operators():
 @jwt_required
 def list_unit_groups():
     try:
-        id_empresa = request.user.get("id_empresa")
+        id_empresa = request.args.get("id_empresa", type=int) or request.user.get(
+            "id_empresa"
+        )
         if not id_empresa:
             return jsonify({"error": "Empresa no definida"}), 400
         search = request.args.get("search", "").strip()
