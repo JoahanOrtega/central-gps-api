@@ -116,19 +116,38 @@ def get_route_custom(imei):
         id_empresa = get_required_empresa()
         if not id_empresa:
             return jsonify({"error": "Empresa no definida"}), 400
+
         start_date = request.args.get("start_date")
         start_time = request.args.get("start_time")
         end_date = request.args.get("end_date")
         end_time = request.args.get("end_time")
+
         if not start_date or not end_date:
             return jsonify({"error": "start_date y end_date son obligatorios"}), 400
+
+        # Validar que el rango sea coherente — start no puede ser posterior a end.
+        # Comparación de strings funciona para formato YYYY-MM-DD (ISO 8601).
+        if start_date > end_date:
+            return (
+                jsonify({"error": "start_date debe ser anterior o igual a end_date"}),
+                400,
+            )
+
+        # Cota máxima de puntos para proteger la BD y el cliente.
+        # El frontend puede pedir menos, pero nunca más que MAX_LIMIT.
+        MAX_LIMIT = 5000
+        limit = min(
+            request.args.get("limit", default=MAX_LIMIT, type=int),
+            MAX_LIMIT,
+        )
+
         points = get_route_by_custom_range(
             imei,
             start_date,
             start_time,
             end_date,
             end_time,
-            limit=5000,
+            limit=limit,
             id_empresa=id_empresa,
         )
         return jsonify(points), 200

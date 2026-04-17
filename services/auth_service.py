@@ -1,7 +1,7 @@
 import hashlib
 import logging
 import bcrypt
-from db.connection import get_db_connection
+from db.connection import get_db_connection, release_db_connection
 from utils.jwt_handler import generate_jwt
 
 # Logger del módulo — reemplaza print() para tener trazabilidad real en producción
@@ -225,4 +225,6 @@ def authenticate_user(username: str, password: str):
         if cursor:
             cursor.close()
         if connection:
-            connection.close()
+            # Devolver al pool — connection.close() destruye la conexión
+            # en lugar de reutilizarla, agotando el pool con alta carga
+            release_db_connection(connection)

@@ -63,10 +63,3 @@ class Config:
     TELEMETRY_DB_USER: str = os.getenv("TELEMETRY_DB_USER", "postgres")
     TELEMETRY_DB_PASSWORD: str = _require("TELEMETRY_DB_PASSWORD")
     TELEMETRY_DB_PORT: str = os.getenv("TELEMETRY_DB_PORT", "5432")
-
-    import os
-
-
-from dotenv import load_dotenv
-
-load_dotenv()
