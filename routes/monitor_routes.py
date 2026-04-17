@@ -15,7 +15,10 @@ logger = logging.getLogger(__name__)
 @jwt_required
 def get_units_live():
     try:
-        id_empresa = request.user.get("id_empresa")
+        # Query param primero (para sudo_erp), JWT como fallback (usuarios normales)
+        id_empresa = request.args.get("id_empresa", type=int) or request.user.get(
+            "id_empresa"
+        )
         if not id_empresa:
             return jsonify({"error": "Empresa no definida"}), 400
         search = request.args.get("search", "").strip()
@@ -30,7 +33,10 @@ def get_units_live():
 @jwt_required
 def get_unit_summary(imei):
     try:
-        id_empresa = request.user.get("id_empresa")
+        # Query param primero (para sudo_erp), JWT como fallback (usuarios normales)
+        id_empresa = request.args.get("id_empresa", type=int) or request.user.get(
+            "id_empresa"
+        )
         if not id_empresa:
             return jsonify({"error": "Empresa no definida"}), 400
         result = get_unit_summary_by_imei(imei, id_empresa)

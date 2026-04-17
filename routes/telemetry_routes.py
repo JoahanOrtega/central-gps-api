@@ -17,15 +17,14 @@ logger = logging.getLogger(__name__)
 
 def get_required_empresa():
     """
-    Lee id_empresa del JWT del usuario autenticado.
+    Lee id_empresa del query param primero (para sudo_erp que cambia
+    de empresa vía el frontend), y del JWT como fallback (usuarios normales
+    que tienen su empresa fija en el token).
 
-    Retorna el valor (puede ser None si el usuario es sudo_erp o no
-    tiene empresa asignada). El endpoint que llama a esta función es
-    responsable de validar que el valor no sea None y retornar 400
-    explícitamente — esto evita que un ValueError sea capturado por
-    el except Exception genérico y devuelto al cliente como 500.
+    Retorna el valor o None — el endpoint que llama es responsable de
+    validar y retornar 400 explícitamente si es None.
     """
-    return request.user.get("id_empresa")
+    return request.args.get("id_empresa", type=int) or request.user.get("id_empresa")
 
 
 @telemetry_bp.route("/telemetry/latest/<string:imei>", methods=["GET"])
