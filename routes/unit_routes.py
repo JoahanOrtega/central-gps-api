@@ -1,8 +1,11 @@
+import logging
 from flask import Blueprint, jsonify, request
 from services.unit_service import get_units, create_unit
 from utils.auth_guard import jwt_required, validate_empresa_access
 
 units_bp = Blueprint("units", __name__)
+
+logger = logging.getLogger(__name__)
 
 
 @units_bp.route("/units", methods=["GET"])
@@ -14,14 +17,18 @@ def list_units():
         )
         if not id_empresa:
             return jsonify({"error": "Empresa no definida"}), 400
-        if not validate_empresa_access(id_empresa, request.user):
-            return jsonify({"error": "Acceso no autorizado a esta empresa"}), 403
 
         search = request.args.get("search", "").strip()
         units = get_units(id_empresa, search if search else None)
         return jsonify(units), 200
     except Exception as error:
-        return jsonify({"error": str(error)}), 500
+        logger.error(
+            "Error en GET /units id_empresa=%s: %s",
+            request.args.get("id_empresa"),
+            repr(error),
+            exc_info=True,
+        )
+        return jsonify({"error": "Error interno del servidor"}), 500
 
 
 @units_bp.route("/units", methods=["POST"])
@@ -41,4 +48,10 @@ def create_new_unit():
         result = create_unit(data, id_usuario, id_empresa)
         return jsonify({"message": "Unidad creada correctamente", "unit": result}), 201
     except Exception as error:
-        return jsonify({"error": str(error)}), 500
+        logger.error(
+            "Error en POST /units id_empresa=%s: %s",
+            request.user.get("id_empresa"),
+            repr(error),
+            exc_info=True,
+        )
+        return jsonify({"error": "Error interno del servidor"}), 500

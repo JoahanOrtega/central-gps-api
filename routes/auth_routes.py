@@ -1,9 +1,10 @@
 import logging
-from flask import Blueprint, jsonify, request, current_app
+from flask import Blueprint, jsonify, request
 from services.auth_service import authenticate_user
 from services.company_service import get_user_companies
 from utils.auth_guard import jwt_required
 from utils.jwt_handler import generate_jwt
+from utils.limiter import limiter
 from db.connection import get_db_connection, release_db_connection
 
 logger = logging.getLogger(__name__)
@@ -12,6 +13,7 @@ auth_bp = Blueprint("auth", __name__)
 
 
 @auth_bp.route("/login", methods=["POST"])
+@limiter.limit("10 per minute; 50 per hour")
 def login():
     """
     Autentica al usuario y retorna un JWT con su rol y empresa activa.
@@ -26,13 +28,6 @@ def login():
       - El mensaje y el status code son idénticos para usuario inexistente
         y contraseña incorrecta — previene user enumeration.
     """
-    # Aplicar rate limiting específico para login — más estricto que el global.
-    # get_remote_address() usa el header X-Forwarded-For si está disponible,
-    # lo que funciona correctamente detrás de un proxy reverso (nginx).
-    limiter = current_app.extensions.get("limiter")
-    if limiter:
-        limiter.limit("10 per minute; 50 per hour")(lambda: None)()
-
     try:
         data = request.get_json(silent=True)
         if not data:

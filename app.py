@@ -2,8 +2,8 @@ import os
 import logging
 from flask import Flask, jsonify
 from flask_cors import CORS
-from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
+from utils.limiter import limiter
 from routes import auth_bp, users_bp, units_bp
 from routes.poi_routes import poi_bp
 from routes.telemetry_routes import telemetry_bp
@@ -60,25 +60,14 @@ def create_app() -> Flask:
     )
 
     # ── Rate Limiting ─────────────────────────────────────────────────────────
-    # Limita peticiones por IP para proteger endpoints sensibles.
+    # El limiter se define en utils/limiter.py como singleton importable.
+    # Aquí solo se inicializa con la app y se configura el storage.
     #
-    # Límite global: 200 peticiones/hora por IP — cubre uso normal de la app.
-    # Límites por endpoint se declaran con @limiter.limit() en el route.
-    #
-    # storage_uri: en producción usar Redis para compartir contadores entre
-    # workers de gunicorn. En desarrollo, memoria local es suficiente.
-    #   Redis: LIMITER_STORAGE_URI=redis://localhost:6379/0
-    limiter = Limiter(
-        app=app,
-        key_func=get_remote_address,
-        default_limits=["200 per hour"],
-        storage_uri=os.getenv("LIMITER_STORAGE_URI", "memory://"),
-        # En modo testing desactivar el limiter para no interferir con tests
-        enabled=os.getenv("FLASK_TESTING", "false").lower() != "true",
-    )
-
-    # Adjuntar el limiter al contexto de la app para que los blueprints
-    # puedan accederlo con current_app.extensions["limiter"]
+    # Los blueprints usan @limiter.limit() directamente importando desde
+    # utils.limiter — sin necesidad de current_app.extensions.
+    limiter.storage_uri = os.getenv("LIMITER_STORAGE_URI", "memory://")
+    limiter.enabled = os.getenv("FLASK_TESTING", "false").lower() != "true"
+    limiter.init_app(app)
     app.extensions["limiter"] = limiter
 
     # ── Blueprints ────────────────────────────────────────────────────────────
