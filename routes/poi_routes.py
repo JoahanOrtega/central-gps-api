@@ -20,6 +20,8 @@ def list_pois():
         )
         if not id_empresa:
             return jsonify({"error": "Empresa no definida"}), 400
+        if not validate_empresa_access(id_empresa, request.user):
+            return jsonify({"error": "Acceso no autorizado a esta empresa"}), 403
         search = request.args.get("search", "").strip()
         return jsonify(get_pois(id_empresa, search if search else None)), 200
     except Exception as error:
@@ -55,6 +57,9 @@ def list_poi_groups():
         )
         if not id_empresa:
             return jsonify({"error": "Empresa no definida"}), 400
+        if not validate_empresa_access(id_empresa, request.user):
+            return jsonify({"error": "Acceso no autorizado a esta empresa"}), 403
+
         search = request.args.get("search", "").strip()
         return jsonify(get_poi_groups(id_empresa, search if search else None)), 200
     except Exception as error:
@@ -93,6 +98,9 @@ def list_clients():
         )
         if not id_empresa:
             return jsonify({"error": "Empresa no definida"}), 400
+        if not validate_empresa_access(id_empresa, request.user):
+            return jsonify({"error": "Acceso no autorizado a esta empresa"}), 403
+
         return jsonify(get_clients(id_empresa)), 200
     except Exception as error:
         return jsonify({"error": str(error)}), 500

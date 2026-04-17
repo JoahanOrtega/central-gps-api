@@ -16,10 +16,16 @@ logger = logging.getLogger(__name__)
 
 
 def get_required_empresa():
-    id_empresa = request.user.get("id_empresa")
-    if not id_empresa:
-        raise ValueError("Empresa no definida")
-    return id_empresa
+    """
+    Lee id_empresa del JWT del usuario autenticado.
+
+    Retorna el valor (puede ser None si el usuario es sudo_erp o no
+    tiene empresa asignada). El endpoint que llama a esta función es
+    responsable de validar que el valor no sea None y retornar 400
+    explícitamente — esto evita que un ValueError sea capturado por
+    el except Exception genérico y devuelto al cliente como 500.
+    """
+    return request.user.get("id_empresa")
 
 
 @telemetry_bp.route("/telemetry/latest/<string:imei>", methods=["GET"])
@@ -27,6 +33,8 @@ def get_required_empresa():
 def get_latest_telemetry(imei):
     try:
         id_empresa = get_required_empresa()
+        if not id_empresa:
+            return jsonify({"error": "Empresa no definida"}), 400
         result = get_latest_position_by_imei(imei, id_empresa)
         if not result:
             return jsonify({"error": "No se encontró telemetría o no autorizado"}), 404
@@ -41,6 +49,8 @@ def get_latest_telemetry(imei):
 def get_telemetry_history(imei):
     try:
         id_empresa = get_required_empresa()
+        if not id_empresa:
+            return jsonify({"error": "Empresa no definida"}), 400
         start_date = request.args.get("start")
         end_date = request.args.get("end")
         limit = request.args.get("limit", default=500, type=int)
@@ -58,6 +68,8 @@ def get_telemetry_history(imei):
 def get_route(imei):
     try:
         id_empresa = get_required_empresa()
+        if not id_empresa:
+            return jsonify({"error": "Empresa no definida"}), 400
         mode = request.args.get("mode", "").strip()
         if mode not in ("latest", "today", "yesterday", "day_before_yesterday"):
             return jsonify({"error": "El parámetro mode no es válido"}), 400
@@ -73,6 +85,8 @@ def get_route(imei):
 def get_recent_trips(imei):
     try:
         id_empresa = get_required_empresa()
+        if not id_empresa:
+            return jsonify({"error": "Empresa no definida"}), 400
         result = get_recent_trips_by_imei(imei, limit=10, id_empresa=id_empresa)
         return jsonify(result), 200
     except Exception as error:
@@ -85,6 +99,8 @@ def get_recent_trips(imei):
 def get_trip(imei, trip_id):
     try:
         id_empresa = get_required_empresa()
+        if not id_empresa:
+            return jsonify({"error": "Empresa no definida"}), 400
         result = get_trip_by_id(imei, trip_id, id_empresa)
         if result is None:
             return jsonify({"error": "Recorrido no encontrado"}), 404
@@ -99,6 +115,8 @@ def get_trip(imei, trip_id):
 def get_route_custom(imei):
     try:
         id_empresa = get_required_empresa()
+        if not id_empresa:
+            return jsonify({"error": "Empresa no definida"}), 400
         start_date = request.args.get("start_date")
         start_time = request.args.get("start_time")
         end_date = request.args.get("end_date")

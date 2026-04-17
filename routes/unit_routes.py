@@ -14,6 +14,8 @@ def list_units():
         )
         if not id_empresa:
             return jsonify({"error": "Empresa no definida"}), 400
+        if not validate_empresa_access(id_empresa, request.user):
+            return jsonify({"error": "Acceso no autorizado a esta empresa"}), 403
 
         search = request.args.get("search", "").strip()
         units = get_units(id_empresa, search if search else None)
