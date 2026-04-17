@@ -344,7 +344,24 @@ def get_latest_positions_by_imeis(imeis):
             release_db_telemetry_connection(connection)
 
 
-def get_positions_history_by_imei(imei, start_date, end_date, limit=500):
+def get_positions_history_by_imei(
+    imei, start_date, end_date, limit=500, id_empresa=None
+):
+    """
+    Retorna el historial de posiciones de una unidad en un rango de fechas.
+
+    id_empresa es opcional por compatibilidad con llamadas internas
+    (get_route_by_mode, get_route_by_custom_range) que ya validaron
+    la pertenencia antes de llegar aquí.
+
+    Cuando se llama desde el endpoint HTTP debe pasarse siempre —
+    evita que un usuario conozca el IMEI de otra empresa y consulte
+    su historial directamente.
+    """
+    # Validar que el IMEI pertenezca a la empresa antes de consultar telemetría
+    if id_empresa is not None and not check_unit_belongs_to_company(imei, id_empresa):
+        return []
+
     connection = None
     cursor = None
 
@@ -379,7 +396,6 @@ def get_positions_history_by_imei(imei, start_date, end_date, limit=500):
         if cursor:
             cursor.close()
         if connection:
-            # Devolver al pool — nunca llamar .close() directamente
             release_db_telemetry_connection(connection)
 
 
