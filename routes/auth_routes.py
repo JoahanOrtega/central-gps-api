@@ -4,7 +4,7 @@ from services.auth_service import authenticate_user
 from services.company_service import get_user_companies
 from utils.auth_guard import jwt_required
 from utils.jwt_handler import generate_jwt
-from db.connection import get_db_connection
+from db.connection import get_db_connection, release_db_connection
 
 logger = logging.getLogger(__name__)
 
@@ -117,7 +117,7 @@ def switch_company():
             es_admin_empresa = bool(rel_row[0]) if rel_row else False
         finally:
             cursor.close()
-            connection.close()
+            release_db_connection(connection)
 
         # 4. Generar nuevo JWT con empresa actualizada
         new_user = {

@@ -1,7 +1,11 @@
 from datetime import datetime, timedelta, time, timezone
 from math import radians, sin, cos, sqrt, atan2
-from db.connection import get_db_telemetry_connection
-from db.connection import get_db_connection as get_main_db_connection
+from db.connection import (
+    get_db_telemetry_connection,
+    release_db_telemetry_connection,
+    get_db_connection as get_main_db_connection,
+    release_db_connection,
+)
 
 UTC_TIMEZONE = timezone.utc
 APP_TIMEZONE = timezone(timedelta(hours=-6))
@@ -25,7 +29,8 @@ def check_unit_belongs_to_company(imei, id_empresa):
         if cursor:
             cursor.close()
         if connection:
-            connection.close()
+            # Devolver al pool — nunca llamar .close() directamente
+            release_db_connection(connection)
 
 
 def get_status_code(status):
@@ -190,7 +195,8 @@ def get_latest_route_between_last_two_power_offs(imei):
         if cursor:
             cursor.close()
         if connection:
-            connection.close()
+            # Devolver al pool — nunca llamar .close() directamente
+            release_db_telemetry_connection(connection)
 
 
 def get_latest_position_by_imei(imei, id_empresa=None):
@@ -269,7 +275,8 @@ def get_latest_position_by_imei(imei, id_empresa=None):
         if cursor:
             cursor.close()
         if connection:
-            connection.close()
+            # Devolver al pool — nunca llamar .close() directamente
+            release_db_telemetry_connection(connection)
 
 
 def get_latest_positions_by_imeis(imeis):
@@ -333,7 +340,8 @@ def get_latest_positions_by_imeis(imeis):
         if cursor:
             cursor.close()
         if connection:
-            connection.close()
+            # Devolver al pool — nunca llamar .close() directamente
+            release_db_telemetry_connection(connection)
 
 
 def get_positions_history_by_imei(imei, start_date, end_date, limit=500):
@@ -371,7 +379,8 @@ def get_positions_history_by_imei(imei, start_date, end_date, limit=500):
         if cursor:
             cursor.close()
         if connection:
-            connection.close()
+            # Devolver al pool — nunca llamar .close() directamente
+            release_db_telemetry_connection(connection)
 
 
 def get_route_by_mode(imei, mode, id_empresa=None):
@@ -440,7 +449,8 @@ def get_trip_by_id(imei, trip_id, id_empresa=None):
         if cursor:
             cursor.close()
         if connection:
-            connection.close()
+            # Devolver al pool — nunca llamar .close() directamente
+            release_db_telemetry_connection(connection)
 
 
 def get_recent_trips_by_imei(imei, limit=10, id_empresa=None):
@@ -495,7 +505,8 @@ def get_recent_trips_by_imei(imei, limit=10, id_empresa=None):
         if cursor:
             cursor.close()
         if connection:
-            connection.close()
+            # Devolver al pool — nunca llamar .close() directamente
+            release_db_telemetry_connection(connection)
 
 
 def get_route_by_custom_range(
