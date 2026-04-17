@@ -1,4 +1,7 @@
-from db.connection import get_db_connection
+import logging
+from db.connection import get_db_connection, release_db_connection
+
+logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────
 # MÓDULO: Gestión de empresas
@@ -13,7 +16,22 @@ def get_all_companies():
         connection = get_db_connection()
         cursor = connection.cursor()
 
-        cursor.execute("SELECT * FROM v_erp_resumen_empresas")
+        cursor.execute("""
+            SELECT
+                id_empresa,
+                nombre,
+                direccion,
+                telefonos,
+                lat,
+                lng,
+                logo,
+                status,
+                total_unidades,
+                total_usuarios,
+                fecha_registro
+            FROM v_erp_resumen_empresas
+            ORDER BY nombre ASC
+        """)
         rows = cursor.fetchall()
         cols = [desc[0] for desc in cursor.description]
 
@@ -25,7 +43,7 @@ def get_all_companies():
         if cursor:
             cursor.close()
         if connection:
-            connection.close()
+            release_db_connection(connection)
 
 
 def create_company(
@@ -74,7 +92,7 @@ def create_company(
         if cursor:
             cursor.close()
         if connection:
-            connection.close()
+            release_db_connection(connection)
 
 
 def update_company(id_empresa: int, datos: dict, id_usuario_cambio: int):
@@ -125,7 +143,7 @@ def update_company(id_empresa: int, datos: dict, id_usuario_cambio: int):
         if cursor:
             cursor.close()
         if connection:
-            connection.close()
+            release_db_connection(connection)
 
 
 def toggle_company_status(id_empresa: int, status: int, id_usuario_cambio: int):
@@ -173,7 +191,7 @@ def toggle_company_status(id_empresa: int, status: int, id_usuario_cambio: int):
         if cursor:
             cursor.close()
         if connection:
-            connection.close()
+            release_db_connection(connection)
 
 
 # ─────────────────────────────────────────────
@@ -190,7 +208,20 @@ def get_users_by_company(id_empresa: int):
         cursor = connection.cursor()
 
         cursor.execute(
-            "SELECT * FROM v_erp_usuarios_empresa WHERE id_empresa = %s", (id_empresa,)
+            """
+            SELECT
+                id_usuario,
+                usuario,
+                nombre,
+                id_empresa,
+                es_admin_empresa,
+                status,
+                fecha_registro
+            FROM v_erp_usuarios_empresa
+            WHERE id_empresa = %s
+            ORDER BY nombre ASC
+            """,
+            (id_empresa,),
         )
         rows = cursor.fetchall()
         cols = [desc[0] for desc in cursor.description]
@@ -203,7 +234,7 @@ def get_users_by_company(id_empresa: int):
         if cursor:
             cursor.close()
         if connection:
-            connection.close()
+            release_db_connection(connection)
 
 
 def set_admin_empresa(
@@ -253,7 +284,7 @@ def set_admin_empresa(
         if cursor:
             cursor.close()
         if connection:
-            connection.close()
+            release_db_connection(connection)
 
 
 # ─────────────────────────────────────────────
@@ -269,7 +300,17 @@ def get_all_permissions():
         connection = get_db_connection()
         cursor = connection.cursor()
 
-        cursor.execute("SELECT * FROM v_erp_catalogo_permisos")
+        cursor.execute("""
+            SELECT
+                id_permiso,
+                clave,
+                nombre,
+                modulo,
+                descripcion,
+                total_usuarios
+            FROM v_erp_catalogo_permisos
+            ORDER BY modulo ASC, nombre ASC
+        """)
         rows = cursor.fetchall()
         cols = [desc[0] for desc in cursor.description]
 
@@ -281,7 +322,7 @@ def get_all_permissions():
         if cursor:
             cursor.close()
         if connection:
-            connection.close()
+            release_db_connection(connection)
 
 
 def create_permission(clave: str, nombre: str, modulo: str, descripcion: str):
@@ -313,7 +354,7 @@ def create_permission(clave: str, nombre: str, modulo: str, descripcion: str):
         if cursor:
             cursor.close()
         if connection:
-            connection.close()
+            release_db_connection(connection)
 
 
 # ─────────────────────────────────────────────
@@ -334,11 +375,43 @@ def get_audit_log(limit: int = 100, entidad: str = None):
 
         if entidad:
             cursor.execute(
-                "SELECT * FROM v_erp_auditoria WHERE entidad = %s LIMIT %s",
+                """
+                SELECT
+                    id_auditoria,
+                    id_usuario,
+                    usuario,
+                    entidad,
+                    id_entidad,
+                    accion,
+                    datos_anteriores,
+                    datos_nuevos,
+                    fecha_registro
+                FROM v_erp_auditoria
+                WHERE entidad = %s
+                ORDER BY fecha_registro DESC
+                LIMIT %s
+                """,
                 (entidad, limit),
             )
         else:
-            cursor.execute("SELECT * FROM v_erp_auditoria LIMIT %s", (limit,))
+            cursor.execute(
+                """
+                SELECT
+                    id_auditoria,
+                    id_usuario,
+                    usuario,
+                    entidad,
+                    id_entidad,
+                    accion,
+                    datos_anteriores,
+                    datos_nuevos,
+                    fecha_registro
+                FROM v_erp_auditoria
+                ORDER BY fecha_registro DESC
+                LIMIT %s
+                """,
+                (limit,),
+            )
 
         rows = cursor.fetchall()
         cols = [desc[0] for desc in cursor.description]
@@ -351,7 +424,7 @@ def get_audit_log(limit: int = 100, entidad: str = None):
         if cursor:
             cursor.close()
         if connection:
-            connection.close()
+            release_db_connection(connection)
 
 
 # ─────────────────────────────────────────────

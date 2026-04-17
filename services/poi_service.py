@@ -1,4 +1,7 @@
-from db.connection import get_db_connection
+import logging
+from db.connection import get_db_connection, release_db_connection
+
+logger = logging.getLogger(__name__)
 
 
 def get_pois(id_empresa, search=None):
@@ -84,7 +87,7 @@ def get_pois(id_empresa, search=None):
         if cursor:
             cursor.close()
         if connection:
-            connection.close()
+            release_db_connection(connection)
 
 
 def create_poi(payload, id_empresa, id_usuario_registro):
@@ -157,15 +160,21 @@ def create_poi(payload, id_empresa, id_usuario_registro):
         )
         connection.commit()
         return {"id_poi": poi_id}
-    except Exception:
+    except Exception as e:
         if connection:
             connection.rollback()
+        logger.error(
+            "Error en create_poi id_empresa=%s nombre=%s: %s",
+            id_empresa,
+            payload.get("nombre"),
+            repr(e),
+        )
         raise
     finally:
         if cursor:
             cursor.close()
         if connection:
-            connection.close()
+            release_db_connection(connection)
 
 
 def get_poi_groups(id_empresa, search=None):
@@ -219,7 +228,7 @@ def get_poi_groups(id_empresa, search=None):
         if cursor:
             cursor.close()
         if connection:
-            connection.close()
+            release_db_connection(connection)
 
 
 def create_poi_group(payload, id_empresa, id_usuario_registro):
@@ -255,15 +264,21 @@ def create_poi_group(payload, id_empresa, id_usuario_registro):
         group_id = cursor.fetchone()[0]
         connection.commit()
         return {"id_grupo_pois": group_id}
-    except Exception:
+    except Exception as e:
         if connection:
             connection.rollback()
+        logger.error(
+            "Error en create_poi_group id_empresa=%s nombre=%s: %s",
+            id_empresa,
+            payload.get("nombre"),
+            repr(e),
+        )
         raise
     finally:
         if cursor:
             cursor.close()
         if connection:
-            connection.close()
+            release_db_connection(connection)
 
 
 def save_poi_groups(cursor, id_poi, group_ids, user_id):
@@ -303,4 +318,4 @@ def get_clients(id_empresa):
         if cursor:
             cursor.close()
         if connection:
-            connection.close()
+            release_db_connection(connection)
