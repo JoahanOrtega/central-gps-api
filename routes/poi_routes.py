@@ -8,6 +8,8 @@ from services.poi_service import (
     get_clients,
 )
 from utils.auth_guard import jwt_required, validate_empresa_access
+from utils.validation import validate_payload
+from validators import CreatePoiSchema, CreatePoiGroupSchema
 
 poi_bp = Blueprint("poi", __name__)
 
@@ -33,8 +35,27 @@ def list_pois():
 @poi_bp.route("/pois", methods=["POST"])
 @jwt_required
 def save_poi():
+    """
+    Crea un nuevo POI.
+
+    Validación (marshmallow):
+      - nombre: obligatorio, max 100 chars
+      - tipo_poi: 1 (marcador), 2 (círculo) o 3 (polígono)
+      - lat/lng: obligatorios para tipo 1 y 2, rango [-90,90] y [-180,180]
+      - radio: obligatorio para tipo 2, > 0
+      - polygon_path: obligatorio para tipo 3
+      - colores: formato hex válido (#RRGGBB)
+
+    Respuesta en error:
+      HTTP 422 { "error": "Datos inválidos", "fields": { "campo": ["mensaje"] } }
+    """
+    data = request.get_json(silent=True)
+
+    validation_error = validate_payload(CreatePoiSchema(), data)
+    if validation_error:
+        return validation_error
+
     try:
-        data = request.get_json()
         id_empresa = data.get("id_empresa") or request.user.get("id_empresa")
         id_usuario = request.user.get("sub")
 
@@ -46,6 +67,7 @@ def save_poi():
 
         result = create_poi(data, id_empresa, id_usuario)
         return jsonify({"message": "POI creado correctamente", "poi": result}), 201
+
     except Exception as error:
         logger.error("Error en %s: %s", request.path, repr(error), exc_info=True)
         return jsonify({"error": "Error interno del servidor"}), 500
@@ -70,8 +92,24 @@ def list_poi_groups():
 @poi_bp.route("/poi-groups", methods=["POST"])
 @jwt_required
 def save_poi_group():
+    """
+    Crea un nuevo grupo de POIs.
+
+    Validación (marshmallow):
+      - nombre: obligatorio, max 100 chars
+      - is_default: booleano (default false)
+      - id_cliente: entero opcional
+
+    Respuesta en error:
+      HTTP 422 { "error": "Datos inválidos", "fields": { "campo": ["mensaje"] } }
+    """
+    data = request.get_json(silent=True)
+
+    validation_error = validate_payload(CreatePoiGroupSchema(), data)
+    if validation_error:
+        return validation_error
+
     try:
-        data = request.get_json()
         id_empresa = data.get("id_empresa") or request.user.get("id_empresa")
         id_usuario = request.user.get("sub")
 
@@ -81,11 +119,9 @@ def save_poi_group():
         if not validate_empresa_access(id_empresa, request.user):
             return jsonify({"error": "Acceso no autorizado a esta empresa"}), 403
 
-        if not data.get("nombre"):
-            return jsonify({"error": "El nombre es requerido"}), 400
-
         result = create_poi_group(data, id_empresa, id_usuario)
         return jsonify({"message": "Grupo creado correctamente", "group": result}), 201
+
     except Exception as error:
         logger.error("Error en %s: %s", request.path, repr(error), exc_info=True)
         return jsonify({"error": "Error interno del servidor"}), 500

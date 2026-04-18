@@ -2,6 +2,8 @@ import logging
 from flask import Blueprint, jsonify, request
 from services.unit_service import get_units, create_unit
 from utils.auth_guard import jwt_required, validate_empresa_access
+from utils.validation import validate_payload
+from validators import CreateUnitSchema
 
 units_bp = Blueprint("units", __name__)
 
@@ -34,8 +36,27 @@ def list_units():
 @units_bp.route("/units", methods=["POST"])
 @jwt_required
 def create_new_unit():
+    """
+    Crea una nueva unidad.
+
+    Validación (marshmallow):
+      - numero, marca, tipo, imei, chip, fecha_instalacion: obligatorios
+      - imei: exactamente 10 dígitos numéricos
+      - odometro_inicial: >= 0
+      - fecha_instalacion: no futura
+      - tipo: valor del catálogo [1-7]
+
+    Respuesta en error de validación:
+      HTTP 422 { "error": "Datos inválidos", "fields": { "campo": ["mensaje"] } }
+    """
+    data = request.get_json(silent=True)
+
+    # Validar antes de tocar la BD — si el payload es inválido, fallar rápido
+    validation_error = validate_payload(CreateUnitSchema(), data)
+    if validation_error:
+        return validation_error
+
     try:
-        data = request.get_json()
         id_usuario = request.user.get("sub")
         id_empresa = data.get("id_empresa") or request.user.get("id_empresa")
 
@@ -47,6 +68,7 @@ def create_new_unit():
 
         result = create_unit(data, id_usuario, id_empresa)
         return jsonify({"message": "Unidad creada correctamente", "unit": result}), 201
+
     except Exception as error:
         logger.error(
             "Error en POST /units id_empresa=%s: %s",
