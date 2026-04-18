@@ -1,8 +1,11 @@
+import logging
 from db.connection import get_db_connection, release_db_connection
 from services.telemetry_service import (
     get_latest_positions_by_imeis,
     get_latest_position_by_imei,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def get_units_with_latest_telemetry(id_empresa, search=None):
@@ -68,7 +71,12 @@ def get_units_with_latest_telemetry(id_empresa, search=None):
             result.append({**unit, "telemetry": telemetry_map.get(unit["imei"])})
         return result
     except Exception as error:
-        print("ERROR EN get_units_with_latest_telemetry:", repr(error))
+        logger.error(
+            "Error en get_units_with_latest_telemetry id_empresa=%s: %s",
+            id_empresa,
+            repr(error),
+            exc_info=True,
+        )
         raise
     finally:
         if cursor:
@@ -120,7 +128,12 @@ def get_unit_summary_by_imei(imei, id_empresa):
             "hasTelemetry": latest_telemetry is not None,
         }
     except Exception as error:
-        print("ERROR EN get_unit_summary_by_imei:", repr(error))
+        logger.error(
+            "Error en get_unit_summary_by_imei imei=%s: %s",
+            imei,
+            repr(error),
+            exc_info=True,
+        )
         raise
     finally:
         if cursor:
