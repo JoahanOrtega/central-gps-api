@@ -25,7 +25,6 @@ def _require(key: str) -> str:
     value = os.getenv(key, "").strip()
 
     if not value:
-        # Mensaje claro para el operador — indica qué falta y cómo resolverlo
         sys.exit(
             f"\n[CONFIG ERROR] La variable de entorno '{key}' no está configurada.\n"
             f"  → Revisa tu archivo .env y asegúrate de definir '{key}' con un valor real.\n"
@@ -36,28 +35,45 @@ def _require(key: str) -> str:
 
 
 class Config:
-    # ── Seguridad JWT ──────────────────────────────────────────────────────
-    # SECRET_KEY firma todos los tokens JWT del sistema.
-    # Si esta clave es débil o predecible, un atacante puede fabricar tokens
-    # válidos para cualquier usuario, incluyendo sudo_erp.
-    # Requerida: la app no arranca sin ella.
+    # ── Seguridad JWT — Access Token ──────────────────────────────────────────
+    # SECRET_KEY firma los access tokens JWT (corta duración — 15 min).
+    # Si esta clave es débil, un atacante puede fabricar tokens válidos
+    # para cualquier usuario, incluyendo sudo_erp. Requerida al arrancar.
     SECRET_KEY: str = _require("SECRET_KEY")
 
-    # Duración de los tokens JWT en horas. Default: 8 horas.
-    # Ajustar según política de seguridad del negocio.
-    JWT_EXPIRATION_HOURS: int = int(os.getenv("JWT_EXPIRATION_HOURS", "8"))
+    # Duración del access token en minutos. Default: 15 min.
+    # Corto por diseño — se renueva automáticamente con el refresh token.
+    # No usar horas largas aquí; para sesiones largas usar el refresh token.
+    JWT_EXPIRATION_MINUTES: int = int(os.getenv("JWT_EXPIRATION_MINUTES", "15"))
 
-    # ── Base de datos principal ────────────────────────────────────────────
-    # Host y puerto tienen defaults de desarrollo — no son secretos.
-    # Usuario y contraseña son requeridos: no deben tener defaults débiles.
+    # ── Seguridad JWT — Refresh Token ─────────────────────────────────────────
+    # REFRESH_SECRET_KEY debe ser DIFERENTE a SECRET_KEY.
+    # El refresh token es opaco (no JWT) — esta clave no se usa para firmarlo,
+    # pero sí para validar el contexto de la sesión en el endpoint /auth/refresh.
+    # Genera una clave segura:
+    #   python -c "import secrets; print(secrets.token_hex(64))"
+    REFRESH_SECRET_KEY: str = _require("REFRESH_SECRET_KEY")
+
+    # Duración del refresh token en días. Default: 30 días.
+    # Determina cada cuánto el usuario debe hacer login nuevamente.
+    REFRESH_TOKEN_EXPIRATION_DAYS: int = int(
+        os.getenv("REFRESH_TOKEN_EXPIRATION_DAYS", "30")
+    )
+
+    # ── Frontend ──────────────────────────────────────────────────────────────
+    # URL base del frontend — usada para configurar la cookie del refresh token.
+    # En desarrollo: http://localhost:5173
+    # En producción: https://app.tudominio.com
+    FRONTEND_URL: str = os.getenv("FRONTEND_URL", "http://localhost:5173")
+
+    # ── Base de datos principal ────────────────────────────────────────────────
     DB_HOST: str = os.getenv("DB_HOST", "127.0.0.1")
     DB_NAME: str = os.getenv("DB_NAME", "centralgps")
     DB_USER: str = os.getenv("DB_USER", "postgres")
     DB_PASSWORD: str = _require("DB_PASSWORD")
     DB_PORT: str = os.getenv("DB_PORT", "5432")
 
-    # ── Base de datos de telemetría ────────────────────────────────────────
-    # Misma política: host/puerto/nombre con defaults, contraseña requerida.
+    # ── Base de datos de telemetría ────────────────────────────────────────────
     TELEMETRY_DB_HOST: str = os.getenv("TELEMETRY_DB_HOST", "127.0.0.1")
     TELEMETRY_DB_NAME: str = os.getenv("TELEMETRY_DB_NAME", "centralgps")
     TELEMETRY_DB_USER: str = os.getenv("TELEMETRY_DB_USER", "postgres")
