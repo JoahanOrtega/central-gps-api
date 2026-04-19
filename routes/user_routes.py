@@ -8,7 +8,7 @@ users_bp = Blueprint("users", __name__)
 logger = logging.getLogger(__name__)
 
 
-@users_bp.route("/users", methods=["GET"])
+@users_bp.route("/", methods=["GET"])
 @jwt_required
 @sudo_erp_required
 def get_users():

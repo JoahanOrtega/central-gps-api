@@ -1,5 +1,6 @@
 import logging
 from db.connection import get_db_connection, release_db_connection
+from services.telemetry_service import to_app_iso
 
 logger = logging.getLogger(__name__)
 
@@ -76,9 +77,9 @@ def get_pois(id_empresa, search=None):
                     "polygon_path": row[19],
                     "polygon_color": row[20],
                     "observaciones": row[21],
-                    "fecha_registro": row[22].isoformat() if row[22] else None,
+                    "fecha_registro": to_app_iso(row[22]) if row[22] else None,
                     "id_usuario_registro": row[23],
-                    "fecha_cambio": row[24].isoformat() if row[24] else None,
+                    "fecha_cambio": to_app_iso(row[24]) if row[24] else None,
                     "id_usuario_cambio": row[25],
                 }
             )
@@ -216,9 +217,9 @@ def get_poi_groups(id_empresa, search=None):
                     "nombre": row[3],
                     "pois": row[4],
                     "observaciones": row[5],
-                    "fecha_registro": row[6].isoformat() if row[6] else None,
+                    "fecha_registro": to_app_iso(row[6]) if row[6] else None,
                     "id_usuario_registro": row[7],
-                    "fecha_cambio": row[8].isoformat() if row[8] else None,
+                    "fecha_cambio": to_app_iso(row[8]) if row[8] else None,
                     "id_usuario_cambio": row[9],
                     "is_default": row[10],
                 }
