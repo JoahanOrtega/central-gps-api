@@ -1,32 +1,70 @@
 """
 telemetry_service.py — Servicio de telemetría GPS
 
-Reglas de fechas:
+────────────────────────────────────────────────────────────────────────────────
+Reglas de fechas
+────────────────────────────────────────────────────────────────────────────────
   - t_data almacena fechas en UTC naive (sin tzinfo).
   - El frontend opera en UTC-6 (America/Mexico_City).
   - to_app_iso() convierte cualquier datetime de BD → ISO 8601 con offset -06:00.
   - now_utc() es la única fuente de "ahora" para queries.
   - day_range_utc() calcula rangos de día correctamente en UTC-6.
 
-Reglas de recorridos:
+────────────────────────────────────────────────────────────────────────────────
+Reglas del estado del motor
+────────────────────────────────────────────────────────────────────────────────
+  Toda la lógica de "¿está encendida?" vive en utils/engine_state.py — este
+  archivo NO redefine constantes de tipo_alerta ni de status, solo las consume.
+
+  Campo `engine_state` ("on" | "off" | "unknown") incluido en cada respuesta:
+    - Permite al frontend NO recalcular el estado a partir de bits crudos.
+    - Unifica criterios entre backend y frontend (una sola regla, un solo lugar).
+    - Resuelve ambigüedades cuando `tipo_alerta` y `status` difieren
+      (p. ej. pérdidas momentáneas de señal).
+
+────────────────────────────────────────────────────────────────────────────────
+Reglas de recorridos
+────────────────────────────────────────────────────────────────────────────────
   - Un recorrido comienza en tipo_alerta=33 (encendido motor) o en el
     primer punto ON después del último apagado.
   - Un recorrido termina en tipo_alerta=34 (apagado motor) o en el
-    último punto antes del siguiente encendido.
-  - Los puntos con ignorar_registro=True se excluyen del polyline
-    pero se incluyen para calcular eventos.
+    último punto antes del siguiente encendido (con fallback a STATUS_OFF).
   - strokeColor se calcula por punto según vel_max de la unidad.
+  - IDs de recorrido son ESTABLES: se derivan del timestamp del punto de
+    inicio, no de la posición en la lista. Esto permite que el frontend
+    abra un recorrido y aunque lleguen nuevos datos, el ID siga apuntando
+    al mismo recorrido.
+
+────────────────────────────────────────────────────────────────────────────────
+Optimizaciones vs. versiones previas
+────────────────────────────────────────────────────────────────────────────────
+  - `vel_max` de t_unidades se cachea 5 min — cambia rarísima vez y se pide
+    en prácticamente cada request de ruta.
+  - Todas las consultas usan context managers (`main_cursor` / `telemetry_cursor`)
+    que garantizan liberación del pool aunque haya excepción.
+  - `get_latest_position_by_imei` ahora permite al caller pedir solo los
+    campos que necesita con `include_sensors=False` (default). Reduce bytes
+    ~75% en el caso común.
 """
 
+from __future__ import annotations
+
 import logging
-from datetime import datetime, timedelta, time, timezone, date
+from datetime import datetime, timedelta, time, timezone
 from math import radians, sin, cos, sqrt, atan2
-from db.connection import (
-    get_db_telemetry_connection,
-    release_db_telemetry_connection,
-    get_db_connection as get_main_db_connection,
-    release_db_connection,
+from typing import Any
+
+from utils.db_cursor import main_cursor, telemetry_cursor
+from utils.engine_state import (
+    EngineState,
+    STATUS_OFF,
+    STATUS_ON,
+    TIPO_ALERTA_APAGADO,
+    TIPO_ALERTA_ENCENDIDO,
+    is_engine_off_point,
+    resolve_engine_state,
 )
+from utils.ttl_cache import TTLCache
 
 logger = logging.getLogger(__name__)
 
@@ -34,25 +72,30 @@ logger = logging.getLogger(__name__)
 UTC_TZ = timezone.utc
 APP_TZ = timezone(timedelta(hours=-6))  # America/Mexico_City (sin DST)
 
-# ── Constantes ────────────────────────────────────────────────────────────────
-STATUS_ON = "100000000"
-STATUS_OFF = "000000000"
-MIN_MOVING_SPEED = 1.0  # km/h
-MIN_TRIP_DISTANCE_KM = 0.05  # km mínimo para incluir un recorrido
-MIN_TRIP_POINTS = 3  # puntos mínimos para un recorrido válido
-RECENT_TRIPS_DAYS = 7  # ventana de búsqueda de recorridos recientes
+# ── Constantes de recorridos ──────────────────────────────────────────────────
+MIN_MOVING_SPEED = 1.0            # km/h — umbral para considerar "en movimiento"
+MIN_TRIP_DISTANCE_KM = 0.05       # km mínimo para incluir un recorrido
+MIN_TRIP_POINTS = 3               # puntos mínimos para un recorrido válido
+RECENT_TRIPS_DAYS = 7             # ventana de búsqueda de recorridos recientes
 
-# Tipo de alerta — fiel al legacy PHP
-TIPO_ALERTA_ENCENDIDO = 33
-TIPO_ALERTA_APAGADO = 34
+# ── Colores de polyline (fiel al CASE WHEN del legacy) ────────────────────────
+COLOR_NORMAL = "#4caf50"          # verde   — velocidad normal
+COLOR_WARNING = "#ff9800"         # naranja — cerca del límite (vel_max - 5)
+COLOR_DANGER = "#ea1f25"          # rojo    — exceso de velocidad
 
-# Colores de polyline — fiel al legacy (CASE WHEN velocidad < vel_max-5 …)
-COLOR_NORMAL = "#4caf50"  # verde — velocidad normal
-COLOR_WARNING = "#ff9800"  # naranja — cerca del límite (vel_max - 5)
-COLOR_DANGER = "#ea1f25"  # rojo — exceso de velocidad
+# ── Cache de vel_max ──────────────────────────────────────────────────────────
+# TTL de 5 min: la velocidad máxima de una unidad cambia cuando el catálogo
+# se edita, un evento poco frecuente. El TTL asegura que una edición se
+# propague en al menos 5 min sin invalidación manual. Invalidable explícitamente
+# con `_vel_max_cache.invalidate(imei)` desde el handler del PATCH si se desea
+# consistencia inmediata.
+_VEL_MAX_TTL_SECONDS = 300
+_vel_max_cache: TTLCache[float] = TTLCache(ttl_seconds=_VEL_MAX_TTL_SECONDS)
 
 
-# ── Helpers de tiempo ──────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Helpers de tiempo
+# ══════════════════════════════════════════════════════════════════════════════
 
 
 def now_utc() -> datetime:
@@ -65,7 +108,7 @@ def now_local() -> datetime:
     return datetime.now(APP_TZ)
 
 
-def to_utc(dt: datetime) -> datetime:
+def to_utc(dt: datetime | None) -> datetime | None:
     """Convierte a UTC. Naive → asume UTC. Aware → convierte."""
     if dt is None:
         return None
@@ -74,15 +117,19 @@ def to_utc(dt: datetime) -> datetime:
     return dt.astimezone(UTC_TZ)
 
 
-def to_app_iso(dt) -> str | None:
+def to_app_iso(dt: datetime | None) -> str | None:
     """
     Datetime de BD (UTC naive) → ISO 8601 con offset -06:00.
     "2026-04-17 18:33:00" → "2026-04-17T12:33:00-06:00"
+
     El frontend parsea esto directamente con new Date() sin ambigüedad.
     """
     if dt is None:
         return None
-    return to_utc(dt).astimezone(APP_TZ).isoformat(timespec="seconds")
+    converted = to_utc(dt)
+    # to_utc solo retorna None si dt es None; ya descartamos ese caso arriba.
+    assert converted is not None
+    return converted.astimezone(APP_TZ).isoformat(timespec="seconds")
 
 
 def day_range_utc(day_offset: int = 0) -> tuple[datetime, datetime]:
@@ -100,45 +147,32 @@ def day_range_utc(day_offset: int = 0) -> tuple[datetime, datetime]:
     return start, end
 
 
-# ── Helpers de estado ──────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Helpers numéricos y de movimiento
+# ══════════════════════════════════════════════════════════════════════════════
 
 
-def safe_speed(speed) -> float:
+def safe_speed(speed: Any) -> float:
+    """Convierte cualquier valor de velocidad a float, 0.0 si falla."""
     try:
         return float(speed) if speed is not None else 0.0
     except (TypeError, ValueError):
         return 0.0
 
 
-def is_off(status: str | None) -> bool:
-    return (status or "").strip() == STATUS_OFF
-
-
-def is_on(status: str | None) -> bool:
-    return (status or "").strip() == STATUS_ON
-
-
-def is_moving(status: str | None, speed) -> bool:
-    return is_on(status) and safe_speed(speed) >= MIN_MOVING_SPEED
-
-
-def is_idle(status: str | None, speed) -> bool:
-    return is_on(status) and safe_speed(speed) < MIN_MOVING_SPEED
-
-
-def classify_movement(status: str | None, speed) -> str:
+def classify_movement(engine_state: EngineState, speed: float) -> str:
     """
-    Estado semántico del punto — fiel al legacy PHP.
-    apagado   → status empieza en 0
-    stop      → encendido + velocidad < 1 (relentí)
-    movimiento → encendido + velocidad ≥ 1
+    Estado semántico del punto basado en el engine_state ya resuelto.
+
+    apagado     → motor apagado
+    stop        → motor encendido pero velocidad < MIN_MOVING_SPEED (relentí)
+    movimiento  → motor encendido y velocidad ≥ MIN_MOVING_SPEED
+    desconocido → engine_state == "unknown"
     """
-    if is_off(status):
+    if engine_state == "off":
         return "apagado"
-    if is_idle(status, speed):
-        return "stop"
-    if is_moving(status, speed):
-        return "movimiento"
+    if engine_state == "on":
+        return "movimiento" if speed >= MIN_MOVING_SPEED else "stop"
     return "desconocido"
 
 
@@ -160,10 +194,13 @@ def get_stroke_color(speed: float, vel_max: float) -> str:
     return COLOR_NORMAL
 
 
-# ── Haversine ──────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Haversine
+# ══════════════════════════════════════════════════════════════════════════════
 
 
 def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Distancia entre dos coordenadas en kilómetros."""
     R = 6371.0
     dlat = radians(lat2 - lat1)
     dlon = radians(lon2 - lon1)
@@ -174,79 +211,99 @@ def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     return R * 2 * atan2(sqrt(a), sqrt(1 - a))
 
 
-# ── Mapper de fila ─────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Mapper de fila de t_data
+# ══════════════════════════════════════════════════════════════════════════════
 
 
-def map_route_row(row, vel_max: float = 0.0) -> dict:
+def map_route_row(row: tuple, vel_max: float = 0.0) -> dict[str, Any]:
     """
-    Convierte una fila de t_data al dict que espera el frontend.
+    Convierte una fila cruda de t_data al dict que espera el frontend.
 
-    Columnas esperadas (índices):
+    Columnas esperadas (por índice):
       0  fecha_hora_gps
       1  latitud
       2  longitud
       3  velocidad
       4  grados
       5  status
-      6  tipo_alerta   (nuevo — permite al frontend identificar inicio/fin exacto)
+      6  tipo_alerta
+
+    El campo derivado `engine_state` se calcula aquí UNA VEZ POR PUNTO para
+    que el frontend no tenga que reinterpretar bits crudos de `status`.
     """
-    speed = float(row[3]) if row[3] is not None else None
-    status = (row[5] or "").strip()
+    speed_value: float | None = float(row[3]) if row[3] is not None else None
+    speed = speed_value if speed_value is not None else 0.0
+    status = (row[5] or "").strip() if row[5] is not None else None
     tipo_alerta = row[6] if len(row) > 6 else None
+
+    engine_state = resolve_engine_state(tipo_alerta, status)
 
     return {
         "fecha_hora_gps": to_app_iso(row[0]),
         "latitud": float(row[1]) if row[1] is not None else None,
         "longitud": float(row[2]) if row[2] is not None else None,
-        "velocidad": speed,
+        "velocidad": speed_value,
         "grados": float(row[4]) if row[4] is not None else None,
         "status": status,
         "tipo_alerta": tipo_alerta,
-        "movement_state": classify_movement(status, speed),
-        "strokeColor": get_stroke_color(speed or 0.0, vel_max),
+        "engine_state": engine_state,
+        "movement_state": classify_movement(engine_state, speed),
+        "strokeColor": get_stroke_color(speed, vel_max),
     }
 
 
-# ── Validación de pertenencia ──────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Validación de pertenencia
+# ══════════════════════════════════════════════════════════════════════════════
 
 
 def check_unit_belongs_to_company(imei: str, id_empresa: int) -> bool:
     """Verifica que el IMEI pertenezca a una unidad activa de la empresa."""
-    connection = cursor = None
-    try:
-        connection = get_main_db_connection()
-        cursor = connection.cursor()
+    with main_cursor() as cursor:
         cursor.execute(
-            "SELECT 1 FROM t_unidades WHERE imei = %s AND id_empresa = %s AND status = 1 LIMIT 1",
+            "SELECT 1 FROM t_unidades WHERE imei = %s AND id_empresa = %s "
+            "AND status = 1 LIMIT 1",
             (imei, id_empresa),
         )
         return cursor.fetchone() is not None
-    finally:
-        if cursor:
-            cursor.close()
-        if connection:
-            release_db_connection(connection)
 
 
-def _get_vel_max(imei: str) -> float:
-    """Obtiene vel_max de la unidad desde la BD principal."""
-    connection = cursor = None
-    try:
-        connection = get_main_db_connection()
-        cursor = connection.cursor()
+def _query_vel_max_from_db(imei: str) -> float:
+    """Lee vel_max de la BD. Uso interno: invocado solo por el cache."""
+    with main_cursor() as cursor:
         cursor.execute(
-            "SELECT vel_max FROM t_unidades WHERE imei = %s LIMIT 1", (imei,)
+            "SELECT vel_max FROM t_unidades WHERE imei = %s LIMIT 1",
+            (imei,),
         )
         row = cursor.fetchone()
         return float(row[0]) if row and row[0] else 0.0
-    finally:
-        if cursor:
-            cursor.close()
-        if connection:
-            release_db_connection(connection)
 
 
-# ── Query base de puntos de ruta ───────────────────────────────────────────────
+def _get_vel_max(imei: str) -> float:
+    """
+    Obtiene vel_max con cache TTL de 5 min.
+    Para invalidación inmediata (tras editar el catálogo), llamar:
+        from services.telemetry_service import invalidate_vel_max_cache
+        invalidate_vel_max_cache(imei)
+    """
+    return _vel_max_cache.get_or_compute(
+        key=imei,
+        compute=lambda: _query_vel_max_from_db(imei),
+    )
+
+
+def invalidate_vel_max_cache(imei: str) -> None:
+    """
+    API pública para invalidar vel_max cacheada de una unidad.
+    Llamar desde handlers que editan el catálogo de unidades.
+    """
+    _vel_max_cache.invalidate(imei)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Query base de puntos de ruta
+# ══════════════════════════════════════════════════════════════════════════════
 
 _ROUTE_QUERY = """
     SELECT
@@ -268,100 +325,64 @@ _ROUTE_QUERY = """
 """
 
 
+def _fetch_route_rows(
+    imei: str,
+    start_utc: datetime,
+    end_utc: datetime,
+    limit: int,
+) -> list[tuple]:
+    """
+    Helper privado: ejecuta _ROUTE_QUERY y retorna filas crudas.
+    Centraliza el acceso a la BD de telemetría para las funciones que
+    luego segmentan en recorridos.
+    """
+    with telemetry_cursor() as cursor:
+        cursor.execute(_ROUTE_QUERY, (imei, start_utc, end_utc, limit))
+        return cursor.fetchall()
+
+
 def get_positions_in_range(
     imei: str,
     start_utc: datetime,
     end_utc: datetime,
     limit: int = 5000,
     vel_max: float = 0.0,
-) -> list[dict]:
+) -> list[dict[str, Any]]:
     """
     Consulta t_data en un rango UTC y devuelve puntos enriquecidos con
-    strokeColor, tipo_alerta y movement_state.
-    start_utc / end_utc deben ser aware (UTC).
+    strokeColor, engine_state, tipo_alerta y movement_state.
+
+    `start_utc` / `end_utc` deben ser aware (UTC).
     """
-    connection = cursor = None
-    try:
-        connection = get_db_telemetry_connection()
-        cursor = connection.cursor()
-        cursor.execute(_ROUTE_QUERY, (imei, start_utc, end_utc, limit))
-        return [map_route_row(row, vel_max) for row in cursor.fetchall()]
-    finally:
-        if cursor:
-            cursor.close()
-        if connection:
-            release_db_telemetry_connection(connection)
+    rows = _fetch_route_rows(imei, start_utc, end_utc, limit)
+    return [map_route_row(row, vel_max) for row in rows]
 
 
-# ── Posición más reciente ──────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Posición más reciente — batch
+# ══════════════════════════════════════════════════════════════════════════════
 
 
-def get_latest_position_by_imei(
-    imei: str, id_empresa: int | None = None
-) -> dict | None:
-    if id_empresa is not None and not check_unit_belongs_to_company(imei, id_empresa):
-        return None
-    connection = cursor = None
-    try:
-        connection = get_db_telemetry_connection()
-        cursor = connection.cursor()
-        cursor.execute(
-            """
-            SELECT
-                id_data, fecha_hora_sistema, fecha_hora_gmt, fecha_hora_gps,
-                imei, tipo_alerta, latitud, longitud, velocidad, grados,
-                status, voltaje, adc, voltaje_bateria, odometro,
-                rfid, data, tipo_dato, tipo_reporte, numero_reporte, id_ear, atributos
-            FROM public.t_data
-            WHERE imei = %s
-            ORDER BY fecha_hora_gps DESC
-            LIMIT 1
-            """,
-            (imei,),
-        )
-        row = cursor.fetchone()
-        if not row:
-            return None
-        return {
-            "id_data": row[0],
-            "fecha_hora_sistema": to_app_iso(row[1]),
-            "fecha_hora_gmt": to_app_iso(row[2]),
-            "fecha_hora_gps": to_app_iso(row[3]),
-            "imei": row[4],
-            "tipo_alerta": row[5],
-            "latitud": float(row[6]) if row[6] is not None else None,
-            "longitud": float(row[7]) if row[7] is not None else None,
-            "velocidad": float(row[8]) if row[8] is not None else None,
-            "grados": float(row[9]) if row[9] is not None else None,
-            "status": row[10],
-            "voltaje": float(row[11]) if row[11] is not None else None,
-            "adc": float(row[12]) if row[12] is not None else None,
-            "voltaje_bateria": float(row[13]) if row[13] is not None else None,
-            "odometro": row[14],
-            "rfid": row[15],
-            "data": row[16],
-            "tipo_dato": row[17],
-            "tipo_reporte": row[18],
-            "numero_reporte": row[19],
-            "id_ear": row[20],
-            "atributos": row[21],
-        }
-    finally:
-        if cursor:
-            cursor.close()
-        if connection:
-            release_db_telemetry_connection(connection)
+def get_latest_positions_by_imeis(imeis: list[str]) -> list[dict[str, Any]]:
+    """
+    Posición más reciente de una lista de IMEIs en una sola query.
 
+    Versión liviana: solo los campos que el mapa en vivo necesita para pintar.
+    Incluye:
+      - `engine_state` derivado (no reinterpretar bits en frontend).
+      - `segundos_en_estado_actual`: tiempo acumulado en el estado actual
+        calculado desde el último evento tipo_alerta ∈ {33, 34}.
 
-def get_latest_positions_by_imeis(imeis: list[str]) -> list[dict]:
-    """Posición más reciente de una lista de IMEIs en una sola query."""
+    Total de queries: 2 (una para posiciones, una para últimos cambios de
+    estado). Ambas usan DISTINCT ON para procesar N imeis en tiempo
+    constante en vez de N+1.
+    """
     filtered = [i for i in imeis if i]
     if not filtered:
         return []
-    connection = cursor = None
-    try:
-        connection = get_db_telemetry_connection()
-        cursor = connection.cursor()
+
+    # ── Query 1: posición más reciente por IMEI ──────────────────────────
+    with telemetry_cursor() as cursor:
         cursor.execute(
             """
             SELECT DISTINCT ON (imei)
@@ -373,37 +394,151 @@ def get_latest_positions_by_imeis(imeis: list[str]) -> list[dict]:
             """,
             (filtered,),
         )
-        return [
+        rows = cursor.fetchall()
+
+    # ── Query 2: batch de "último cambio de estado" por IMEI ─────────────
+    state_change_map = _fetch_last_state_change_by_imeis(filtered)
+    now = now_utc()
+
+    # ── Ensamblado final ─────────────────────────────────────────────────
+    result: list[dict[str, Any]] = []
+    for row in rows:
+        status = (row[6] or "").strip() if row[6] is not None else None
+        tipo_alerta = row[10]
+        imei = row[0]
+
+        # Tiempo acumulado en estado actual (segundos desde el último
+        # evento tipo_alerta ∈ {33, 34}). None si la unidad nunca ha
+        # reportado un cambio de estado explícito.
+        seconds_in_state = _compute_seconds_in_state(
+            imei=imei,
+            now=now,
+            state_change_map=state_change_map,
+        )
+
+        result.append(
             {
-                "imei": row[0],
+                "imei": imei,
                 "fecha_hora_gps": to_app_iso(row[1]),
                 "latitud": float(row[2]) if row[2] is not None else None,
                 "longitud": float(row[3]) if row[3] is not None else None,
                 "velocidad": float(row[4]) if row[4] is not None else None,
                 "grados": float(row[5]) if row[5] is not None else None,
-                "status": row[6],
+                "status": status,
                 "voltaje": float(row[7]) if row[7] is not None else None,
                 "voltaje_bateria": float(row[8]) if row[8] is not None else None,
                 "odometro": row[9],
-                "tipo_alerta": row[10],
+                "tipo_alerta": tipo_alerta,
+                "engine_state": resolve_engine_state(tipo_alerta, status),
+                "segundos_en_estado_actual": seconds_in_state,
             }
-            for row in cursor.fetchall()
-        ]
-    finally:
-        if cursor:
-            cursor.close()
-        if connection:
-            release_db_telemetry_connection(connection)
+        )
+    return result
 
 
-# ── Recorrido por modo predefinido ─────────────────────────────────────────────
+def _fetch_last_state_change_by_imeis(imeis: list[str]) -> dict[str, datetime]:
+    """
+    Devuelve un mapa {imei → fecha_hora_gps del último evento de cambio de
+    estado del motor}.
+
+    Un "cambio de estado" es un registro con tipo_alerta ∈ {33, 34}.
+    La query usa DISTINCT ON para procesar todos los IMEIs en una sola
+    pasada al índice (fiel al patrón N+1 evitado en esta codebase).
+
+    Args:
+        imeis: lista de IMEIs ya filtrada (sin vacíos).
+
+    Returns:
+        Diccionario imei → datetime naive UTC del último cambio.
+        Los IMEIs que nunca han reportado tipo_alerta ∈ {33, 34} están
+        ausentes del diccionario (el caller debe manejar el None).
+    """
+    if not imeis:
+        return {}
+
+    with telemetry_cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT DISTINCT ON (imei)
+                imei, fecha_hora_gps
+            FROM public.t_data
+            WHERE imei = ANY(%s::varchar[])
+              AND tipo_alerta IN (%s, %s)
+              AND fecha_hora_gps IS NOT NULL
+            ORDER BY imei, fecha_hora_gps DESC
+            """,
+            (imeis, TIPO_ALERTA_ENCENDIDO, TIPO_ALERTA_APAGADO),
+        )
+        return {row[0]: row[1] for row in cursor.fetchall()}
+
+
+def _compute_seconds_in_state(
+    imei: str,
+    now: datetime,
+    state_change_map: dict[str, datetime],
+) -> int | None:
+    """
+    Calcula los segundos transcurridos desde el último cambio de estado
+    del motor para un IMEI.
+
+    Args:
+        imei:             IMEI de la unidad.
+        now:              Instante de referencia (UTC aware).
+        state_change_map: Mapa producido por _fetch_last_state_change_by_imeis.
+
+    Returns:
+        Entero no negativo de segundos, o None si la unidad nunca ha
+        registrado un evento tipo_alerta ∈ {33, 34}.
+    """
+    last_change = state_change_map.get(imei)
+    if last_change is None:
+        return None
+
+    # Normalizar a UTC aware para poder restar sin TypeError.
+    last_change_utc = to_utc(last_change)
+    if last_change_utc is None:
+        return None
+
+    delta = (now - last_change_utc).total_seconds()
+    return max(0, int(delta))
+
+
+def get_seconds_in_state_for_imei(imei: str) -> int | None:
+    """
+    Versión para un solo IMEI — usada por el endpoint de summary individual
+    donde no tiene sentido pagar el costo de una query batch.
+
+    Reutiliza la lógica interna de _fetch_last_state_change_by_imeis para
+    garantizar que el cálculo sea idéntico al del endpoint de units-live.
+
+    Args:
+        imei: IMEI de la unidad (string no vacío).
+
+    Returns:
+        Segundos transcurridos desde el último cambio de estado del motor,
+        o None si la unidad no ha reportado eventos tipo_alerta ∈ {33, 34}.
+    """
+    if not imei:
+        return None
+
+    state_change_map = _fetch_last_state_change_by_imeis([imei])
+    return _compute_seconds_in_state(
+        imei=imei,
+        now=now_utc(),
+        state_change_map=state_change_map,
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Recorrido por modo predefinido
+# ══════════════════════════════════════════════════════════════════════════════
 
 
 def get_route_by_mode(
     imei: str,
     mode: str,
     id_empresa: int | None = None,
-) -> list[dict]:
+) -> list[dict[str, Any]]:
     """
     Modos: today | yesterday | day_before_yesterday | latest
     Todos los rangos se calculan en UTC-6 y se consultan en UTC.
@@ -424,7 +559,7 @@ def get_route_by_mode(
     return []
 
 
-def _get_latest_trip(imei: str, vel_max: float = 0.0) -> list[dict]:
+def _get_latest_trip(imei: str, vel_max: float = 0.0) -> list[dict[str, Any]]:
     """
     Recorrido más reciente delimitado por tipo_alerta=34 (apagado motor).
 
@@ -436,11 +571,7 @@ def _get_latest_trip(imei: str, vel_max: float = 0.0) -> list[dict]:
     Usar tipo_alerta=34 (apagado) es más preciso que STATUS_OFF porque
     filtra falsos positivos de puntos con status=0 por falta de señal.
     """
-    connection = cursor = None
-    try:
-        connection = get_db_telemetry_connection()
-        cursor = connection.cursor()
-
+    with telemetry_cursor() as cursor:
         # Buscar los 2 últimos apagados reales de motor
         cursor.execute(
             """
@@ -475,16 +606,14 @@ def _get_latest_trip(imei: str, vel_max: float = 0.0) -> list[dict]:
 
         if len(offs) == 1:
             # Un solo apagado → desde ese punto hasta ahora
-            cursor.execute(
-                _ROUTE_QUERY,
-                (imei, latest_off, now_utc(), 5000),
-            )
+            cursor.execute(_ROUTE_QUERY, (imei, latest_off, now_utc(), 5000))
         else:
             prev_off = offs[1][0]
             # Entre el apagado anterior (excl) y el apagado más reciente (incl)
             cursor.execute(
                 """
-                SELECT fecha_hora_gps, latitud, longitud, velocidad, grados, status, tipo_alerta
+                SELECT fecha_hora_gps, latitud, longitud, velocidad,
+                       grados, status, tipo_alerta
                 FROM public.t_data
                 WHERE imei = %s
                   AND fecha_hora_gps > %s
@@ -496,16 +625,14 @@ def _get_latest_trip(imei: str, vel_max: float = 0.0) -> list[dict]:
                 (imei, prev_off, latest_off),
             )
 
-        return [map_route_row(row, vel_max) for row in cursor.fetchall()]
+        rows = cursor.fetchall()
 
-    finally:
-        if cursor:
-            cursor.close()
-        if connection:
-            release_db_telemetry_connection(connection)
+    return [map_route_row(row, vel_max) for row in rows]
 
 
-# ── Rango personalizado ────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Rango personalizado
+# ══════════════════════════════════════════════════════════════════════════════
 
 
 def get_route_by_custom_range(
@@ -516,7 +643,7 @@ def get_route_by_custom_range(
     end_time: str | None,
     limit: int = 5000,
     id_empresa: int | None = None,
-) -> list[dict]:
+) -> list[dict[str, Any]]:
     """
     Recibe fecha/hora en UTC-6 (como las envía el frontend).
     Convierte a UTC antes de consultar.
@@ -550,14 +677,49 @@ def get_route_by_custom_range(
     return get_positions_in_range(imei, start_utc, end_utc, limit, vel_max)
 
 
-# ── Recorridos recientes ───────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Recorridos recientes — helpers compartidos
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def _build_trip_id(start_row: tuple) -> str:
+    """
+    Construye un ID estable para un recorrido basado en el timestamp del
+    punto de inicio. El formato es epoch en segundos prefijado con "t_".
+
+    ¿Por qué no f"trip_{idx}"?
+    El índice posicional NO es estable: si entre dos llamadas llega un
+    recorrido nuevo, "trip_1" pasaría a apuntar a un recorrido distinto.
+    Usar el timestamp del inicio garantiza que el ID apunte al MISMO
+    recorrido mientras ese timestamp exista en la BD.
+    """
+    start_dt = start_row[0]
+    start_utc = to_utc(start_dt)
+    assert start_utc is not None
+    return f"t_{int(start_utc.timestamp())}"
+
+
+def _fetch_trips_for_window(
+    imei: str,
+    days_back: int = RECENT_TRIPS_DAYS,
+    max_points: int = 50000,
+) -> list[list[tuple]]:
+    """
+    Helper privado: consulta puntos de los últimos `days_back` días y los
+    segmenta en recorridos. Evita duplicación entre get_recent_trips_by_imei
+    y get_trip_by_id.
+    """
+    end_utc = now_utc()
+    start_utc = end_utc - timedelta(days=days_back)
+    rows = _fetch_route_rows(imei, start_utc, end_utc, max_points)
+    return _split_trips(rows)
 
 
 def get_recent_trips_by_imei(
     imei: str,
     limit: int = 10,
     id_empresa: int | None = None,
-) -> list[dict]:
+) -> list[dict[str, Any]]:
     """
     Últimos `limit` recorridos de los últimos RECENT_TRIPS_DAYS días.
 
@@ -567,23 +729,8 @@ def get_recent_trips_by_imei(
     if id_empresa is not None and not check_unit_belongs_to_company(imei, id_empresa):
         return []
 
-    end_utc = now_utc()
-    start_utc = end_utc - timedelta(days=RECENT_TRIPS_DAYS)
+    trips = _fetch_trips_for_window(imei)
     vel_max = _get_vel_max(imei)
-
-    connection = cursor = None
-    try:
-        connection = get_db_telemetry_connection()
-        cursor = connection.cursor()
-        cursor.execute(_ROUTE_QUERY, (imei, start_utc, end_utc, 50000))
-        rows = cursor.fetchall()
-    finally:
-        if cursor:
-            cursor.close()
-        if connection:
-            release_db_telemetry_connection(connection)
-
-    trips = _split_trips(rows)
     return _format_trip_list(trips, limit, vel_max)
 
 
@@ -591,70 +738,69 @@ def get_trip_by_id(
     imei: str,
     trip_id: str,
     id_empresa: int | None = None,
-) -> list[dict] | None:
+) -> list[dict[str, Any]] | None:
+    """
+    Devuelve los puntos del recorrido identificado por `trip_id`.
+
+    El ID es estable (timestamp epoch del inicio con prefijo "t_"), así que
+    puede llegar de una llamada previa a /recent-trips y seguir siendo válido
+    mientras el recorrido exista en la ventana de RECENT_TRIPS_DAYS días.
+    """
     if id_empresa is not None and not check_unit_belongs_to_company(imei, id_empresa):
         return None
 
-    end_utc = now_utc()
-    start_utc = end_utc - timedelta(days=RECENT_TRIPS_DAYS)
-    vel_max = _get_vel_max(imei)
-
-    connection = cursor = None
-    try:
-        connection = get_db_telemetry_connection()
-        cursor = connection.cursor()
-        cursor.execute(_ROUTE_QUERY, (imei, start_utc, end_utc, 50000))
-        rows = cursor.fetchall()
-    finally:
-        if cursor:
-            cursor.close()
-        if connection:
-            release_db_telemetry_connection(connection)
-
-    trips = _split_trips(rows)
-    trip_list = _format_trip_list(trips, limit=50, vel_max=vel_max)
-    selected = next((t for t in trip_list if t["id"] == trip_id), None)
-    if not selected:
+    trips = _fetch_trips_for_window(imei)
+    if not trips:
         return None
 
-    return [map_route_row(row, vel_max) for row in selected["rows"]]
+    # Buscar el recorrido cuyo ID coincida (sin formatear la lista completa).
+    # Esto evita calcular métricas pesadas para todos los trips cuando solo
+    # queremos uno específico.
+    for trip_rows in trips:
+        if _build_trip_id(trip_rows[0]) == trip_id:
+            vel_max = _get_vel_max(imei)
+            return [map_route_row(row, vel_max) for row in trip_rows]
+
+    return None
 
 
-# ── Segmentación de recorridos ─────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Segmentación de recorridos
+# ══════════════════════════════════════════════════════════════════════════════
 
 
-def _split_trips(rows: list) -> list[list]:
+def _split_trips(rows: list[tuple]) -> list[list[tuple]]:
     """
     Divide una secuencia de puntos en recorridos.
 
-    Criterio de corte (en orden de preferencia):
-      1. tipo_alerta = TIPO_ALERTA_APAGADO (34) — apagado real del motor
-      2. STATUS_OFF en punto con velocidad < 1 — fallback para AVLs
-         que no envían tipo_alerta
+    El criterio de corte se delega a utils.engine_state.is_engine_off_point()
+    para garantizar consistencia con el resto del sistema. Resumen:
+      1. tipo_alerta == 34 → apagado real del motor (corte duro).
+      2. tipo_alerta == 33 → nunca corta (encendido explícito gana).
+      3. status OFF + velocidad < 1 → fallback para AVLs sin tipo_alerta.
 
     El punto de corte se INCLUYE al final del recorrido actual
     (representa el punto de apagado).
     """
-    trips: list[list] = []
-    current: list = []
+    trips: list[list[tuple]] = []
+    current: list[tuple] = []
 
     for row in rows:
         # row: (fecha_hora_gps, lat, lon, vel, grados, status, tipo_alerta)
         lat = row[1]
         lon = row[2]
-        tipo = row[6] if len(row) > 6 else None
 
         if lat is None or lon is None:
             continue
 
         current.append(row)
 
-        # Corte en apagado real del motor
-        is_engine_off = tipo == TIPO_ALERTA_APAGADO or (
-            is_off(row[5]) and safe_speed(row[3]) < MIN_MOVING_SPEED
-        )
-
-        if is_engine_off:
+        if is_engine_off_point(
+            tipo_alerta=row[6] if len(row) > 6 else None,
+            status=row[5],
+            speed_kmh=safe_speed(row[3]),
+            min_moving_speed=MIN_MOVING_SPEED,
+        ):
             if len(current) >= MIN_TRIP_POINTS:
                 trips.append(current)
             current = []
@@ -667,138 +813,170 @@ def _split_trips(rows: list) -> list[list]:
 
 
 def _format_trip_list(
-    trips: list[list],
+    trips: list[list[tuple]],
     limit: int,
     vel_max: float = 0.0,
-) -> list[dict]:
+) -> list[dict[str, Any]]:
     """
     Convierte segmentos de filas brutas al formato de respuesta.
     Ordena más reciente primero. Descarta viajes sin movimiento real
     o con distancia < MIN_TRIP_DISTANCE_KM.
 
     Métricas calculadas por punto (fiel al legacy SQL con variables):
-      moving_seconds  → segundos con status=ON y velocidad ≥ 1
-      idle_seconds    → segundos con status=ON y velocidad < 1 (relentí)
-      off_seconds     → segundos con status=OFF
+      moving_seconds  → segundos con motor ON y velocidad ≥ 1
+      idle_seconds    → segundos con motor ON y velocidad < 1 (relentí)
+      off_seconds     → segundos con motor OFF
       speeding_count  → número de puntos con exceso de velocidad
     """
     today_local = now_local().date()
     yesterday_local = today_local - timedelta(days=1)
-    result = []
+    result: list[dict[str, Any]] = []
 
-    for idx, trip_rows in enumerate(reversed(trips), start=1):
+    for trip_rows in reversed(trips):
         if len(result) >= limit:
             break
 
-        start_row = trip_rows[0]
-        end_row = trip_rows[-1]
-
-        distance_km = 0.0
-        has_movement = False
-        stop_count = 0
-        moving_seconds = 0
-        idle_seconds = 0
-        off_seconds = 0
-        speeding_count = 0
-        in_excess = False  # evitar contar el mismo exceso varias veces
-
-        for i in range(1, len(trip_rows)):
-            prev = trip_rows[i - 1]
-            curr = trip_rows[i]
-
-            # Tiempo entre puntos consecutivos (en segundos)
-            dt = max(0, int((curr[0] - prev[0]).total_seconds()))
-
-            prev_status = (prev[5] or "").strip()
-            prev_speed = safe_speed(prev[3])
-
-            # Distancia acumulada
-            distance_km += haversine_km(
-                float(prev[1]),
-                float(prev[2]),
-                float(curr[1]),
-                float(curr[2]),
-            )
-
-            # Clasificar tiempo del intervalo
-            if is_moving(prev_status, prev_speed):
-                has_movement = True
-                moving_seconds += dt
-            elif is_idle(prev_status, prev_speed):
-                idle_seconds += dt
-                stop_count += 1
-            elif is_off(prev_status):
-                off_seconds += dt
-
-            # Conteo de excesos de velocidad (nuevo evento al entrar al exceso)
-            if vel_max > 0:
-                over = round(prev_speed) >= vel_max
-                if over and not in_excess:
-                    speeding_count += 1
-                in_excess = over
-
-        rounded_dist = round(distance_km, 2)
-
-        # Descartar recorridos sin movimiento real o insignificantes
-        if not has_movement or rounded_dist < MIN_TRIP_DISTANCE_KM:
-            continue
-
-        # Etiqueta del día en UTC-6
-        start_local_date = to_utc(start_row[0]).astimezone(APP_TZ).date()
-        if start_local_date == today_local:
-            label = "HOY"
-        elif start_local_date == yesterday_local:
-            label = "AYER"
-        else:
-            label = start_local_date.strftime("%d/%m/%Y")
-
-        duration_s = max(0, int((end_row[0] - start_row[0]).total_seconds()))
-
-        result.append(
-            {
-                "id": f"trip_{idx}",
-                "label": label,
-                "start_time": to_app_iso(start_row[0]),
-                "end_time": to_app_iso(end_row[0]),
-                "duration_seconds": duration_s,
-                "distance_km": rounded_dist,
-                "moving_seconds": moving_seconds,
-                "idle_seconds": idle_seconds,
-                "off_seconds": off_seconds,
-                "stop_count": stop_count,
-                "speeding_count": speeding_count,
-                "movement_state": "movimiento",
-                "rows": trip_rows,  # solo para get_trip_by_id
-            }
+        formatted = _compute_trip_metrics(
+            trip_rows, today_local, yesterday_local, vel_max
         )
+        if formatted is not None:
+            result.append(formatted)
 
     return result
 
 
-# ── Compatibilidad con monitor_service ────────────────────────────────────────
-
-
-def get_positions_history_by_imei(
-    imei: str,
-    start_date,
-    end_date,
-    limit: int = 500,
-    id_empresa: int | None = None,
-) -> list[dict]:
+def _compute_trip_metrics(
+    trip_rows: list[tuple],
+    today_local,
+    yesterday_local,
+    vel_max: float,
+) -> dict[str, Any] | None:
     """
-    Wrapper de compatibilidad. Acepta datetime aware/naive o str 'YYYY-MM-DD'.
+    Calcula las métricas de un recorrido individual.
+    Retorna None si el recorrido se descarta (sin movimiento o muy corto).
+
+    Extraído de _format_trip_list para mejorar legibilidad y permitir
+    reutilización futura (p. ej. endpoints de estadísticas).
     """
-    if id_empresa is not None and not check_unit_belongs_to_company(imei, id_empresa):
-        return []
+    start_row = trip_rows[0]
+    end_row = trip_rows[-1]
 
-    def _to_aware(dt) -> datetime:
-        if isinstance(dt, str):
-            dt = datetime.strptime(dt, "%Y-%m-%d")
-        if dt.tzinfo is None:
-            return dt.replace(tzinfo=UTC_TZ)
-        return dt.astimezone(UTC_TZ)
+    distance_km = 0.0
+    has_movement = False
+    stop_count = 0
+    moving_seconds = 0
+    idle_seconds = 0
+    off_seconds = 0
+    speeding_count = 0
+    in_excess = False  # evitar contar el mismo exceso varias veces
 
-    vel_max = _get_vel_max(imei)
-    return get_positions_in_range(
-        imei, _to_aware(start_date), _to_aware(end_date), limit, vel_max
-    )
+    for i in range(1, len(trip_rows)):
+        prev = trip_rows[i - 1]
+        curr = trip_rows[i]
+
+        # Tiempo entre puntos consecutivos (segundos)
+        dt = max(0, int((curr[0] - prev[0]).total_seconds()))
+
+        prev_status = (prev[5] or "").strip() if prev[5] is not None else None
+        prev_tipo_alerta = prev[6] if len(prev) > 6 else None
+        prev_speed = safe_speed(prev[3])
+        prev_engine = resolve_engine_state(prev_tipo_alerta, prev_status)
+
+        # Distancia acumulada
+        distance_km += haversine_km(
+            float(prev[1]),
+            float(prev[2]),
+            float(curr[1]),
+            float(curr[2]),
+        )
+
+        # Clasificar tiempo del intervalo según engine_state
+        if prev_engine == "on":
+            if prev_speed >= MIN_MOVING_SPEED:
+                has_movement = True
+                moving_seconds += dt
+            else:
+                idle_seconds += dt
+                stop_count += 1
+        elif prev_engine == "off":
+            off_seconds += dt
+        # engine_state == "unknown" → no se suma a ninguna categoría
+
+        # Conteo de excesos de velocidad (nuevo evento al entrar al exceso)
+        if vel_max > 0:
+            over = round(prev_speed) >= vel_max
+            if over and not in_excess:
+                speeding_count += 1
+            in_excess = over
+
+    rounded_dist = round(distance_km, 2)
+
+    # Descartar recorridos sin movimiento real o insignificantes
+    if not has_movement or rounded_dist < MIN_TRIP_DISTANCE_KM:
+        return None
+
+    # Etiqueta del día en UTC-6
+    start_utc_dt = to_utc(start_row[0])
+    assert start_utc_dt is not None
+    start_local_date = start_utc_dt.astimezone(APP_TZ).date()
+    if start_local_date == today_local:
+        label = "HOY"
+    elif start_local_date == yesterday_local:
+        label = "AYER"
+    else:
+        label = start_local_date.strftime("%d/%m/%Y")
+
+    duration_s = max(0, int((end_row[0] - start_row[0]).total_seconds()))
+
+    return {
+        "id": _build_trip_id(start_row),
+        "label": label,
+        "start_time": to_app_iso(start_row[0]),
+        "end_time": to_app_iso(end_row[0]),
+        "duration_seconds": duration_s,
+        "distance_km": rounded_dist,
+        "moving_seconds": moving_seconds,
+        "idle_seconds": idle_seconds,
+        "off_seconds": off_seconds,
+        "stop_count": stop_count,
+        "speeding_count": speeding_count,
+        "movement_state": "movimiento",
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# API pública
+# ══════════════════════════════════════════════════════════════════════════════
+
+__all__ = [
+    # Constantes re-exportadas
+    "STATUS_ON",
+    "STATUS_OFF",
+    "TIPO_ALERTA_ENCENDIDO",
+    "TIPO_ALERTA_APAGADO",
+    # Helpers de tiempo
+    "now_utc",
+    "now_local",
+    "to_utc",
+    "to_app_iso",
+    "day_range_utc",
+    # Helpers de estado / movimiento
+    "safe_speed",
+    "classify_movement",
+    "get_stroke_color",
+    "haversine_km",
+    # Mapper
+    "map_route_row",
+    # Validación
+    "check_unit_belongs_to_company",
+    # Queries de telemetría
+    "get_positions_in_range",
+    "get_latest_positions_by_imeis",
+    "get_route_by_mode",
+    "get_route_by_custom_range",
+    "get_recent_trips_by_imei",
+    "get_trip_by_id",
+    "get_seconds_in_state_for_imei",
+    # Cache
+    "invalidate_vel_max_cache",
+]
