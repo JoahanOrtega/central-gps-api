@@ -22,8 +22,7 @@ def get_all_companies():
         connection = get_db_connection()
         cursor = connection.cursor()
 
-        cursor.execute(
-            """
+        cursor.execute("""
             SELECT
                 id_empresa,
                 empresa,
@@ -36,8 +35,7 @@ def get_all_companies():
                 fecha_registro
             FROM v_erp_resumen_empresas
             ORDER BY empresa ASC
-        """
-        )
+        """)
         rows = cursor.fetchall()
         cols = [desc[0] for desc in cursor.description]
 
@@ -257,8 +255,27 @@ def set_admin_empresa(
     id_usuario: int, id_empresa: int, es_admin: bool, id_usuario_cambio: int
 ):
     """
-    Promueve o revoca el rol de admin de empresa a un usuario.
-    Solo el sudo_erp puede hacer esto.
+    Promueve o revoca el rol admin_empresa de un usuario.
+
+    Cambio de diseño (modelo 1:N):
+        Antes: alternaba un flag en r_empresa_usuarios.es_admin_empresa.
+        Ahora: cambia el id_rol en t_usuarios entre 'admin_empresa' y
+        'usuario'. El rol es la fuente única de verdad; la columna
+        es_admin_empresa fue eliminada por redundante.
+
+    Precondiciones:
+        - El usuario debe pertenecer a la empresa (u.id_empresa = id_empresa).
+        - El usuario no puede ser sudo_erp (solo hay un sudo_erp por sistema
+          y no se promueve/degrada por este endpoint).
+
+    Args:
+        id_usuario:         ID del usuario a modificar.
+        id_empresa:         Empresa del usuario (validación de pertenencia).
+        es_admin:           True para promover, False para degradar.
+        id_usuario_cambio:  ID del sudo_erp que ejecuta (auditoría).
+
+    Returns:
+        Tupla (data, error_dict|None) igual al patrón del resto del módulo.
     """
     connection = None
     cursor = None
@@ -266,36 +283,81 @@ def set_admin_empresa(
         connection = get_db_connection()
         cursor = connection.cursor()
 
+        # 1. Validar que el usuario pertenece a la empresa y obtener su rol actual.
         cursor.execute(
             """
-            UPDATE r_empresa_usuarios
-            SET es_admin_empresa  = %s,
-                id_usuario_cambio = %s,
-                fecha_cambio      = CURRENT_TIMESTAMP
-            WHERE id_usuario  = %s
-              AND id_empresa   = %s
+            SELECT u.id_empresa, r.clave AS rol_actual
+              FROM t_usuarios u
+              LEFT JOIN t_roles r ON r.id_rol = u.id_rol
+             WHERE u.id     = %s
+               AND u.status = 1
             """,
-            (1 if es_admin else 0, id_usuario_cambio, id_usuario, id_empresa),
+            (id_usuario,),
         )
-        connection.commit()
+        row = cursor.fetchone()
+        if not row:
+            return None, {
+                "code": "USER_NOT_FOUND",
+                "message": "Usuario no encontrado o inactivo",
+            }
+
+        id_empresa_actual, rol_actual = row
+
+        if id_empresa_actual != id_empresa:
+            return None, {
+                "code": "USER_NOT_IN_EMPRESA",
+                "message": "El usuario no pertenece a la empresa indicada",
+            }
+
+        if rol_actual == _ROL_SUDO_ERP_CLAVE:
+            return None, {
+                "code": "CANNOT_MODIFY_SUDO",
+                "message": "No es posible cambiar el rol del sudo_erp",
+            }
+
+        # 2. Resolver el id_rol destino según la acción.
+        nuevo_rol = _ROL_ADMIN_EMPRESA_CLAVE if es_admin else _ROL_USUARIO_CLAVE
+        nuevo_id_rol = _get_rol_id_by_clave(cursor, nuevo_rol)
+        if nuevo_id_rol is None:
+            logger.error("Rol '%s' no configurado en t_roles", nuevo_rol)
+            return None, {"code": "ROL_NOT_CONFIGURED", "message": "Rol no configurado"}
+
+        # 3. Si ya tiene el rol objetivo, no hacer nada.
+        if rol_actual == nuevo_rol:
+            return {
+                "actualizado": False,
+                "mensaje": "El usuario ya tenía ese rol",
+            }, None
+
+        # 4. Aplicar el cambio en t_usuarios. El trigger de BD
+        #    valida la invariante rol ↔ id_empresa.
+        cursor.execute(
+            "UPDATE t_usuarios SET id_rol = %s WHERE id = %s",
+            (nuevo_id_rol, id_usuario),
+        )
 
         accion = "PROMOTE_ADMIN" if es_admin else "REVOKE_ADMIN"
         _registrar_auditoria(
             cursor=cursor,
             connection=connection,
             id_usuario=id_usuario_cambio,
-            entidad="usuario_empresa",
+            entidad="usuario",
             id_entidad=id_usuario,
             accion=accion,
-            datos_nuevos={"id_empresa": id_empresa, "es_admin_empresa": es_admin},
+            datos_anteriores={"rol": rol_actual},
+            datos_nuevos={"rol": nuevo_rol, "id_empresa": id_empresa},
         )
+        # _registrar_auditoria hace commit interno.
 
         return {"actualizado": True}, None
 
     except Exception as e:
         if connection:
             connection.rollback()
-        return None, str(e)
+        logger.error(
+            "Error en set_admin_empresa id_usuario=%s: %s", id_usuario, repr(e)
+        )
+        return None, {"code": "DATABASE_ERROR", "message": str(e)}
     finally:
         if cursor:
             cursor.close()
@@ -308,9 +370,11 @@ def set_admin_empresa(
 # ─────────────────────────────────────────────
 
 
-# Clave del rol en t_roles. Centralizar la constante evita hardcodear el ID
-# numérico (que puede variar entre ambientes) y documenta la intención.
+# Claves de roles en t_roles. Centralizar evita hardcodear IDs numéricos
+# (que pueden variar entre ambientes) y documenta las intenciones.
+_ROL_SUDO_ERP_CLAVE = "sudo_erp"
 _ROL_ADMIN_EMPRESA_CLAVE = "admin_empresa"
+_ROL_USUARIO_CLAVE = "usuario"
 
 # El campo `perfil` en t_usuarios es legacy del sistema PHP.
 # Convención observada en BD:
@@ -372,10 +436,9 @@ def create_empresa_admin(
       7. Registrar auditoría (entidad='usuario', acción='CREATE_ADMIN_EMPRESA').
       8. Commit.
 
-    Al tener `es_admin_empresa=1` en r_empresa_usuarios, la lógica de login
-    (authenticate_user) lo detectará y le cargará los permisos del rol
-    admin_empresa desde r_rol_permisos — incluyendo TODOS los permisos EXCEPTO
-    cund3 (crear unidades), por la política definida en Fase A.
+    Tras el login, la lógica de authenticate_user detectará el id_rol y
+    cargará los permisos heredados de r_rol_permiso para admin_empresa —
+    todos EXCEPTO cund3 (crear unidades), por la política de Fase A.
 
     Args:
         id_empresa:           Empresa a la que el nuevo usuario será admin.
@@ -430,27 +493,38 @@ def create_empresa_admin(
             bcrypt.gensalt(rounds=BCRYPT_ROUNDS),
         ).decode("utf-8")
 
-        # 5. INSERT en t_usuarios — solo columnas obligatorias.
-        #    Los campos opcionales (email, telefono) se omiten intencionalmente
-        #    si la BD los acepta como NULL; en caso contrario, agregar aquí.
+        # 5. INSERT en t_usuarios incluyendo id_empresa.
+        #    Con el modelo 1:N, la empresa vive directamente en t_usuarios.
+        #    El trigger trg_validar_usuario_empresa garantiza que para el
+        #    rol admin_empresa id_empresa sea no-NULL.
         cursor.execute(
             """
-            INSERT INTO t_usuarios (usuario, clave, nombre, perfil, id_rol, status)
-            VALUES (%s, %s, %s, %s, %s, 1)
+            INSERT INTO t_usuarios
+                (usuario, clave, nombre, perfil, id_rol, id_empresa, status)
+            VALUES (%s, %s, %s, %s, %s, %s, 1)
             RETURNING id
             """,
-            (usuario, clave_hasheada, nombre, _PERFIL_ADMIN_EMPRESA, id_rol),
+            (
+                usuario,
+                clave_hasheada,
+                nombre,
+                _PERFIL_ADMIN_EMPRESA,
+                id_rol,
+                id_empresa,
+            ),
         )
         new_user_id = cursor.fetchone()[0]
 
-        # 6. INSERT en r_empresa_usuarios con la marca de admin.
-        #    Incluye id_usuario_registro para auditoría del propio registro.
+        # 6. INSERT en r_empresa_usuarios — asociación histórica.
+        #    La tabla ya no contiene es_admin_empresa (eliminada en
+        #    migración 003b). Se mantiene como relación simple con
+        #    auditoría, hasta su deprecación completa en una fase futura.
         cursor.execute(
             """
             INSERT INTO r_empresa_usuarios
-                (id_usuario, id_empresa, es_admin_empresa, status,
+                (id_usuario, id_empresa, status,
                  id_usuario_registro, fecha_registro)
-            VALUES (%s, %s, 1, 1, %s, CURRENT_TIMESTAMP)
+            VALUES (%s, %s, 1, %s, CURRENT_TIMESTAMP)
             """,
             (new_user_id, id_empresa, id_usuario_registro),
         )
@@ -468,7 +542,6 @@ def create_empresa_admin(
                 "nombre": nombre,
                 "id_empresa": id_empresa,
                 "rol": _ROL_ADMIN_EMPRESA_CLAVE,
-                "es_admin_empresa": True,
             },
         )
 
@@ -481,7 +554,6 @@ def create_empresa_admin(
                 "nombre": nombre,
                 "id_empresa": id_empresa,
                 "rol": _ROL_ADMIN_EMPRESA_CLAVE,
-                "es_admin_empresa": True,
             },
             None,
         )
@@ -517,8 +589,7 @@ def get_all_permissions():
         connection = get_db_connection()
         cursor = connection.cursor()
 
-        cursor.execute(
-            """
+        cursor.execute("""
             SELECT
                 id_permiso,
                 clave,
@@ -530,8 +601,7 @@ def get_all_permissions():
                 empresas_con_permiso
             FROM v_erp_catalogo_permisos
             ORDER BY modulo ASC, nombre ASC
-        """
-        )
+        """)
         rows = cursor.fetchall()
         cols = [desc[0] for desc in cursor.description]
 

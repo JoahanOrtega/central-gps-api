@@ -113,9 +113,8 @@ def _load_user_permissions(
       2. Permisos específicos del usuario en esa empresa (r_usuario_permisos):
          extras que el sudo_erp o el admin_empresa le asignó individualmente.
 
-    La unión se hace con UNION en SQL (deduplica claves automáticamente)
-    para que si un permiso está en ambas fuentes aparezca solo una vez
-    en el resultado.
+    La unión se hace con SQL (deduplica claves automáticamente) para que si
+    un permiso aparece en ambas fuentes, salga solo una vez en el resultado.
 
     Solo se devuelven permisos con `status = 1` en t_permisos (permite
     "desactivar" un permiso globalmente sin borrar datos históricos).
@@ -210,7 +209,13 @@ def authenticate_user(username: str, password: str):
         connection = get_db_connection()
         cursor = connection.cursor()
 
-        # 1. Buscar usuario activo y obtener su rol normalizado
+        # 1. Buscar usuario activo con su rol y empresa.
+        #    Con el modelo 1:N, la empresa del usuario vive directamente en
+        #    t_usuarios.id_empresa (migración 001). Se hace un solo JOIN a
+        #    t_empresas para traer el nombre y validar que la empresa está
+        #    activa. Si el usuario es sudo_erp, id_empresa es NULL y el
+        #    LEFT JOIN simplemente no trae nombre — es el comportamiento
+        #    esperado (sudo_erp opera a nivel global, no en una empresa).
         cursor.execute(
             """
             SELECT
@@ -220,9 +225,13 @@ def authenticate_user(username: str, password: str):
                 u.nombre,
                 u.perfil,
                 u.id_rol,
-                r.clave     AS rol
+                r.clave      AS rol,
+                u.id_empresa,
+                e.nombre     AS nombre_empresa
             FROM t_usuarios u
-            LEFT JOIN t_roles r ON r.id_rol = u.id_rol
+            LEFT JOIN t_roles   r ON r.id_rol     = u.id_rol
+            LEFT JOIN t_empresas e ON e.id_empresa = u.id_empresa
+                                   AND e.status    = 1
             WHERE u.usuario = %s
               AND u.status  = 1
             """,
@@ -235,7 +244,17 @@ def authenticate_user(username: str, password: str):
         if not row:
             return None, None, ERROR_CREDENCIALES
 
-        user_id, db_username, stored_hash, nombre, perfil, id_rol, rol = row
+        (
+            user_id,
+            db_username,
+            stored_hash,
+            nombre,
+            perfil,
+            id_rol,
+            rol,
+            id_empresa,
+            nombre_empresa,
+        ) = row
 
         # 2. Verificar contraseña — soporta bcrypt (nuevo) y MD5 (legacy PHP)
         if not _verificar_password(password, stored_hash):
@@ -246,35 +265,19 @@ def authenticate_user(username: str, password: str):
         if not _es_hash_bcrypt(stored_hash):
             _migrar_a_bcrypt(cursor, connection, user_id, password)
 
-        # 4. Obtener empresa activa del usuario
-        #    El sudo_erp no tiene empresa asignada en r_empresa_usuarios
-        id_empresa = None
-        nombre_empresa = None
-        es_admin_empresa = False
-
-        if rol != "sudo_erp":
-            cursor.execute(
-                """
-                SELECT
-                    e.id_empresa,
-                    e.nombre,
-                    reu.es_admin_empresa
-                FROM t_empresas e
-                INNER JOIN r_empresa_usuarios reu ON reu.id_empresa = e.id_empresa
-                WHERE reu.id_usuario = %s
-                  AND reu.status     = 1
-                  AND e.status       = 1
-                ORDER BY reu.es_admin_empresa DESC, e.nombre
-                LIMIT 1
-                """,
-                (user_id,),
+        # 4. Validar integridad de datos:
+        #    - sudo_erp debe tener id_empresa = NULL (regla enforced por trigger).
+        #    - Cualquier otro rol debe tener id_empresa asignado y válido.
+        #    Si llega un usuario no-sudo sin empresa, es un dato inconsistente:
+        #    negar el login para no dejar una sesión con contexto ambiguo.
+        if rol != "sudo_erp" and id_empresa is None:
+            logger.error(
+                "Usuario id=%s rol=%s no tiene id_empresa asignado — "
+                "dato inconsistente. Revisar t_usuarios.",
+                user_id,
+                rol,
             )
-            company_row = cursor.fetchone()
-
-            if company_row:
-                id_empresa = company_row[0]
-                nombre_empresa = company_row[1]
-                es_admin_empresa = bool(company_row[2])
+            return None, None, ERROR_CREDENCIALES
 
         # 5. Cargar permisos efectivos del usuario en su empresa activa.
         #    Es la UNIÓN de permisos heredados del rol + específicos del usuario.
@@ -283,7 +286,11 @@ def authenticate_user(username: str, password: str):
         if id_rol is not None:
             permisos = _load_user_permissions(cursor, user_id, id_rol, id_empresa)
 
-        # 6. Construir payload del usuario para el JWT
+        # 6. Construir payload del usuario para el JWT.
+        #    NOTA: "es_admin_empresa" se eliminó como campo independiente.
+        #    Para saber si un usuario es admin de su empresa, comparar:
+        #        user["rol"] == "admin_empresa"
+        #    Esto elimina redundancia con el rol y evita desincronización.
         user = {
             "id": user_id,
             "username": db_username,
@@ -292,7 +299,6 @@ def authenticate_user(username: str, password: str):
             "rol": rol,  # 'sudo_erp' | 'admin_empresa' | 'usuario'
             "id_empresa": id_empresa,
             "nombre_empresa": nombre_empresa,
-            "es_admin_empresa": es_admin_empresa,
             # Lista de claves de permisos efectivos (rol + específicos).
             # El decorador @permiso_required valida contra este campo.
             "permisos": permisos,

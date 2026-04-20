@@ -108,7 +108,18 @@ def login():
 
 @auth_bp.route("/refresh", methods=["POST"])
 def refresh():
-    """Renueva el access token usando el refresh token de la cookie HttpOnly."""
+    """
+    Renueva el access token usando el refresh token de la cookie HttpOnly.
+
+    El JWT renovado mantiene el rol y la empresa del usuario. También incluye
+    los permisos efectivos (rol + específicos) — mismo que al hacer login —
+    para que la sesión renovada respete la autorización del decorador.
+
+    Cambios del refactor 1:N:
+      - id_empresa se lee directamente de t_usuarios (un solo query).
+      - Se eliminó es_admin_empresa: para saber si es admin usar rol.
+      - Se carga 'permisos' en el nuevo JWT (no se hacía antes — bug).
+    """
     try:
         refresh_token_crudo = request.cookies.get(_COOKIE_NAME)
 
@@ -127,12 +138,29 @@ def refresh():
         connection = get_db_connection()
         cursor = connection.cursor()
         try:
+            # Query única: datos del usuario + empresa asignada.
+            # En el modelo 1:N, id_empresa vive en t_usuarios. El LEFT JOIN
+            # a t_empresas filtra e.status=1: si la empresa del usuario fue
+            # suspendida, nombre_empresa queda NULL pero el login continúa
+            # (la política de bloqueo por empresa suspendida se maneja
+            # idealmente antes, al suspender la empresa).
             cursor.execute(
                 """
-                SELECT u.id, u.usuario, u.nombre, u.perfil, r.clave AS rol
+                SELECT
+                    u.id,
+                    u.usuario,
+                    u.nombre,
+                    u.perfil,
+                    u.id_rol,
+                    r.clave       AS rol,
+                    u.id_empresa,
+                    e.nombre      AS nombre_empresa
                 FROM t_usuarios u
-                LEFT JOIN t_roles r ON r.id_rol = u.id_rol
-                WHERE u.id = %s AND u.status = 1
+                LEFT JOIN t_roles    r ON r.id_rol     = u.id_rol
+                LEFT JOIN t_empresas e ON e.id_empresa = u.id_empresa
+                                       AND e.status    = 1
+                WHERE u.id     = %s
+                  AND u.status = 1
                 """,
                 (id_usuario,),
             )
@@ -142,28 +170,39 @@ def refresh():
                 response = jsonify({"error": "Usuario no encontrado o inactivo"})
                 return _clear_refresh_cookie(response), 401
 
-            user_id, username, nombre, perfil, rol = user_row
-            id_empresa = None
-            nombre_empresa = None
-            es_admin_empresa = False
+            (
+                user_id,
+                username,
+                nombre,
+                perfil,
+                id_rol,
+                rol,
+                id_empresa,
+                nombre_empresa,
+            ) = user_row
 
-            if rol != "sudo_erp":
-                cursor.execute(
-                    """
-                    SELECT e.id_empresa, e.nombre, reu.es_admin_empresa
-                    FROM t_empresas e
-                    INNER JOIN r_empresa_usuarios reu ON reu.id_empresa = e.id_empresa
-                    WHERE reu.id_usuario = %s AND reu.status = 1 AND e.status = 1
-                    ORDER BY reu.es_admin_empresa DESC, e.nombre
-                    LIMIT 1
-                    """,
-                    (user_id,),
+            # Validar invariante del modelo 1:N: cualquier rol que no sea
+            # sudo_erp debe tener empresa. Si llega inconsistente, rechazar
+            # el refresh (forzar re-login) — es más seguro que emitir un
+            # token con estado ambiguo.
+            if rol != "sudo_erp" and id_empresa is None:
+                logger.error(
+                    "Refresh rechazado: usuario id=%s rol=%s sin id_empresa",
+                    user_id,
+                    rol,
                 )
-                company_row = cursor.fetchone()
-                if company_row:
-                    id_empresa = company_row[0]
-                    nombre_empresa = company_row[1]
-                    es_admin_empresa = bool(company_row[2])
+                response = jsonify(
+                    {"error": "Sesión inválida. Inicia sesión nuevamente."}
+                )
+                return _clear_refresh_cookie(response), 401
+
+            # Cargar permisos efectivos (rol + específicos). Importado de
+            # auth_service para respetar la lógica canónica de un solo lugar.
+            from services.auth_service import _load_user_permissions
+
+            permisos: list[str] = []
+            if id_rol is not None:
+                permisos = _load_user_permissions(cursor, user_id, id_rol, id_empresa)
         finally:
             cursor.close()
             release_db_connection(connection)
@@ -176,7 +215,7 @@ def refresh():
             "rol": rol,
             "id_empresa": id_empresa,
             "nombre_empresa": nombre_empresa,
-            "es_admin_empresa": es_admin_empresa,
+            "permisos": permisos,
         }
 
         new_access_token = generate_access_token(user)
@@ -216,9 +255,38 @@ def switch_company():
     """
     Cambia la empresa activa del usuario generando un nuevo access token.
 
+    Restricción (modelo 1:N):
+      Solo el rol sudo_erp puede cambiar de empresa. Los clientes
+      (admin_empresa, usuario) pertenecen a UNA empresa — su id_empresa
+      vive directamente en t_usuarios y no se cambia por este endpoint.
+
     Validación:
       - id_empresa: entero positivo (>= 1)
+      - El sudo_erp debe tener acceso a la empresa (validado por
+        get_user_companies que retorna todas las empresas activas para
+        este rol).
+
+    El nuevo JWT incluye los permisos recargados. Aunque el sudo_erp
+    tiene bypass total en el decorador permiso_required, mantener el
+    campo 'permisos' en el payload es coherente con los demás endpoints
+    que emiten tokens (login, refresh).
     """
+    # Bloquear a todos los roles que no sean sudo_erp. Esta es la
+    # única barrera real: el frontend oculta el selector para no-sudo,
+    # pero el backend debe rechazar también, para defensa en profundidad.
+    if request.user.get("rol") != "sudo_erp":
+        return (
+            jsonify(
+                {
+                    "error": (
+                        "Los usuarios cliente pertenecen a una sola empresa. "
+                        "Esta operación está reservada al administrador del sistema."
+                    )
+                }
+            ),
+            403,
+        )
+
     data = request.get_json(silent=True)
 
     validation_error = validate_payload(SwitchCompanySchema(), data)
@@ -230,24 +298,33 @@ def switch_company():
         user_id = user_payload.get("sub")
         new_company_id = data["id_empresa"]
 
+        # Validar que el sudo_erp tiene acceso. get_user_companies() para
+        # sudo_erp retorna todas las empresas activas (company_service.py).
         companies = get_user_companies(user_id)
         target = next((c for c in companies if c["id_empresa"] == new_company_id), None)
 
         if not target:
-            return jsonify({"error": "No tienes acceso a esta empresa"}), 403
+            return jsonify({"error": "La empresa no existe o no está activa"}), 404
 
+        # Recargar permisos para la nueva empresa. El sudo_erp tiene bypass
+        # en el decorador, pero dejar el campo coherente evita sorpresas
+        # si el modelo de permisos cambia en el futuro.
         connection = get_db_connection()
         cursor = connection.cursor()
         try:
+            from services.auth_service import _load_user_permissions
+
             cursor.execute(
-                """
-                SELECT es_admin_empresa FROM r_empresa_usuarios
-                WHERE id_usuario = %s AND id_empresa = %s AND status = 1
-                """,
-                (user_id, new_company_id),
+                "SELECT id_rol FROM t_usuarios WHERE id = %s AND status = 1",
+                (user_id,),
             )
-            rel_row = cursor.fetchone()
-            es_admin_empresa = bool(rel_row[0]) if rel_row else False
+            rol_row = cursor.fetchone()
+            if not rol_row:
+                return jsonify({"error": "Usuario no encontrado"}), 401
+            id_rol = rol_row[0]
+            permisos = _load_user_permissions(
+                cursor, int(user_id), id_rol, new_company_id
+            )
         finally:
             cursor.close()
             release_db_connection(connection)
@@ -260,7 +337,7 @@ def switch_company():
             "rol": user_payload.get("rol"),
             "id_empresa": new_company_id,
             "nombre_empresa": target["nombre"],
-            "es_admin_empresa": es_admin_empresa,
+            "permisos": permisos,
         }
         new_token = generate_jwt(new_user)
 
