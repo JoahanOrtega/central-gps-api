@@ -120,15 +120,21 @@ def get_unit_full_detail(id_unidad: int):
       404 → unidad no existe o pertenece a otra empresa
     """
     try:
-        id_empresa = request.user.get("id_empresa")
+        # Patrón: el query param ?id_empresa=X permite al sudo_erp operar
+        # sobre una empresa específica (su JWT no tiene id_empresa fijo).
+        # Para admin_empresa/usuario, validate_empresa_access confirma que
+        # el id coincide con su JWT — si intentan pasar otra empresa,
+        # responde 403.
+        id_empresa = request.args.get("id_empresa", type=int) or request.user.get(
+            "id_empresa"
+        )
         rol = request.user.get("rol")
 
-        # Un usuario sin empresa asignada no debería haber llegado aquí
-        # (auth_service bloquea login de no-sudo sin id_empresa). Pero
-        # validamos por si acaso — el sudo_erp sí puede tener id_empresa
-        # si ya hizo switch, si no, no puede ver unidades de nadie.
         if not id_empresa:
             return jsonify({"error": "Empresa no definida en la sesión"}), 400
+
+        if not validate_empresa_access(id_empresa, request.user):
+            return jsonify({"error": "Acceso no autorizado a esta empresa"}), 403
 
         unit = get_unit_detail(id_unidad, id_empresa, rol)
         if unit is None:
@@ -185,17 +191,39 @@ def patch_unit(id_unidad: int):
         return jsonify({"error": "No hay campos para actualizar"}), 400
 
     try:
-        id_empresa = request.user.get("id_empresa")
+        # Mismo patrón que el GET: sudo_erp puede pasar id_empresa por query
+        # param o dentro del body (para consistencia con POST /units). Los
+        # otros roles usan su JWT — si pasan otra empresa, 403.
+        id_empresa = (
+            request.args.get("id_empresa", type=int)
+            or data.get("id_empresa")
+            or request.user.get("id_empresa")
+        )
         rol = request.user.get("rol")
         id_usuario = request.user.get("sub")
 
         if not id_empresa or not id_usuario:
             return jsonify({"error": "Datos de autenticación incompletos"}), 400
 
+        if not validate_empresa_access(id_empresa, request.user):
+            return jsonify({"error": "Acceso no autorizado a esta empresa"}), 403
+
+        # id_empresa no es un campo actualizable en la unidad — si vino en
+        # el body junto con otros cambios, lo sacamos antes de pasar al
+        # servicio para que no termine en el UPDATE SQL.
+        payload = {k: v for k, v in data.items() if k != "id_empresa"}
+
+        # Si tras sacar id_empresa el payload quedó vacío, no hay nada que
+        # hacer. Esto puede pasar si el frontend manda {"id_empresa": 1}
+        # pensando que es cambio — queremos evitar el 400 del "body vacío"
+        # que arrojaríamos si no, porque es confuso.
+        if not payload:
+            return jsonify({"error": "No hay campos para actualizar"}), 400
+
         result, error = update_unit(
             id_unidad=id_unidad,
             id_empresa=id_empresa,
-            payload=data,
+            payload=payload,
             rol=rol,
             id_usuario=id_usuario,
         )
