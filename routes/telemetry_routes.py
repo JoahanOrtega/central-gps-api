@@ -10,8 +10,6 @@ Convención de parámetros de fecha:
 from flask import Blueprint, jsonify, request
 import logging
 from services.telemetry_service import (
-    get_latest_position_by_imei,
-    get_positions_history_by_imei,
     get_route_by_mode,
     get_recent_trips_by_imei,
     get_trip_by_id,
@@ -51,51 +49,6 @@ def _empresa_or_400():
     if not empresa:
         return None, (jsonify({"error": "Empresa no definida"}), 400)
     return empresa, None
-
-
-@telemetry_bp.route("/telemetry/latest/<string:imei>", methods=["GET"])
-@jwt_required
-def get_latest_telemetry(imei):
-    """Retorna la posición más reciente de una unidad."""
-    try:
-        empresa, err = _empresa_or_400()
-        if err:
-            return err
-
-        result = get_latest_position_by_imei(imei, empresa)
-        if not result:
-            return jsonify({"error": "Sin telemetría o unidad no autorizada"}), 404
-
-        return jsonify(result), 200
-    except Exception:
-        logger.exception("GET /telemetry/latest/%s", imei)
-        return jsonify({"error": "Error interno del servidor"}), 500
-
-
-@telemetry_bp.route("/telemetry/history/<string:imei>", methods=["GET"])
-@jwt_required
-def get_telemetry_history(imei):
-    """
-    Historial de posiciones en un rango.
-    Params: start (YYYY-MM-DD), end (YYYY-MM-DD), limit (int, max 5000)
-    """
-    try:
-        empresa, err = _empresa_or_400()
-        if err:
-            return err
-
-        start = request.args.get("start")
-        end = request.args.get("end")
-        limit = min(request.args.get("limit", default=500, type=int), MAX_POINTS)
-
-        if not start or not end:
-            return jsonify({"error": "Los parámetros start y end son requeridos"}), 400
-
-        result = get_positions_history_by_imei(imei, start, end, limit, empresa)
-        return jsonify(result), 200
-    except Exception:
-        logger.exception("GET /telemetry/history/%s", imei)
-        return jsonify({"error": "Error interno del servidor"}), 500
 
 
 @telemetry_bp.route("/telemetry/route/<string:imei>", methods=["GET"])
