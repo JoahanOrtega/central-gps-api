@@ -25,7 +25,37 @@ auth_bp = Blueprint("auth", __name__)
 
 _COOKIE_NAME = "refresh_token"
 _COOKIE_MAX_AGE = Config.REFRESH_TOKEN_EXPIRATION_DAYS * 24 * 60 * 60
-_COOKIE_SECURE = not Config.FRONTEND_URL.startswith("http://localhost")
+
+# ── Configuración de la cookie del refresh token ──────────────────────────────
+#
+# Detectamos si estamos en desarrollo local (HTTP + localhost/127.0.0.1) o
+# en producción (cualquier otra cosa, típicamente HTTPS cross-domain).
+#
+# Reglas de cookies del navegador que nos importan:
+#
+#   DESARROLLO (FRONTEND y BACKEND en localhost):
+#     - HTTP permitido (el navegador hace excepción para localhost)
+#     - SameSite=Lax: la cookie se envía en navegaciones y en requests del
+#       MISMO sitio. Suficiente para dev cuando frontend y backend comparten
+#       hostname "localhost".
+#     - Secure=False: obligatorio en HTTP o el navegador rechaza la cookie.
+#
+#   PRODUCCIÓN (HTTPS, frontend y backend posiblemente en subdominios distintos):
+#     - SameSite=None: necesario para cross-site (p.ej. frontend en
+#       app.ejemplo.com llamando al backend en api.ejemplo.com).
+#     - Secure=True: OBLIGATORIO cuando SameSite=None. El navegador rechaza
+#       la cookie si se intenta setear SameSite=None sin Secure.
+#
+# Una mala configuración acá causa 401 silencioso en /auth/refresh: la cookie
+# está en el navegador pero no se envía porque SameSite la bloqueó.
+_IS_LOCAL_DEV = Config.FRONTEND_URL.startswith(
+    "http://localhost"
+) or Config.FRONTEND_URL.startswith("http://127.0.0.1")
+
+# SameSite=None (requerido para cross-site HTTPS) implica Secure=True.
+# Lax es suficiente para dev donde todo corre en localhost same-site.
+_COOKIE_SAMESITE = "Lax" if _IS_LOCAL_DEV else "None"
+_COOKIE_SECURE = not _IS_LOCAL_DEV
 
 
 def _set_refresh_cookie(response, refresh_token_crudo: str):
@@ -35,7 +65,7 @@ def _set_refresh_cookie(response, refresh_token_crudo: str):
         max_age=_COOKIE_MAX_AGE,
         httponly=True,
         secure=_COOKIE_SECURE,
-        samesite="Lax",
+        samesite=_COOKIE_SAMESITE,
         path="/auth",
     )
     return response
@@ -48,7 +78,7 @@ def _clear_refresh_cookie(response):
         max_age=0,
         httponly=True,
         secure=_COOKIE_SECURE,
-        samesite="Lax",
+        samesite=_COOKIE_SAMESITE,
         path="/auth",
     )
     return response
@@ -124,14 +154,23 @@ def refresh():
         refresh_token_crudo = request.cookies.get(_COOKIE_NAME)
 
         if not refresh_token_crudo:
-            response = jsonify({"error": "No hay sesión activa"})
-            return _clear_refresh_cookie(response), 401
+            # Sin cookie no hay nada que limpiar — solo responder 401.
+            return jsonify({"error": "No hay sesión activa"}), 401
 
         result = validate_and_rotate_refresh_token(refresh_token_crudo)
 
         if not result:
-            response = jsonify({"error": "Sesión expirada. Inicia sesión nuevamente."})
-            return _clear_refresh_cookie(response), 401
+            # NO borrar la cookie aquí. Razón: race condition.
+            # Si dos requests paralelos entran con la misma cookie (ej.
+            # React StrictMode en dev duplicando efectos, o navegación
+            # rápida disparando múltiples refresh), el primer request
+            # rota el token y deja la cookie antigua inválida. El segundo
+            # request llega con esa cookie vieja y SI BORRAMOS AQUÍ
+            # machacamos la cookie nueva que el primero acaba de emitir,
+            # terminando la sesión del usuario.
+            # El frontend se encarga de limpiar su estado local cuando
+            # /auth/refresh retorna 401 en condiciones normales.
+            return jsonify({"error": "Sesión expirada. Inicia sesión nuevamente."}), 401
 
         id_usuario = result["id_usuario"]
 

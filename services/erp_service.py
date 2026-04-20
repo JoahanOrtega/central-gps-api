@@ -205,7 +205,28 @@ def toggle_company_status(id_empresa: int, status: int, id_usuario_cambio: int):
 
 
 def get_users_by_company(id_empresa: int):
-    """Devuelve todos los usuarios de una empresa con sus roles."""
+    """
+    Devuelve todos los usuarios activos de una empresa con sus roles.
+
+    Modelo 1:N (tras migración 001):
+      La empresa del usuario vive en t_usuarios.id_empresa, no en
+      r_empresa_usuarios. Esta función consulta directamente t_usuarios +
+      t_roles + t_empresas para no depender del estado de la vista
+      v_erp_usuarios_empresa (que puede requerir actualización por separado).
+
+    Campos retornados — mismos nombres que la vista anterior para
+    compatibilidad con el frontend:
+      - id_empresa, empresa
+      - id_usuario, email_login, nombre_usuario
+      - rol (clave técnica), nombre_rol (nombre legible)
+      - status_usuario, fecha_asignacion
+      - total_permisos (específicos en r_usuario_permisos; excluye heredados)
+
+    Se eliminaron los campos:
+      - es_admin_empresa → ahora se infiere de rol == 'admin_empresa'
+      - status_relacion, autenticacion_2f → no se usan en la UI actual;
+        si hacen falta, se agregan explícitamente.
+    """
     connection = None
     cursor = None
     try:
@@ -215,22 +236,31 @@ def get_users_by_company(id_empresa: int):
         cursor.execute(
             """
             SELECT
-                id_empresa,
-                empresa,
-                id_usuario,
-                email_login,
-                nombre_usuario,
-                rol,
-                nombre_rol,
-                es_admin_empresa,
-                status_relacion,
-                status_usuario,
-                autenticacion_2f,
-                fecha_asignacion,
-                total_permisos
-            FROM v_erp_usuarios_empresa
-            WHERE id_empresa = %s
-            ORDER BY nombre_usuario ASC
+                e.id_empresa                             AS id_empresa,
+                e.nombre                                 AS empresa,
+                u.id                                     AS id_usuario,
+                u.usuario                                AS email_login,
+                u.nombre                                 AS nombre_usuario,
+                COALESCE(r.clave,  'sin_rol')            AS rol,
+                COALESCE(r.nombre, 'Sin rol asignado')   AS nombre_rol,
+                u.status                                 AS status_usuario,
+                u.fecha_registro                         AS fecha_asignacion,
+                COALESCE(perm.total, 0)                  AS total_permisos
+            FROM t_usuarios u
+            INNER JOIN t_empresas e ON e.id_empresa = u.id_empresa
+            LEFT  JOIN t_roles    r ON r.id_rol     = u.id_rol
+            -- Conteo de permisos específicos del usuario en su empresa.
+            -- No incluye heredados del rol (r_rol_permiso) — solo los
+            -- asignados individualmente desde el panel del admin de empresa.
+            LEFT JOIN (
+                SELECT id_usuario, id_empresa, COUNT(*) AS total
+                FROM r_usuario_permisos
+                GROUP BY id_usuario, id_empresa
+            ) perm ON perm.id_usuario = u.id
+                  AND perm.id_empresa = u.id_empresa
+            WHERE u.id_empresa = %s
+              AND u.status     = 1
+            ORDER BY u.nombre ASC
             """,
             (id_empresa,),
         )
@@ -431,8 +461,9 @@ def create_empresa_admin(
       2. Validar que el nombre de usuario esté disponible.
       3. Resolver id_rol del rol 'admin_empresa' (no hardcodear IDs).
       4. Hashear la contraseña con bcrypt.
-      5. INSERT en t_usuarios con perfil=1, status=1.
-      6. INSERT en r_empresa_usuarios con es_admin_empresa=1, status=1.
+      5. INSERT en t_usuarios con id_empresa, id_rol=admin_empresa, perfil=1, status=1.
+      6. INSERT en r_empresa_usuarios (registro histórico; el flag de
+         admin se infiere del rol, no se guarda aquí).
       7. Registrar auditoría (entidad='usuario', acción='CREATE_ADMIN_EMPRESA').
       8. Commit.
 

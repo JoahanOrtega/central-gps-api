@@ -208,9 +208,10 @@ def create_company_admin(id_empresa):
     Crea un usuario admin_empresa dentro de una empresa existente.
 
     Solo el sudo_erp puede ejecutar este endpoint. El usuario creado:
-      - Tiene rol 'admin_empresa' en t_usuarios
-      - Queda asociado a la empresa con es_admin_empresa=1
-      - Recibe automáticamente los permisos de r_rol_permisos para admin_empresa
+      - Tiene rol 'admin_empresa' en t_usuarios (fuente de verdad)
+      - Queda asociado a la empresa (id_empresa en t_usuarios y registro
+        histórico en r_empresa_usuarios)
+      - Recibe automáticamente los permisos de r_rol_permiso para admin_empresa
         (todos los permisos EXCEPTO cund3 = crear unidades)
       - Puede iniciar sesión y acceder a su panel inmediatamente
 
