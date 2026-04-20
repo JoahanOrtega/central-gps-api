@@ -1,6 +1,8 @@
 import logging
 from flask import Blueprint, request, jsonify
 from utils.auth_guard import sudo_erp_required
+from utils.validation import validate_payload
+from validators import CreateEmpresaAdminSchema
 from services import erp_service
 
 logger = logging.getLogger(__name__)
@@ -181,6 +183,105 @@ def list_company_users(id_empresa):
     except Exception as exc:
         logger.error(
             "Error en GET /admin-erp/empresas/%s/usuarios: %s",
+            id_empresa,
+            repr(exc),
+            exc_info=True,
+        )
+        return jsonify({"error": "Error interno del servidor"}), 500
+
+
+# Mapeo de códigos de error del service a códigos HTTP.
+# Se separa del service (que no debe conocer HTTP) y permite que las rutas
+# ofrezcan mensajes distintos sin duplicar lógica de negocio.
+_ADMIN_CREATE_ERROR_STATUS = {
+    "EMPRESA_NOT_FOUND": 404,
+    "USERNAME_TAKEN": 409,
+    "ROL_NOT_CONFIGURED": 500,
+    "DATABASE_ERROR": 500,
+}
+
+
+@erp_bp.route("/empresas/<int:id_empresa>/usuarios", methods=["POST"])
+@sudo_erp_required
+def create_company_admin(id_empresa):
+    """
+    Crea un usuario admin_empresa dentro de una empresa existente.
+
+    Solo el sudo_erp puede ejecutar este endpoint. El usuario creado:
+      - Tiene rol 'admin_empresa' en t_usuarios
+      - Queda asociado a la empresa con es_admin_empresa=1
+      - Recibe automáticamente los permisos de r_rol_permisos para admin_empresa
+        (todos los permisos EXCEPTO cund3 = crear unidades)
+      - Puede iniciar sesión y acceder a su panel inmediatamente
+
+    Body JSON esperado (validado por CreateEmpresaAdminSchema):
+      {
+        "usuario":  "juanperez",          // login, único en t_usuarios
+        "clave":    "password123",        // 8-128 chars, se hashea con bcrypt
+        "nombre":   "Juan Pérez",         // nombre visible
+        "email":    "juan@cliente.com",   // opcional
+        "telefono": "+52 55 1234 5678"    // opcional
+      }
+
+    Respuestas:
+      201 { "message": "...", "usuario": { id_usuario, usuario, nombre, ... } }
+      404 { "error": "La empresa no existe o está inactiva" }
+      409 { "error": "El nombre de usuario ya está en uso" }
+      422 { "error": "Datos inválidos", "fields": {...} }  ← marshmallow
+      500 { "error": "..." }
+    """
+    data = request.get_json(silent=True)
+
+    # Validar payload antes de tocar la BD — fail fast
+    validation_error = validate_payload(CreateEmpresaAdminSchema(), data)
+    if validation_error:
+        return validation_error
+
+    try:
+        id_usuario_registro = int(request.user["sub"])
+
+        result, error = erp_service.create_empresa_admin(
+            id_empresa=id_empresa,
+            datos_usuario=data,
+            id_usuario_registro=id_usuario_registro,
+        )
+
+        if error:
+            code = error.get("code", "DATABASE_ERROR")
+            status = _ADMIN_CREATE_ERROR_STATUS.get(code, 500)
+
+            # Los errores con código conocido (404, 409) son de negocio y se
+            # devuelven con el mensaje tal cual (ya vienen sanitizados).
+            # Los 500 (ROL_NOT_CONFIGURED, DATABASE_ERROR) se logean pero al
+            # cliente se le devuelve un mensaje genérico para no filtrar
+            # detalles internos como nombres de tablas o queries.
+            if status >= 500:
+                logger.error(
+                    "Error 500 en POST /admin-erp/empresas/%s/usuarios (%s): %s",
+                    id_empresa,
+                    code,
+                    error.get("message"),
+                )
+                return (
+                    jsonify({"error": "No fue posible crear el usuario"}),
+                    status,
+                )
+
+            return jsonify({"error": error["message"]}), status
+
+        return (
+            jsonify(
+                {
+                    "message": "Usuario admin de empresa creado correctamente",
+                    "usuario": result,
+                }
+            ),
+            201,
+        )
+
+    except Exception as exc:
+        logger.error(
+            "Error en POST /admin-erp/empresas/%s/usuarios: %s",
             id_empresa,
             repr(exc),
             exc_info=True,

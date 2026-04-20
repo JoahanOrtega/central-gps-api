@@ -10,6 +10,7 @@
 from validators.auth_validators import LoginSchema, SwitchCompanySchema
 from validators.unit_validators import CreateUnitSchema
 from validators.poi_validators import CreatePoiSchema, CreatePoiGroupSchema
+from validators.erp_validators import CreateEmpresaAdminSchema
 
 __all__ = [
     "LoginSchema",
@@ -17,4 +18,5 @@ __all__ = [
     "CreateUnitSchema",
     "CreatePoiSchema",
     "CreatePoiGroupSchema",
+    "CreateEmpresaAdminSchema",
 ]
