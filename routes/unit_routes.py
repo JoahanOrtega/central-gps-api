@@ -1,7 +1,7 @@
 import logging
 from flask import Blueprint, jsonify, request
 from services.unit_service import get_units, create_unit
-from utils.auth_guard import jwt_required, validate_empresa_access
+from utils.auth_guard import jwt_required, permiso_required, validate_empresa_access
 from utils.validation import validate_payload
 from validators import CreateUnitSchema
 
@@ -34,10 +34,16 @@ def list_units():
 
 
 @units_bp.route("/units", methods=["POST"])
-@jwt_required
+@permiso_required("cund3")
 def create_new_unit():
     """
     Crea una nueva unidad.
+
+    Autorización (cund3 = "Crear unidades"):
+      - sudo_erp       → acceso por bypass de rol.
+      - admin_empresa  → denegado por diseño (el rol NO hereda cund3).
+      - usuario        → permitido solo si el admin_empresa le asigna cund3
+                         explícitamente en r_usuario_permisos.
 
     Validación (marshmallow):
       - numero, marca, tipo, imei, chip, fecha_instalacion: obligatorios
