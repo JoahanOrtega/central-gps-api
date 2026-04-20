@@ -98,6 +98,80 @@ def _migrar_a_bcrypt(cursor, connection, user_id: int, password: str) -> None:
         )
 
 
+def _load_user_permissions(
+    cursor,
+    user_id: int,
+    id_rol: int,
+    id_empresa: int | None,
+) -> list[str]:
+    """
+    Carga los permisos efectivos de un usuario en una empresa específica.
+
+    El conjunto efectivo es la UNIÓN de:
+      1. Permisos heredados del rol (r_rol_permisos): comunes a todos los
+         usuarios que comparten el rol, asignados por el sudo_erp.
+      2. Permisos específicos del usuario en esa empresa (r_usuario_permisos):
+         extras que el sudo_erp o el admin_empresa le asignó individualmente.
+
+    La unión se hace con UNION en SQL (deduplica claves automáticamente)
+    para que si un permiso está en ambas fuentes aparezca solo una vez
+    en el resultado.
+
+    Solo se devuelven permisos con `status = 1` en t_permisos (permite
+    "desactivar" un permiso globalmente sin borrar datos históricos).
+
+    Si id_empresa es None (caso sudo_erp sin empresa asignada), solo se
+    consultan los permisos heredados del rol — r_usuario_permisos requiere
+    filtrar por empresa y sin ella no aplica.
+
+    Args:
+        cursor:      Cursor activo sobre la conexión del login (reutilizado
+                     para no abrir una nueva conexión del pool).
+        user_id:     ID del usuario autenticado.
+        id_rol:      ID del rol del usuario (para heredar de r_rol_permisos).
+        id_empresa:  Empresa activa del usuario, o None si es sudo_erp.
+
+    Returns:
+        Lista ordenada y deduplicada de claves de permiso (ej: ["on", "cund1"]).
+    """
+    if id_empresa is not None:
+        # Caso común: usuario con empresa — unir permisos del rol + específicos
+        cursor.execute(
+            """
+            SELECT DISTINCT p.clave
+            FROM t_permisos p
+            WHERE p.status = 1
+              AND (
+                  p.id_permiso IN (
+                      SELECT id_permiso FROM r_rol_permisos WHERE id_rol = %s
+                  )
+                  OR
+                  p.id_permiso IN (
+                      SELECT id_permiso FROM r_usuario_permisos
+                       WHERE id_usuario = %s AND id_empresa = %s
+                  )
+              )
+            ORDER BY p.clave
+            """,
+            (id_rol, user_id, id_empresa),
+        )
+    else:
+        # Caso sudo_erp sin empresa: solo permisos heredados del rol
+        cursor.execute(
+            """
+            SELECT p.clave
+            FROM t_permisos p
+            INNER JOIN r_rol_permisos rp ON rp.id_permiso = p.id_permiso
+            WHERE rp.id_rol = %s
+              AND p.status  = 1
+            ORDER BY p.clave
+            """,
+            (id_rol,),
+        )
+
+    return [row[0] for row in cursor.fetchall()]
+
+
 def authenticate_user(username: str, password: str):
     """
     Autentica a un usuario y genera su JWT.
@@ -145,6 +219,7 @@ def authenticate_user(username: str, password: str):
                 u.clave,
                 u.nombre,
                 u.perfil,
+                u.id_rol,
                 r.clave     AS rol
             FROM t_usuarios u
             LEFT JOIN t_roles r ON r.id_rol = u.id_rol
@@ -160,7 +235,7 @@ def authenticate_user(username: str, password: str):
         if not row:
             return None, None, ERROR_CREDENCIALES
 
-        user_id, db_username, stored_hash, nombre, perfil, rol = row
+        user_id, db_username, stored_hash, nombre, perfil, id_rol, rol = row
 
         # 2. Verificar contraseña — soporta bcrypt (nuevo) y MD5 (legacy PHP)
         if not _verificar_password(password, stored_hash):
@@ -201,7 +276,14 @@ def authenticate_user(username: str, password: str):
                 nombre_empresa = company_row[1]
                 es_admin_empresa = bool(company_row[2])
 
-        # 5. Construir payload del usuario para el JWT
+        # 5. Cargar permisos efectivos del usuario en su empresa activa.
+        #    Es la UNIÓN de permisos heredados del rol + específicos del usuario.
+        #    Si la BD no tiene el rol cargado (id_rol=None), lista vacía.
+        permisos: list[str] = []
+        if id_rol is not None:
+            permisos = _load_user_permissions(cursor, user_id, id_rol, id_empresa)
+
+        # 6. Construir payload del usuario para el JWT
         user = {
             "id": user_id,
             "username": db_username,
@@ -211,6 +293,9 @@ def authenticate_user(username: str, password: str):
             "id_empresa": id_empresa,
             "nombre_empresa": nombre_empresa,
             "es_admin_empresa": es_admin_empresa,
+            # Lista de claves de permisos efectivos (rol + específicos).
+            # El decorador @permiso_required valida contra este campo.
+            "permisos": permisos,
         }
 
         token = generate_jwt(user)

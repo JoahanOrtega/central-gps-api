@@ -96,13 +96,24 @@ def permiso_required(clave_permiso: str):
     antes de permitir el acceso al endpoint.
 
     Jerarquía de acceso:
-      1. sudo_erp       → acceso total, sin revisar permisos
-      2. admin_empresa  → acceso total dentro de su empresa
-      3. usuario normal → debe tener la clave en su campo 'permisos' del JWT
+      1. sudo_erp       → acceso total, sin revisar permisos (único bypass).
+      2. cualquier rol  → debe tener la clave en su lista `permisos` del JWT.
+                          Incluye admin_empresa, usuario común y cualquier
+                          rol futuro. La lista se calcula al login como la
+                          UNIÓN de permisos heredados del rol (r_rol_permisos)
+                          más permisos específicos (r_usuario_permisos).
 
-    El campo 'permisos' del JWT soporta dos formatos:
-      - Wildcard: "*"               → acceso a todos los permisos
-      - Lista:    "on,cund1,cpoi1"  → acceso solo a los permisos listados
+    Nota sobre admin_empresa:
+      El admin_empresa NO tiene bypass automático. Sus capacidades se
+      definen en r_rol_permisos — si le asignan todos los permisos del
+      catálogo, se comporta como antes; si le quitan uno (ej: cund3 =
+      crear unidades), ese endpoint queda bloqueado sin tocar código.
+      Esto mantiene la lógica de autorización 100% en datos.
+
+    El campo 'permisos' del JWT puede venir como:
+      - Lista:    ["on", "cund1", "cpoi1"]   ← formato actual
+      - Wildcard: "*"                         ← compatibilidad legacy
+      - String:   "on,cund1,cpoi1"            ← compatibilidad legacy PHP
 
     Uso:
         @permiso_required("cund1")
@@ -119,25 +130,32 @@ def permiso_required(clave_permiso: str):
             user = request.user
             rol = user.get("rol")
 
-            # Nivel 1: sudo_erp tiene acceso total al sistema
+            # Nivel 1: sudo_erp tiene acceso total al sistema.
+            # Es el único bypass — refleja que es operador interno, no cliente.
             if rol == "sudo_erp":
                 return f(*args, **kwargs)
 
-            # Nivel 2: admin_empresa tiene acceso total dentro de su empresa
-            if user.get("es_admin_empresa", False):
-                return f(*args, **kwargs)
+            # Nivel 2: cualquier otro rol (incluido admin_empresa) se valida
+            # contra su lista de permisos efectivos. Esto elimina privilegios
+            # hardcodeados y centraliza la autorización en datos.
+            permisos_raw = user.get("permisos")
 
-            # Nivel 3: usuario normal — verificar contra el campo 'permisos' del JWT.
-            # El campo viene como string separado por comas: "on,cund1,cpoi1"
-            # o como wildcard "*" para acceso total.
-            permisos_raw = user.get("permisos", "")
-
-            # Wildcard: el usuario tiene todos los permisos habilitados
+            # Wildcard legacy: acceso total por configuración
             if permisos_raw == "*":
                 return f(*args, **kwargs)
 
-            # Lista: verificar que la clave solicitada esté incluida
-            permisos_lista = [p.strip() for p in permisos_raw.split(",") if p.strip()]
+            # Normalizar a lista: el campo puede venir como list[str] (formato
+            # nuevo desde authenticate_user) o como string legacy separado por
+            # comas ("on,cund1,cpoi1"). Ambos casos producen una lista limpia.
+            if isinstance(permisos_raw, list):
+                permisos_lista = permisos_raw
+            elif isinstance(permisos_raw, str):
+                permisos_lista = [
+                    p.strip() for p in permisos_raw.split(",") if p.strip()
+                ]
+            else:
+                # None u otro tipo inesperado — tratarlo como sin permisos
+                permisos_lista = []
 
             if clave_permiso not in permisos_lista:
                 return (
