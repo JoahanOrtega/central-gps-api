@@ -67,6 +67,10 @@ def admin_empresa_required(f):
     Decorador para rutas que requieren ser admin de una empresa.
     Permite acceso tanto al sudo_erp como al admin_empresa.
 
+    Identificación del admin: mediante el campo `rol` del JWT
+    (rol == "admin_empresa"). El campo booleano es_admin_empresa
+    quedó obsoleto y fue eliminado para evitar redundancia con el rol.
+
     Uso:
         @admin_empresa_required
         def mi_endpoint(): ...
@@ -76,10 +80,9 @@ def admin_empresa_required(f):
     @jwt_required
     def decorated(*args, **kwargs):
         rol = request.user.get("rol")
-        es_admin = request.user.get("es_admin_empresa", False)
 
-        # sudo_erp siempre puede; admin_empresa también
-        if rol != "sudo_erp" and not es_admin:
+        # sudo_erp y admin_empresa pasan; cualquier otro rol es denegado.
+        if rol not in ("sudo_erp", "admin_empresa"):
             return (
                 jsonify({"error": "Acceso denegado. Se requiere rol de administrador"}),
                 403,

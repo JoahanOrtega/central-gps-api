@@ -30,7 +30,10 @@ def generate_access_token(user: dict) -> str:
         "perfil": user.get("perfil"),  # Legacy — compatibilidad PHP
         "id_empresa": user.get("id_empresa"),
         "nombre_empresa": user.get("nombre_empresa"),
-        "es_admin_empresa": user.get("es_admin_empresa", False),
+        # Lista de claves de permisos efectivos (rol + específicos).
+        # Para saber si es admin de empresa, comparar rol == "admin_empresa".
+        # Ya no se incluye es_admin_empresa como campo separado —
+        # era redundante con rol.
         "permisos": user.get("permisos"),
         "exp": datetime.now(timezone.utc)
         + timedelta(minutes=Config.JWT_EXPIRATION_MINUTES),
