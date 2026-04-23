@@ -100,8 +100,10 @@ def login():
     """
     data = request.get_json(silent=True)
 
-    # Validar payload con marshmallow antes de tocar la BD
-    validation_error = validate_payload(LoginSchema(), data)
+    # Validar payload con marshmallow antes de tocar la BD.
+    # data queda filtrado: solo username y password, descarta cualquier
+    # campo extra que el cliente haya enviado.
+    data, validation_error = validate_payload(LoginSchema(), data)
     if validation_error:
         return validation_error
 
@@ -328,7 +330,7 @@ def switch_company():
 
     data = request.get_json(silent=True)
 
-    validation_error = validate_payload(SwitchCompanySchema(), data)
+    data, validation_error = validate_payload(SwitchCompanySchema(), data)
     if validation_error:
         return validation_error
 

@@ -12,7 +12,27 @@ class CreateUnitSchema(Schema):
       - odometro_inicial: >= 0
       - fecha_instalacion: no puede ser futura
       - tipo: valor del catálogo [1-7]
+
+    Notas de diseño:
+      - `id_empresa` es opcional en el schema pero el endpoint la necesita
+        (si no viene en el body, la lee del JWT). El sudo_erp la envía
+        explícitamente porque su JWT no tiene empresa fija.
+      - `unknown = EXCLUDE` descarta silenciosamente cualquier campo extra
+        que mande el frontend (evita 422 ruidosos y es defensa ligera
+        contra intentos de escalación de privilegios por campo desconocido).
     """
+
+    class Meta:
+        # Descartar campos no declarados en vez de fallar con 422. Alinea
+        # con el comportamiento del UpdateUnitSchema.
+        unknown = "EXCLUDE"
+
+    # ── Contexto (no es un "campo de unidad" pero el endpoint lo usa) ─────────
+    # id_empresa: lo manda el frontend cuando un sudo_erp opera sobre una
+    # empresa específica. Para admin_empresa y usuario, el endpoint lo
+    # toma del JWT; si igual viene en el body, validate_empresa_access
+    # confirma que coincide con el del token.
+    id_empresa = fields.Int(load_default=None, allow_none=True)
 
     # ── Obligatorios ──────────────────────────────────────────────────────────
     numero = fields.Str(required=True, validate=validate.Length(min=1, max=20))
@@ -108,6 +128,13 @@ class UpdateUnitSchema(Schema):
     que lleguen. El filtro de qué campos puede cambiar cada rol se
     aplica en el servicio (no aquí) porque depende de lógica de negocio
     (rol del usuario, permisos, empresa).
+
+    Nota sobre id_empresa:
+      Es un campo de CONTEXTO, no de actualización. El sudo_erp lo envía
+      para indicar sobre qué empresa está operando (su JWT no tiene
+      empresa fija). El route lo lee con data.get("id_empresa") y NO
+      lo pasa al service — si llegara al UPDATE SQL, cambiaría la unidad
+      a otra empresa, lo cual no está permitido.
     """
 
     class Meta:
@@ -115,6 +142,9 @@ class UpdateUnitSchema(Schema):
         # que un body con claves inesperadas (o intentos de escalación
         # de privilegios por campo desconocido) genere un 400 ruidoso.
         unknown = "EXCLUDE"
+
+    # ── Contexto (leído por el route, NO se pasa al service) ─────────────
+    id_empresa = fields.Int(load_default=None, allow_none=True)
 
     # ── Identidad y datos básicos ────────────────────────────────────────
     numero = fields.Str(validate=validate.Length(min=1, max=20))

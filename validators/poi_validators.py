@@ -13,7 +13,22 @@ class CreatePoiSchema(Schema):
       tipo_poi=1 (marcador) → lat/lng requeridos
       tipo_poi=2 (círculo)  → lat/lng + radio requeridos
       tipo_poi=3 (polígono) → polygon_path requerido
+
+    Notas de diseño:
+      - `id_empresa` es opcional aquí pero el endpoint la usa: si no viene
+        en el body, la lee del JWT. El sudo_erp la envía explícitamente
+        porque su JWT no tiene empresa fija.
+      - `unknown = "EXCLUDE"` descarta silenciosamente cualquier campo
+        extra (evita 422 ruidosos y funciona como defensa ligera contra
+        intentos de escalación de privilegios por campo desconocido).
     """
+
+    class Meta:
+        unknown = "EXCLUDE"
+
+    # ── Contexto (no es un "campo de POI" pero el endpoint lo usa) ────────────
+    # Ver la nota en el docstring sobre id_empresa.
+    id_empresa = fields.Int(load_default=None, allow_none=True)
 
     # ── Obligatorios ──────────────────────────────────────────────────────────
     nombre = fields.Str(required=True, validate=validate.Length(min=1, max=100))
@@ -130,7 +145,16 @@ class CreatePoiGroupSchema(Schema):
     El service accede con payload["id_cliente"], payload["nombre"],
     payload["observaciones"] y payload["is_default"] directamente —
     todos tienen load_default para evitar KeyError.
+
+    Nota: id_empresa es opcional (el endpoint la lee del body si viene, o
+    del JWT). Ver nota equivalente en CreatePoiSchema.
     """
+
+    class Meta:
+        unknown = "EXCLUDE"
+
+    # id_empresa: ver nota en CreatePoiSchema sobre el patrón sudo_erp.
+    id_empresa = fields.Int(load_default=None, allow_none=True)
 
     nombre = fields.Str(required=True, validate=validate.Length(min=1, max=100))
     # El service usa payload["id_cliente"] directamente — necesita default

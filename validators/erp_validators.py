@@ -25,7 +25,16 @@ class CreateEmpresaAdminSchema(Schema):
     Los campos se normalizan con `.strip()` antes de validar la longitud
     para que " juanperez " y "juanperez" sean equivalentes y no pasen
     espacios en blanco a la BD.
+
+    Nota: id_empresa viene en la URL (path param), NO en el body. El
+    `unknown = "EXCLUDE"` igual está por consistencia y defensa en
+    profundidad — si alguien intenta enviar campos como {"id_rol": 1,
+    "status": 0}, se descartan silenciosamente en vez de filtrar
+    información sobre qué campos existen en t_usuarios.
     """
+
+    class Meta:
+        unknown = "EXCLUDE"
 
     usuario = fields.Str(
         required=True,

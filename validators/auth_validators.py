@@ -1,7 +1,20 @@
 from marshmallow import Schema, fields, validate
 
 
-class LoginSchema(Schema):
+# ─── Base class con Meta ─────────────────────────────────────────────────────
+# Todos los schemas heredan de esta para descartar silenciosamente los campos
+# no declarados. Esto:
+#   - Evita 422 ruidosos cuando el frontend manda campos extra ("remember_me",
+#     "captcha_token", etc.) que el backend no usa.
+#   - Provee defensa ligera: si un atacante intenta escalar privilegios
+#     añadiendo campos como {"id_rol": 1, "status": 0}, se ignoran en vez
+#     de enviar pistas sobre qué campos existen.
+class _BaseAuthSchema(Schema):
+    class Meta:
+        unknown = "EXCLUDE"
+
+
+class LoginSchema(_BaseAuthSchema):
     """
     Valida el payload de POST /auth/login.
 
@@ -40,7 +53,7 @@ class LoginSchema(Schema):
     )
 
 
-class SwitchCompanySchema(Schema):
+class SwitchCompanySchema(_BaseAuthSchema):
     """
     Valida el payload de POST /auth/switch-company.
 

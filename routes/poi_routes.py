@@ -51,7 +51,9 @@ def save_poi():
     """
     data = request.get_json(silent=True)
 
-    validation_error = validate_payload(CreatePoiSchema(), data)
+    # `data` queda filtrado: solo campos declarados en CreatePoiSchema.
+    # Si el cliente mandó campos extra, se descartan silenciosamente.
+    data, validation_error = validate_payload(CreatePoiSchema(), data)
     if validation_error:
         return validation_error
 
@@ -105,7 +107,8 @@ def save_poi_group():
     """
     data = request.get_json(silent=True)
 
-    validation_error = validate_payload(CreatePoiGroupSchema(), data)
+    # `data` queda filtrado: solo campos declarados en CreatePoiGroupSchema.
+    data, validation_error = validate_payload(CreatePoiGroupSchema(), data)
     if validation_error:
         return validation_error
 

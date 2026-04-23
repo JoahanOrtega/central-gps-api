@@ -62,8 +62,9 @@ def create_new_unit():
     """
     data = request.get_json(silent=True)
 
-    # Validar antes de tocar la BD — si el payload es inválido, fallar rápido
-    validation_error = validate_payload(CreateUnitSchema(), data)
+    # Validar antes de tocar la BD — si el payload es inválido, fallar rápido.
+    # `data` queda filtrado: solo campos declarados en CreateUnitSchema.
+    data, validation_error = validate_payload(CreateUnitSchema(), data)
     if validation_error:
         return validation_error
 
@@ -181,22 +182,30 @@ def patch_unit(id_unidad: int):
     """
     data = request.get_json(silent=True)
 
-    # Validar formato antes de ir a la BD
-    validation_error = validate_payload(UpdateUnitSchema(), data)
+    # Validar formato antes de ir a la BD.
+    # `data` queda filtrado: solo campos declarados en UpdateUnitSchema,
+    # incluido id_empresa como campo de contexto. Cualquier otro campo
+    # que el cliente intente enviar (status, id_rol, etc.) se descarta.
+    data, validation_error = validate_payload(UpdateUnitSchema(), data)
     if validation_error:
         return validation_error
 
-    # Body vacío no tiene sentido — ahorra un round-trip a la BD.
-    if not data:
-        return jsonify({"error": "No hay campos para actualizar"}), 400
-
     try:
-        # Mismo patrón que el GET: sudo_erp puede pasar id_empresa por query
-        # param o dentro del body (para consistencia con POST /units). Los
-        # otros roles usan su JWT — si pasan otra empresa, 403.
+        # id_empresa es un campo de CONTEXTO, no de actualización. Lo
+        # separamos del payload antes de pasarlo al service para que no
+        # termine en el UPDATE SQL (cambiar la empresa de una unidad no
+        # es una operación permitida).
+        #
+        # Fuentes en orden de prioridad:
+        #   1. Query param ?id_empresa=X  (estándar REST para contexto)
+        #   2. Body (compatibilidad con clientes que lo envían dentro del JSON)
+        #   3. JWT (admin_empresa/usuario tienen empresa fija en el token)
+        #
+        # dict.pop() remueve y retorna — si no existe, retorna el default.
+        id_empresa_body = data.pop("id_empresa", None)
         id_empresa = (
             request.args.get("id_empresa", type=int)
-            or data.get("id_empresa")
+            or id_empresa_body
             or request.user.get("id_empresa")
         )
         rol = request.user.get("rol")
@@ -208,22 +217,16 @@ def patch_unit(id_unidad: int):
         if not validate_empresa_access(id_empresa, request.user):
             return jsonify({"error": "Acceso no autorizado a esta empresa"}), 403
 
-        # id_empresa no es un campo actualizable en la unidad — si vino en
-        # el body junto con otros cambios, lo sacamos antes de pasar al
-        # servicio para que no termine en el UPDATE SQL.
-        payload = {k: v for k, v in data.items() if k != "id_empresa"}
-
-        # Si tras sacar id_empresa el payload quedó vacío, no hay nada que
-        # hacer. Esto puede pasar si el frontend manda {"id_empresa": 1}
-        # pensando que es cambio — queremos evitar el 400 del "body vacío"
-        # que arrojaríamos si no, porque es confuso.
-        if not payload:
+        # Tras sacar id_empresa, el body podría quedar vacío (ej: cliente
+        # que solo quería hacer "switch de contexto"). Es un no-op desde
+        # la perspectiva del UPDATE — devolvemos un 400 claro.
+        if not data:
             return jsonify({"error": "No hay campos para actualizar"}), 400
 
         result, error = update_unit(
             id_unidad=id_unidad,
             id_empresa=id_empresa,
-            payload=payload,
+            payload=data,
             rol=rol,
             id_usuario=id_usuario,
         )

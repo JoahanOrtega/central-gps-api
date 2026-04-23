@@ -233,8 +233,10 @@ def create_company_admin(id_empresa):
     """
     data = request.get_json(silent=True)
 
-    # Validar payload antes de tocar la BD — fail fast
-    validation_error = validate_payload(CreateEmpresaAdminSchema(), data)
+    # Validar payload antes de tocar la BD — fail fast.
+    # `data` queda filtrado: solo usuario, clave, nombre, email, telefono.
+    # Cualquier intento de mandar id_rol, status, etc. se descarta aquí.
+    data, validation_error = validate_payload(CreateEmpresaAdminSchema(), data)
     if validation_error:
         return validation_error
 
