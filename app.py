@@ -1,9 +1,30 @@
 import os
 import logging
+import sys
 from flask import Flask, jsonify
 from flask_cors import CORS
 from flask_limiter.util import get_remote_address
 from utils.limiter import limiter
+
+# ─── Configuración de logging ─────────────────────────────────────────────────
+# Configuramos ANTES de importar los blueprints porque db/connection.py se
+# ejecuta al importar y loggea "Pool BD iniciado" — sin esta config esos
+# mensajes se pierden en stderr sin formato.
+#
+# stdout (no stderr) para que Docker los capture con `docker compose logs`.
+# Nivel INFO en dev para ver el arranque de pools, requests, etc.
+# Formato: timestamp + nivel + módulo + mensaje.
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    stream=sys.stdout,
+    force=True,  # sobrescribe cualquier config previa (ej: la de gunicorn)
+)
+
+# Silenciar el ruido de bibliotecas verbosas que no aportan en dev.
+logging.getLogger("werkzeug").setLevel(logging.WARNING)
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+
 from routes import auth_bp, users_bp, units_bp
 from routes.poi_routes import poi_bp
 from routes.telemetry_routes import telemetry_bp
