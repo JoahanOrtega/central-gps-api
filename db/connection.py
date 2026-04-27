@@ -6,14 +6,32 @@ from config import Config
 logger = logging.getLogger(__name__)
 
 # ── Tamaños del pool ───────────────────────────────────────────────────────────
-# minconn: conexiones abiertas al arrancar — listas para usar de inmediato.
-# maxconn: tope máximo de conexiones simultáneas.
+# Constantes SEPARADAS por tipo de BD porque tienen restricciones distintas:
 #
-# Ajustar según la carga esperada y los límites de PostgreSQL.
-# Regla general: maxconn ≤ max_connections de PostgreSQL / número de workers.
-# Con gunicorn -w 4 y max_connections=100 → 100 / 4 = 25 por worker.
-_POOL_MIN = 2
-_POOL_MAX = 20
+#   BD principal (local, contenedor o instalación dedicada):
+#     - Recursos exclusivos para esta app
+#     - Pool grande está OK — escalas hasta el max_connections del PG local
+#     - Default Postgres: max_connections=100
+#     - Regla: maxconn ≤ max_connections / num_workers (con -w 4 → 25/worker)
+#
+#   BD telemetría (servidor REMOTO compartido — 136.119.58.28):
+#     - Otros clientes/servicios usan el mismo Postgres
+#     - max_connections del servidor está limitado y compartido
+#     - Pool conservador para no saturar al resto
+#     - Si vemos errores "too many clients already", bajar más aún
+#
+# Si alguna vez en producción necesitamos más, hay que coordinar con el
+# admin del server remoto; nunca subir a ciegas.
+
+# Pool de BD principal — recursos locales, generoso por default.
+_POOL_MIN_MAIN = 2
+_POOL_MAX_MAIN = 20
+
+# Pool de BD telemetría — servidor remoto compartido, conservador.
+# Valores reducidos para dev por la cantidad de rebuilds del backend que
+# pueden dejar conexiones zombi temporalmente del lado del server.
+_POOL_MIN_TELEMETRY = 1
+_POOL_MAX_TELEMETRY = 5
 
 # ── Parámetros TCP keepalive ───────────────────────────────────────────────────
 # Cuando la app está en stand-by, PostgreSQL puede cerrar las conexiones
@@ -25,16 +43,16 @@ _POOL_MAX = 20
 #   keepalives_count   → intentos antes de declarar la conexión muerta
 _KEEPALIVE_KWARGS = {
     "keepalives": 1,
-    "keepalives_idle": 60,       # primer ping tras 60s inactiva
-    "keepalives_interval": 10,   # reintento cada 10s
-    "keepalives_count": 5,       # 5 intentos antes de cerrar
+    "keepalives_idle": 60,  # primer ping tras 60s inactiva
+    "keepalives_interval": 10,  # reintento cada 10s
+    "keepalives_count": 5,  # 5 intentos antes de cerrar
 }
 
 
 def _make_main_pool():
     return pg_pool.ThreadedConnectionPool(
-        minconn=_POOL_MIN,
-        maxconn=_POOL_MAX,
+        minconn=_POOL_MIN_MAIN,
+        maxconn=_POOL_MAX_MAIN,
         host=Config.DB_HOST,
         dbname=Config.DB_NAME,
         user=Config.DB_USER,
@@ -47,8 +65,8 @@ def _make_main_pool():
 
 def _make_telemetry_pool():
     return pg_pool.ThreadedConnectionPool(
-        minconn=_POOL_MIN,
-        maxconn=_POOL_MAX,
+        minconn=_POOL_MIN_TELEMETRY,
+        maxconn=_POOL_MAX_TELEMETRY,
         host=Config.TELEMETRY_DB_HOST,
         dbname=Config.TELEMETRY_DB_NAME,
         user=Config.TELEMETRY_DB_USER,
@@ -64,7 +82,9 @@ try:
     _main_pool = _make_main_pool()
     logger.info(
         "Pool BD principal iniciado (min=%s, max=%s, bd=%s)",
-        _POOL_MIN, _POOL_MAX, Config.DB_NAME,
+        _POOL_MIN_MAIN,
+        _POOL_MAX_MAIN,
+        Config.DB_NAME,
     )
 except Exception as exc:
     logger.critical("No se pudo crear el pool de BD principal: %s", repr(exc))
@@ -75,7 +95,9 @@ try:
     _telemetry_pool = _make_telemetry_pool()
     logger.info(
         "Pool BD telemetría iniciado (min=%s, max=%s, bd=%s)",
-        _POOL_MIN, _POOL_MAX, Config.TELEMETRY_DB_NAME,
+        _POOL_MIN_TELEMETRY,
+        _POOL_MAX_TELEMETRY,
+        Config.TELEMETRY_DB_NAME,
     )
 except Exception as exc:
     logger.critical("No se pudo crear el pool de BD telemetría: %s", repr(exc))
@@ -110,9 +132,7 @@ def _get_conn_with_retry(pool, make_pool_fn, pool_attr: str):
 
     # Verificar si la conexión sigue viva
     if not _is_connection_alive(conn):
-        logger.warning(
-            "Conexión muerta detectada en el pool — recreando pool..."
-        )
+        logger.warning("Conexión muerta detectada en el pool — recreando pool...")
         try:
             pool.putconn(conn, close=True)
         except Exception:
