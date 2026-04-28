@@ -39,15 +39,15 @@ def list_units():
 
 
 @units_bp.route("/units", methods=["POST"])
-@permiso_required("cund3")
+@permiso_required("unidades.crear")
 def create_new_unit():
     """
     Crea una nueva unidad.
 
-    Autorización (cund3 = "Crear unidades"):
+    Autorización (unidades.crear = "Crear unidades"):
       - sudo_erp       → acceso por bypass de rol.
-      - admin_empresa  → denegado por diseño (el rol NO hereda cund3).
-      - usuario        → permitido solo si el admin_empresa le asigna cund3
+      - admin_empresa  → denegado por diseño (el rol NO hereda unidades.crear).
+      - usuario        → permitido solo si el admin_empresa le asigna unidades.crear
                          explícitamente en r_usuario_permisos.
 
     Validación (marshmallow):
@@ -97,27 +97,27 @@ def create_new_unit():
 
 
 @units_bp.route("/units/<int:id_unidad>", methods=["GET"])
-@permiso_required("cund_edit")
+@permiso_required("unidades.editar")
 def get_unit_full_detail(id_unidad: int):
     """
     Devuelve el detalle completo de una unidad.
 
-    Autorización (cund_edit = "Editar unidades"):
+    Autorización (unidades.editar = "Editar unidades"):
       - sudo_erp       → acceso por bypass de rol. Ve TODOS los campos,
                          incluido el equipo instalado (IMEI, chip, inputs).
-      - admin_empresa  → tiene cund_edit por defecto (ver seed). Ve los
+      - admin_empresa  → tiene unidades.editar por defecto (ver seed). Ve los
                          campos operativos SIN el equipo instalado.
-      - usuario        → solo si el admin_empresa le asignó cund_edit en
+      - usuario        → solo si el admin_empresa le asignó unidades.editar en
                          r_usuario_permisos. Mismas restricciones que arriba.
 
-    Nota: usamos cund_edit para LEER el detalle también (no solo para
+    Nota: usamos unidades.editar para LEER el detalle también (no solo para
     editarlo). El listado público sigue protegido solo con jwt_required
     (cund1 en el legacy) — este endpoint es para la pantalla de edición
     y comparte su permiso.
 
     Respuestas:
       200 → { ...campos de la unidad filtrados por rol }
-      403 → sin permiso cund_edit (lo devuelve el decorador)
+      403 → sin permiso unidades.editar (lo devuelve el decorador)
       404 → unidad no existe o pertenece a otra empresa
     """
     try:
@@ -155,7 +155,7 @@ def get_unit_full_detail(id_unidad: int):
 
 
 @units_bp.route("/units/<int:id_unidad>", methods=["PATCH"])
-@permiso_required("cund_edit")
+@permiso_required("unidades.editar")
 def patch_unit(id_unidad: int):
     """
     Actualiza parcialmente una unidad.

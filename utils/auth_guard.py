@@ -109,7 +109,7 @@ def permiso_required(clave_permiso: str):
     Nota sobre admin_empresa:
       El admin_empresa NO tiene bypass automático. Sus capacidades se
       definen en r_rol_permisos — si le asignan todos los permisos del
-      catálogo, se comporta como antes; si le quitan uno (ej: cund3 =
+      catálogo, se comporta como antes; si le quitan uno (ej: unidades.crear =
       crear unidades), ese endpoint queda bloqueado sin tocar código.
       Esto mantiene la lógica de autorización 100% en datos.
 
