@@ -2,6 +2,7 @@ import logging
 from flask import Blueprint, jsonify, request
 from services.auth_service import authenticate_user
 from services.company_service import get_user_companies
+from services.password_service import change_password
 from services.refresh_token_service import (
     save_refresh_token,
     validate_and_rotate_refresh_token,
@@ -15,7 +16,7 @@ from utils.jwt_handler import (
 )
 from utils.limiter import limiter
 from utils.validation import validate_payload
-from validators import LoginSchema, SwitchCompanySchema
+from validators import LoginSchema, SwitchCompanySchema, ChangePasswordSchema
 from db.connection import get_db_connection, release_db_connection
 from config import Config
 
@@ -395,4 +396,123 @@ def switch_company():
 
     except Exception as exc:
         logger.error("Error en POST /auth/switch-company: %s", repr(exc), exc_info=True)
+        return jsonify({"error": "Error interno del servidor"}), 500
+
+
+# ─── Cambio de contraseña ─────────────────────────────────────────────────────
+@auth_bp.route("/change-password", methods=["PATCH"])
+@jwt_required
+@limiter.limit("3 per minute; 10 per hour")
+def change_password_endpoint():
+    """
+    Cambia la contraseña del usuario autenticado.
+
+    Flujo del endpoint:
+      1. @jwt_required valida el access token y carga request.user.
+      2. Rate limiting estricto (3/min, 10/hora) — protege contra
+         brute force de la contraseña actual del usuario logueado.
+      3. ChangePasswordSchema valida estructura + reglas básicas.
+      4. password_service.change_password() ejecuta la lógica.
+      5. Si todo OK, además se borra la cookie del refresh token del
+         dispositivo actual: el service revoca TODOS los tokens en BD,
+         pero esa cookie debe limpiarse aquí porque la cookie vive en
+         el navegador y solo el route puede borrarla con set_cookie.
+
+    Por qué PATCH y no POST:
+      Estamos modificando un atributo (clave) de un recurso (usuario).
+      PATCH es el verbo HTTP semánticamente correcto para "modificación
+      parcial" — el body solo trae el campo que cambia, no el usuario
+      completo. POST se reserva para crear recursos nuevos.
+
+    Por qué el rate limit es más estricto que /login:
+      /login limita por IP — un atacante con un username válido podría
+      probar contraseñas. Aquí el atacante necesita un JWT válido
+      (es decir, ya está dentro). El rate limit aquí protege contra
+      un escenario específico: alguien con sesión robada intentando
+      adivinar la contraseña actual para cambiarla y bloquear al dueño.
+
+    Códigos HTTP:
+      200 → Cambio exitoso. Body: { message }.
+      401 → Token inválido (jwt_required) o contraseña actual incorrecta.
+      403 → Token de tipo incorrecto (intentar usar refresh como access).
+      422 → Payload inválido (longitud, no coinciden, igual a la actual).
+      429 → Rate limit excedido.
+      500 → Error interno (BD caída, fallo al hashear, etc.).
+
+    Body esperado:
+      {
+        "current_password": "...",
+        "new_password":     "...",
+        "confirm_password": "..."
+      }
+
+    Body de respuesta exitosa:
+      {
+        "message": "Contraseña actualizada correctamente.
+                    Las sesiones en otros dispositivos se cerraron."
+      }
+    """
+    data = request.get_json(silent=True)
+
+    # 1. Validación marshmallow — descarta cualquier campo extra que
+    #    intente venir en el body (defensa en profundidad por
+    #    Meta.unknown="EXCLUDE" en el schema base).
+    data, validation_error = validate_payload(ChangePasswordSchema(), data)
+    if validation_error:
+        return validation_error
+
+    # 2. user_id viene SIEMPRE del JWT (request.user), nunca del body.
+    #    request.user["sub"] es string (estándar JWT), convertimos a int
+    #    para consultar la BD.
+    try:
+        user_id = int(request.user.get("sub"))
+    except (TypeError, ValueError):
+        # Si el sub del JWT no es un entero válido, el token está
+        # corrupto o forjado — rechazar antes de tocar la BD.
+        logger.error(
+            "JWT con sub inválido en /auth/change-password: %r",
+            request.user.get("sub"),
+        )
+        return jsonify({"error": "Token inválido"}), 401
+
+    try:
+        success, error_message = change_password(
+            user_id=user_id,
+            current_password=data["current_password"],
+            new_password=data["new_password"],
+            ip_origen=request.remote_addr,
+        )
+
+        if not success:
+            # error_message viene del service con un mensaje listo para
+            # mostrar al usuario. El status 401 cubre tanto "usuario
+            # no existe" (no debería pasar con un JWT válido, pero por
+            # si acaso) como "contraseña actual incorrecta".
+            return jsonify({"error": error_message}), 401
+
+        # 3. Limpiar la cookie del refresh token de ESTE dispositivo.
+        #    El service ya revocó todos los tokens en BD; aquí borramos
+        #    además la cookie del navegador actual para que el siguiente
+        #    /auth/refresh (que el interceptor del frontend hará al
+        #    expirar el access token actual) no encuentre cookie y
+        #    redirija limpio a /login. Sin esto, el usuario actual
+        #    quedaría con una cookie inválida en el navegador hasta
+        #    que el navegador la expire por max-age.
+        response = jsonify(
+            {
+                "message": (
+                    "Contraseña actualizada correctamente. "
+                    "Las sesiones en otros dispositivos se cerraron."
+                )
+            }
+        )
+        return _clear_refresh_cookie(response), 200
+
+    except Exception as exc:
+        logger.error(
+            "Error en PATCH /auth/change-password para user_id=%s: %s",
+            user_id,
+            repr(exc),
+            exc_info=True,
+        )
         return jsonify({"error": "Error interno del servidor"}), 500
