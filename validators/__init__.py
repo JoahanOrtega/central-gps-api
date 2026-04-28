@@ -8,6 +8,7 @@
 # colisiones con el módulo interno de marshmallow en Python/Windows.
 
 from validators.auth_validators import LoginSchema, SwitchCompanySchema
+from validators.password_validators import ChangePasswordSchema
 from validators.unit_validators import CreateUnitSchema, UpdateUnitSchema
 from validators.poi_validators import CreatePoiSchema, CreatePoiGroupSchema
 from validators.erp_validators import CreateEmpresaAdminSchema
@@ -15,6 +16,7 @@ from validators.erp_validators import CreateEmpresaAdminSchema
 __all__ = [
     "LoginSchema",
     "SwitchCompanySchema",
+    "ChangePasswordSchema",
     "CreateUnitSchema",
     "UpdateUnitSchema",
     "CreatePoiSchema",
