@@ -1127,3 +1127,375 @@ def create_usuario_completo(
             cursor.close()
         if connection:
             release_db_connection(connection)
+
+
+import secrets
+import string
+
+# ─── Constantes para password temporal ──────────────────────────────────────
+# Charset sin caracteres confusos (0/O, 1/l/I) para evitar errores de
+# transcripción cuando el sudo_erp dicta la temporal por teléfono.
+_TEMP_PASSWORD_CHARSET = (
+    string.ascii_uppercase.replace("O", "").replace("I", "")
+    + string.ascii_lowercase.replace("l", "")
+    + string.digits.replace("0", "").replace("1", "")
+)
+# Longitud lo suficientemente larga para resistir brute-force pero
+# manejable para que el usuario la teclee al primer login.
+_TEMP_PASSWORD_LENGTH = 12
+
+
+def _generate_temp_password() -> str:
+    """
+    Genera una contraseña temporal aleatoria criptográficamente segura.
+
+    Usa secrets.choice (no random) para garantizar entropía adecuada.
+    El charset excluye caracteres visualmente ambiguos.
+    """
+    return "".join(
+        secrets.choice(_TEMP_PASSWORD_CHARSET) for _ in range(_TEMP_PASSWORD_LENGTH)
+    )
+
+
+# ─── 1. Reactivar usuario inhabilitado ────────────────────────────────────────
+
+
+def reactivar_usuario(
+    id_empresa: int,
+    id_usuario: int,
+    id_usuario_cambio: int,
+):
+    """
+    Reactiva un usuario inhabilitado (status 0 → 1) en la empresa indicada.
+
+    Solo se llama desde el endpoint exclusivo del Panel ERP
+    (sudo_erp_required en la capa de routes).
+
+    Conserva todos los permisos y restricciones que el usuario tenía
+    antes de inhabilitarse — no se borran al inhabilitar, solo se
+    "esconden" del listado por status=0.
+
+    Returns:
+        Tupla (data, error). En éxito: ({id_usuario, reactivado: True}, None).
+    """
+    connection = None
+    cursor = None
+    try:
+        connection = get_db_connection()
+        cursor = connection.cursor()
+
+        # 1. Verificar existencia y status actual
+        cursor.execute(
+            """
+            SELECT u.id, u.status, r.clave AS rol
+              FROM t_usuarios u
+              LEFT JOIN t_roles r ON r.id_rol = u.id_rol
+             WHERE u.id         = %s
+               AND u.id_empresa = %s
+            """,
+            (id_usuario, id_empresa),
+        )
+        row = cursor.fetchone()
+
+        if not row:
+            return None, {
+                "code": "USER_NOT_FOUND",
+                "message": "El usuario no existe o no pertenece a esta empresa",
+            }
+
+        if row[1] == 1:
+            return None, {
+                "code": "USER_ALREADY_ACTIVE",
+                "message": "El usuario ya está activo",
+            }
+
+        # 2. UPDATE status=1
+        cursor.execute(
+            """
+            UPDATE t_usuarios
+               SET status            = 1,
+                   fecha_cambio      = NOW(),
+                   id_usuario_cambio = %s
+             WHERE id         = %s
+               AND id_empresa = %s
+            """,
+            (id_usuario_cambio, id_usuario, id_empresa),
+        )
+
+        # 3. Auditoría — "REACTIVAR" (9 chars, cabe holgado).
+        _registrar_auditoria(
+            cursor=cursor,
+            connection=connection,
+            id_usuario=id_usuario_cambio,
+            entidad="usuario",
+            id_entidad=id_usuario,
+            accion="REACTIVAR",
+            datos_anteriores={"status": 0},
+            datos_nuevos={"status": 1, "id_empresa": id_empresa},
+        )
+
+        return ({"id_usuario": id_usuario, "reactivado": True}, None)
+
+    except Exception as e:
+        if connection:
+            connection.rollback()
+        logger.error(
+            "Error en reactivar_usuario id_usuario=%s id_empresa=%s: %s",
+            id_usuario,
+            id_empresa,
+            repr(e),
+        )
+        return None, {
+            "code": "DATABASE_ERROR",
+            "message": "No fue posible reactivar el usuario",
+        }
+    finally:
+        if cursor:
+            cursor.close()
+        if connection:
+            release_db_connection(connection)
+
+
+# ─── 2. Eliminar usuario permanente (HARD DELETE) ────────────────────────────
+
+
+def eliminar_usuario_permanente(
+    id_empresa: int,
+    id_usuario: int,
+    id_usuario_cambio: int,
+):
+    """
+    Elimina PERMANENTEMENTE un usuario: DELETE FROM t_usuarios.
+
+    OPERACIÓN IRREVERSIBLE. Borra:
+      - Fila en t_usuarios
+      - Filas en r_usuario_permisos (con DELETE explícito en este service)
+      - Filas en r_empresa_usuarios (con DELETE explícito)
+
+    NO borra:
+      - Filas en t_auditoria (preservación de trazabilidad histórica).
+
+    Reglas de seguridad:
+      - No auto-eliminarse.
+      - No eliminar a otro sudo_erp.
+      - El usuario debe pertenecer a la empresa indicada.
+
+    Returns:
+        Tupla (data, error).
+    """
+    if id_usuario == id_usuario_cambio:
+        return None, {
+            "code": "CANNOT_DELETE_SELF",
+            "message": "No puedes eliminarte a ti mismo",
+        }
+
+    connection = None
+    cursor = None
+    try:
+        connection = get_db_connection()
+        cursor = connection.cursor()
+
+        # 1. Verificar existencia + obtener rol del target
+        cursor.execute(
+            """
+            SELECT u.id, u.usuario, u.nombre, r.clave AS rol
+              FROM t_usuarios u
+              LEFT JOIN t_roles r ON r.id_rol = u.id_rol
+             WHERE u.id         = %s
+               AND u.id_empresa = %s
+            """,
+            (id_usuario, id_empresa),
+        )
+        row = cursor.fetchone()
+
+        if not row:
+            return None, {
+                "code": "USER_NOT_FOUND",
+                "message": "El usuario no existe o no pertenece a esta empresa",
+            }
+
+        if row[3] == "sudo_erp":
+            return None, {
+                "code": "CANNOT_DELETE_SUDO",
+                "message": "No se puede eliminar al administrador del sistema",
+            }
+
+        # Snapshot para auditoría (antes de borrar)
+        datos_eliminados = {
+            "id_usuario": row[0],
+            "usuario": row[1],
+            "nombre": row[2],
+            "rol": row[3],
+            "id_empresa": id_empresa,
+        }
+
+        # 2. Borrar relaciones primero (defensivo aunque haya CASCADE en FK)
+        cursor.execute(
+            "DELETE FROM r_usuario_permisos WHERE id_usuario = %s",
+            (id_usuario,),
+        )
+        cursor.execute(
+            "DELETE FROM r_empresa_usuarios WHERE id_usuario = %s",
+            (id_usuario,),
+        )
+
+        # 3. Borrar el usuario
+        cursor.execute(
+            "DELETE FROM t_usuarios WHERE id = %s AND id_empresa = %s",
+            (id_usuario, id_empresa),
+        )
+
+        # 4. Auditoría — "DELETE_PERM" (11 chars).
+        # IMPORTANTE: en t_auditoria.id_entidad guardamos el id del usuario
+        # ya borrado. La FK no aplica (auditoría no tiene FK a t_usuarios
+        # por diseño). El id queda como referencia histórica del usuario
+        # que existía.
+        _registrar_auditoria(
+            cursor=cursor,
+            connection=connection,
+            id_usuario=id_usuario_cambio,
+            entidad="usuario",
+            id_entidad=id_usuario,
+            accion="DELETE_PERM",
+            datos_anteriores=datos_eliminados,
+            datos_nuevos={"eliminado": True},
+        )
+
+        return ({"id_usuario": id_usuario, "eliminado": True}, None)
+
+    except Exception as e:
+        if connection:
+            connection.rollback()
+        logger.error(
+            "Error en eliminar_usuario_permanente id_usuario=%s: %s",
+            id_usuario,
+            repr(e),
+        )
+        return None, {
+            "code": "DATABASE_ERROR",
+            "message": "No fue posible eliminar el usuario",
+        }
+    finally:
+        if cursor:
+            cursor.close()
+        if connection:
+            release_db_connection(connection)
+
+
+# ─── 3. Resetear contraseña ──────────────────────────────────────────────────
+
+
+def resetear_clave_usuario(
+    id_empresa: int,
+    id_usuario: int,
+    id_usuario_cambio: int,
+):
+    """
+    Resetea la contraseña del usuario a una temporal generada aleatoriamente.
+
+    La password se devuelve EN CLARO en la respuesta una sola vez.
+    El sudo_erp es responsable de comunicarla al usuario por canal seguro.
+
+    Reglas:
+      - Solo usuarios ACTIVOS (status=1). Si está inhabilitado, primero
+        reactivar y luego resetear.
+
+    Returns:
+        Tupla (data, error). En éxito incluye 'password_temporal'.
+    """
+    connection = None
+    cursor = None
+    try:
+        connection = get_db_connection()
+        cursor = connection.cursor()
+
+        # 1. Verificar usuario existe + pertenece + está activo
+        cursor.execute(
+            """
+            SELECT id, usuario, status
+              FROM t_usuarios
+             WHERE id         = %s
+               AND id_empresa = %s
+            """,
+            (id_usuario, id_empresa),
+        )
+        row = cursor.fetchone()
+
+        if not row:
+            return None, {
+                "code": "USER_NOT_FOUND",
+                "message": "El usuario no existe o no pertenece a esta empresa",
+            }
+
+        if row[2] == 0:
+            return None, {
+                "code": "USER_ALREADY_INACTIVE",
+                "message": (
+                    "El usuario está inhabilitado. Reactívalo antes de "
+                    "resetear su contraseña."
+                ),
+            }
+
+        # 2. Generar password temporal y hashearla
+        temp_password = _generate_temp_password()
+        clave_hasheada = bcrypt.hashpw(
+            temp_password.encode("utf-8"),
+            bcrypt.gensalt(rounds=BCRYPT_ROUNDS),
+        ).decode("utf-8")
+
+        # 3. UPDATE
+        cursor.execute(
+            """
+            UPDATE t_usuarios
+               SET clave             = %s,
+                   fecha_cambio      = NOW(),
+                   id_usuario_cambio = %s
+             WHERE id         = %s
+               AND id_empresa = %s
+            """,
+            (clave_hasheada, id_usuario_cambio, id_usuario, id_empresa),
+        )
+
+        # 4. Auditoría — "RESET_CLAVE" (11 chars).
+        # NUNCA loguear la password en claro ni el hash. Solo el evento.
+        _registrar_auditoria(
+            cursor=cursor,
+            connection=connection,
+            id_usuario=id_usuario_cambio,
+            entidad="usuario",
+            id_entidad=id_usuario,
+            accion="RESET_CLAVE",
+            datos_anteriores=None,
+            datos_nuevos={
+                "id_empresa": id_empresa,
+                "usuario": row[1],
+                # No guardamos la password ni hash. Solo señalamos el evento.
+                "metodo": "temporal_generada",
+            },
+        )
+
+        return (
+            {
+                "id_usuario": id_usuario,
+                "password_temporal": temp_password,  # se devuelve UNA SOLA VEZ
+            },
+            None,
+        )
+
+    except Exception as e:
+        if connection:
+            connection.rollback()
+        logger.error(
+            "Error en resetear_clave_usuario id_usuario=%s: %s",
+            id_usuario,
+            repr(e),
+        )
+        return None, {
+            "code": "DATABASE_ERROR",
+            "message": "No fue posible resetear la contraseña",
+        }
+    finally:
+        if cursor:
+            cursor.close()
+        if connection:
+            release_db_connection(connection)

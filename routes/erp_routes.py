@@ -6,7 +6,7 @@ from utils.auth_guard import (
     validate_empresa_access,
 )
 from utils.validation import validate_payload
-from validators import CreateEmpresaAdminSchema, CreateUsuarioCompletoSchema
+from validators import CreateEmpresaAdminSchema, CreateUserSchema
 from services import erp_service
 
 logger = logging.getLogger(__name__)
@@ -528,7 +528,7 @@ def create_company_user_complete(id_empresa):
     # El schema descarta cualquier campo no declarado en cualquiera de los
     # niveles — defensa en profundidad contra escalación de privilegios
     # vía campos como id_rol, status o id_empresa en datos.
-    data, validation_error = validate_payload(CreateUsuarioCompletoSchema(), data)
+    data, validation_error = validate_payload(CreateUserSchema(), data)
     if validation_error:
         return validation_error
 
@@ -577,6 +577,241 @@ def create_company_user_complete(id_empresa):
         logger.error(
             "Error en POST /admin-erp/empresas/%s/usuarios-completo: %s",
             id_empresa,
+            repr(exc),
+            exc_info=True,
+        )
+        return jsonify({"error": "Error interno del servidor"}), 500
+
+
+# ─── Mapping de errores específicos de operaciones sudo_erp sobre usuarios ───
+_SUDO_USER_OPS_ERROR_STATUS = {
+    "USER_NOT_FOUND": 404,
+    "EMPRESA_NOT_FOUND": 404,
+    "USER_ALREADY_ACTIVE": 409,  # ya está reactivado
+    "USER_ALREADY_INACTIVE": 409,  # ya está inhabilitado (caso reset password)
+    "CANNOT_DELETE_SELF": 403,
+    "CANNOT_DELETE_SUDO": 403,
+    "DATABASE_ERROR": 500,
+}
+
+
+def _handle_sudo_user_ops_error(error: dict, endpoint: str, **extras):
+    """Helper de mapeo error→HTTP para los 3 endpoints sudo_erp/usuario."""
+    code = error.get("code", "DATABASE_ERROR")
+    status = _SUDO_USER_OPS_ERROR_STATUS.get(code, 500)
+    if status >= 500:
+        logger.error(
+            "Error %d en %s (%s): %s | %s",
+            status,
+            endpoint,
+            code,
+            error.get("message"),
+            extras,
+        )
+        return jsonify({"error": "Ocurrió un error interno"}), status
+    return jsonify({"error": error["message"], "code": code}), status
+
+
+# ─── 1. Reactivar usuario inhabilitado ────────────────────────────────────────
+
+
+@erp_bp.route(
+    "/empresas/<int:id_empresa>/usuarios/<int:id_usuario>/reactivar",
+    methods=["PATCH"],
+)
+@sudo_erp_required
+def reactivate_company_user(id_empresa: int, id_usuario: int):
+    """
+    Reactiva un usuario inhabilitado (status 0 → 1).
+
+    Solo el sudo_erp puede ejecutar esta operación. Casos de uso:
+      - Un admin_empresa inhabilitó por error a otro usuario.
+      - El usuario salió de la empresa, regresó después y quiere recuperar
+        su acceso histórico (mismos permisos que tenía).
+      - Recovery de incidentes (alguien fue inhabilitado durante una auditoría).
+
+    No requiere body — el id viene en la URL.
+
+    Respuestas:
+      200 → {"message", "id_usuario", "reactivado": true}
+      404 → usuario no existe / no pertenece a esta empresa
+      409 → el usuario ya está activo
+      500 → error interno
+    """
+    try:
+        id_usuario_cambio = int(request.user["sub"])
+
+        result, error = erp_service.reactivar_usuario(
+            id_empresa=id_empresa,
+            id_usuario=id_usuario,
+            id_usuario_cambio=id_usuario_cambio,
+        )
+
+        if error:
+            return _handle_sudo_user_ops_error(
+                error,
+                f"PATCH /admin-erp/empresas/{id_empresa}/usuarios/{id_usuario}/reactivar",
+                id_empresa=id_empresa,
+                id_usuario=id_usuario,
+            )
+
+        return jsonify({"message": "Usuario reactivado correctamente", **result}), 200
+
+    except Exception as exc:
+        logger.error(
+            "Error en PATCH /admin-erp/empresas/%s/usuarios/%s/reactivar: %s",
+            id_empresa,
+            id_usuario,
+            repr(exc),
+            exc_info=True,
+        )
+        return jsonify({"error": "Error interno del servidor"}), 500
+
+
+# ─── 2. Eliminar usuario permanente (HARD DELETE) ────────────────────────────
+
+
+@erp_bp.route(
+    "/empresas/<int:id_empresa>/usuarios/<int:id_usuario>",
+    methods=["DELETE"],
+)
+@sudo_erp_required
+def delete_company_user_permanent(id_empresa: int, id_usuario: int):
+    """
+    Elimina PERMANENTEMENTE a un usuario (DELETE FROM t_usuarios).
+
+    OPERACIÓN DESTRUCTIVA E IRREVERSIBLE — exclusiva del sudo_erp.
+
+    Casos de uso:
+      - GDPR / Ley de Protección de Datos: el titular ejerce el "derecho
+        al olvido" y la empresa debe borrar sus datos personales.
+      - Limpieza de cuentas de prueba creadas por error.
+      - Desvinculación legal después de retención mínima.
+
+    Lo que SÍ se borra:
+      - Fila en t_usuarios.
+      - Filas en r_usuario_permisos (FK CASCADE o DELETE manual).
+      - Filas en r_empresa_usuarios.
+
+    Lo que NO se borra:
+      - Registros históricos en t_auditoria — ahí queda el rastro de
+        que ese id_usuario realizó X acciones, aunque el usuario ya no
+        exista. Esto preserva la integridad del log.
+
+    Reglas de seguridad:
+      - El usuario debe pertenecer a la empresa indicada.
+      - El sudo_erp NO puede eliminarse a sí mismo.
+      - No se puede eliminar a otro sudo_erp (defensa en profundidad).
+
+    Respuestas:
+      200 → {"message", "id_usuario", "eliminado": true}
+      403 → eliminándose a sí mismo / target es sudo_erp
+      404 → usuario no existe / no pertenece a la empresa
+      500 → error interno
+    """
+    try:
+        id_usuario_cambio = int(request.user["sub"])
+
+        result, error = erp_service.eliminar_usuario_permanente(
+            id_empresa=id_empresa,
+            id_usuario=id_usuario,
+            id_usuario_cambio=id_usuario_cambio,
+        )
+
+        if error:
+            return _handle_sudo_user_ops_error(
+                error,
+                f"DELETE /admin-erp/empresas/{id_empresa}/usuarios/{id_usuario}",
+                id_empresa=id_empresa,
+                id_usuario=id_usuario,
+            )
+
+        return jsonify({"message": "Usuario eliminado permanentemente", **result}), 200
+
+    except Exception as exc:
+        logger.error(
+            "Error en DELETE /admin-erp/empresas/%s/usuarios/%s: %s",
+            id_empresa,
+            id_usuario,
+            repr(exc),
+            exc_info=True,
+        )
+        return jsonify({"error": "Error interno del servidor"}), 500
+
+
+# ─── 3. Resetear contraseña ──────────────────────────────────────────────────
+
+
+@erp_bp.route(
+    "/empresas/<int:id_empresa>/usuarios/<int:id_usuario>/reset-password",
+    methods=["POST"],
+)
+@sudo_erp_required
+def reset_company_user_password(id_empresa: int, id_usuario: int):
+    """
+    Resetea la contraseña de un usuario a una temporal.
+
+    Genera una contraseña aleatoria SEGURA (no es trivial guess) y la
+    devuelve UNA SOLA VEZ en la respuesta. El sudo_erp es responsable
+    de comunicarla al usuario por canal seguro (no email plano).
+
+    El usuario debería cambiarla en su primer login. Esto NO se enforce
+    en código por simplicidad — es responsabilidad operativa.
+
+    Casos de uso:
+      - Usuario olvidó su password y no hay flujo de "olvidé mi contraseña".
+      - Usuario fue víctima de phishing y necesita acceso de emergencia.
+      - Empleado nuevo recibió credenciales por error.
+
+    Lo que NO hace:
+      - No envía email automático con la nueva password (responsabilidad
+        del sudo_erp comunicarla por canal seguro).
+      - No revoca tokens activos automáticamente (en otro PR de seguridad
+        sería ideal hacerlo, pero el alcance aquí es solo reset).
+
+    Body: vacío — la nueva password se genera en el backend.
+
+    Respuestas:
+      200 → {"message", "id_usuario", "password_temporal": "..."}
+      404 → usuario no existe / no pertenece a la empresa
+      409 → usuario inhabilitado (no tiene sentido resetear si no puede entrar)
+      500 → error interno
+    """
+    try:
+        id_usuario_cambio = int(request.user["sub"])
+
+        result, error = erp_service.resetear_clave_usuario(
+            id_empresa=id_empresa,
+            id_usuario=id_usuario,
+            id_usuario_cambio=id_usuario_cambio,
+        )
+
+        if error:
+            return _handle_sudo_user_ops_error(
+                error,
+                f"POST /admin-erp/empresas/{id_empresa}/usuarios/{id_usuario}/reset-password",
+                id_empresa=id_empresa,
+                id_usuario=id_usuario,
+            )
+
+        return (
+            jsonify(
+                {
+                    "message": (
+                        "Contraseña reseteada. Comunica la temporal al usuario "
+                        "por un canal seguro y pídele cambiarla en su primer login."
+                    ),
+                    **result,
+                }
+            ),
+            200,
+        )
+
+    except Exception as exc:
+        logger.error(
+            "Error en POST /admin-erp/empresas/%s/usuarios/%s/reset-password: %s",
+            id_empresa,
+            id_usuario,
             repr(exc),
             exc_info=True,
         )
