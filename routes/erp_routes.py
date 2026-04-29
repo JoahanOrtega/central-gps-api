@@ -1,8 +1,12 @@
 import logging
 from flask import Blueprint, request, jsonify
-from utils.auth_guard import sudo_erp_required
+from utils.auth_guard import (
+    sudo_erp_required,
+    permiso_required,
+    validate_empresa_access,
+)
 from utils.validation import validate_payload
-from validators import CreateEmpresaAdminSchema
+from validators import CreateEmpresaAdminSchema, CreateUsuarioCompletoSchema
 from services import erp_service
 
 logger = logging.getLogger(__name__)
@@ -441,4 +445,139 @@ def get_audit():
 
     except Exception as exc:
         logger.error("Error en GET /admin-erp/auditoria: %s", repr(exc), exc_info=True)
+        return jsonify({"error": "Error interno del servidor"}), 500
+
+
+# ─── CREAR USUARIO COMPLETO (wizard del Panel ERP) ────────────────────────────
+
+
+# Mapping de errores del service a códigos HTTP.
+# Centralizado como dict para que sea fácil ver de un vistazo qué
+# error de negocio mapea a qué status. Si en el futuro se agrega un
+# nuevo "code" en el service, basta con añadir la línea aquí.
+#
+# Códigos NO incluidos aquí caen al default 500 — eso es deliberado:
+# si llega un code desconocido, lo más seguro es tratarlo como error
+# interno hasta clasificarlo explícitamente.
+_USUARIO_COMPLETO_ERROR_STATUS = {
+    "EMPRESA_NOT_FOUND": 404,
+    "USERNAME_TAKEN": 409,  # conflict — recurso duplicado
+    "INVALID_PERMISSIONS": 422,  # unprocessable — datos incoherentes
+    "ROL_NOT_CONFIGURED": 500,  # config del sistema, no del cliente
+}
+
+
+@erp_bp.route("/empresas/<int:id_empresa>/usuarios-completo", methods=["POST"])
+@permiso_required("usuarios.editar")
+def create_company_user_complete(id_empresa):
+    """
+    Crea un usuario completo (rol + restricciones + permisos granulares)
+    desde el wizard del Panel ERP.
+
+    Autorización (jerárquica):
+      - sudo_erp:      bypass de permisos, puede en cualquier empresa.
+      - admin_empresa: tiene 'usuarios.editar' por defecto (heredado del
+                       rol en r_rol_permisos), puede en SU empresa.
+      - usuario:       solo si el sudo_erp o un admin_empresa le asignó
+                       'usuarios.editar' explícitamente, puede en SU empresa.
+
+      validate_empresa_access garantiza que admin_empresa y usuario solo
+      puedan crear usuarios en su propia empresa. sudo_erp pasa siempre.
+
+    Body JSON esperado (validado por CreateUsuarioCompletoSchema):
+      {
+        "datos": {
+          "usuario":  "juanperez",
+          "clave":    "password123",
+          "nombre":   "Juan Pérez",
+          "rol":      "usuario",          // o "admin_empresa"
+          "email":    "juan@cliente.com", // opcional
+          "telefono": "+52 55 1234 5678"  // opcional
+        },
+        "restricciones": {
+          "dias_acceso":         "L,M,X,J,V",  // opcional
+          "hora_inicio_acceso":  "08:00",      // opcional
+          "hora_fin_acceso":     "18:00",      // opcional
+          "id_grupo_unidades":   3,            // opcional
+          "id_cliente":          15,           // opcional
+          "dias_consulta":       30            // opcional, default 0
+        },
+        "permisos": {
+          "id_permisos": [1, 3, 5, 7]   // opcional, default []
+        }
+      }
+
+    Respuestas:
+      201 → {"message", "usuario": {...}}
+      403 → sin permiso 'usuarios.editar' o intentando otra empresa
+      404 → empresa no existe / inactiva
+      409 → nombre de usuario ya tomado
+      422 → datos inválidos por marshmallow o INVALID_PERMISSIONS
+      500 → error interno (rol no configurado, BD caída, etc.)
+    """
+    # Validación de empresa: capa adicional al permiso 'usuarios.editar'.
+    # permiso_required dice "puedes hacer la acción", pero NO dice "en qué
+    # empresas". Sin esta validación, un admin_empresa de la empresa 5
+    # con permiso usuarios.editar podría crear usuarios en empresa 9.
+    if not validate_empresa_access(id_empresa, request.user):
+        return jsonify({"error": "Acceso no autorizado a esta empresa"}), 403
+
+    data = request.get_json(silent=True)
+
+    # Validar payload contra el schema completo (3 secciones anidadas).
+    # El schema descarta cualquier campo no declarado en cualquiera de los
+    # niveles — defensa en profundidad contra escalación de privilegios
+    # vía campos como id_rol, status o id_empresa en datos.
+    data, validation_error = validate_payload(CreateUsuarioCompletoSchema(), data)
+    if validation_error:
+        return validation_error
+
+    try:
+        id_usuario_registro = int(request.user["sub"])
+
+        result, error = erp_service.create_usuario_completo(
+            id_empresa=id_empresa,
+            payload=data,
+            id_usuario_registro=id_usuario_registro,
+        )
+
+        if error:
+            code = error.get("code", "DATABASE_ERROR")
+            status = _USUARIO_COMPLETO_ERROR_STATUS.get(code, 500)
+
+            # Errores 5xx: log detallado pero mensaje genérico al cliente.
+            # No queremos filtrar detalles internos como nombres de tablas
+            # o queries fallidas. Errores 4xx (negocio) sí van con el
+            # mensaje original porque son útiles para el usuario.
+            if status >= 500:
+                logger.error(
+                    "Error 500 en POST /admin-erp/empresas/%s/usuarios-completo (%s): %s",
+                    id_empresa,
+                    code,
+                    error.get("message"),
+                )
+                return (
+                    jsonify({"error": "No fue posible crear el usuario"}),
+                    status,
+                )
+
+            return jsonify({"error": error["message"], "code": code}), status
+
+        return (
+            jsonify(
+                {
+                    "message": "Usuario creado correctamente",
+                    "usuario": result,
+                }
+            ),
+            201,
+        )
+
+    except Exception as exc:
+        logger.error(
+            "Error en POST /admin-erp/empresas/%s/usuarios-completo: %s",
+            id_empresa,
+            repr(exc),
+            exc_info=True,
+        )
         return jsonify({"error": "Error interno del servidor"}), 500
