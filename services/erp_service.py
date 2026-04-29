@@ -1071,7 +1071,7 @@ def create_usuario_completo(
             id_usuario=id_usuario_registro,
             entidad="usuario",
             id_entidad=new_user_id,
-            accion="CREATE_USUARIO_COMPLETO",
+            accion="CREATE_USUARIO",
             datos_nuevos={
                 "usuario": usuario,
                 "nombre": nombre,
