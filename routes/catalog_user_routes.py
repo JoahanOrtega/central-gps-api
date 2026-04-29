@@ -73,29 +73,52 @@ _USER_ERROR_STATUS = {
 
 def _resolve_id_empresa() -> tuple[int | None, tuple | None]:
     """
-    Obtiene id_empresa del JWT del usuario logueado.
+    Resuelve el id_empresa para esta request.
 
-    Para todos los endpoints de catalogs/users el id_empresa SIEMPRE
-    viene del JWT (la empresa del usuario que llama), no de la URL.
-    Esto previene que un admin_empresa pase el id de otra empresa
-    arbitrariamente.
+    Reglas:
+      1. Para admin_empresa / usuario:
+         - El id_empresa SIEMPRE se toma del JWT (campo id_empresa).
+         - Si el cliente pasa ?id_empresa=N en query string, se IGNORA
+           si NO coincide con el del JWT (defensa en profundidad).
+      2. Para sudo_erp:
+         - Si pasa ?id_empresa=N en query string, se usa ese.
+         - Si no pasa nada, se intenta tomar del JWT (raro pero posible).
+         - Si tampoco trae JWT, retorna error: el sudo debe seleccionar
+           empresa antes de operar en catálogos.
+
+    Por qué este patrón:
+      Espeja /catalogs/operators y /catalogs/unit-groups (catalogs_routes.py)
+      donde el frontend pasa ?id_empresa=N tomado del selector visible
+      del navbar (useEmpresaActiva). Esto permite al sudo_erp operar en
+      cualquier empresa sin "switch company" forzado.
 
     Returns:
         Tupla (id_empresa, error_response). Si error_response no es None,
         el caller debe retornarla directamente al cliente.
     """
-    id_empresa = request.user.get("id_empresa")
+    rol = request.user.get("rol")
+    jwt_id_empresa = request.user.get("id_empresa")
+    qs_id_empresa = request.args.get("id_empresa", type=int)
+
+    if rol == "sudo_erp":
+        # sudo_erp: query param tiene prioridad sobre JWT.
+        # Si no manda nada, intentamos JWT (caso raro de sudo con empresa fija).
+        id_empresa = qs_id_empresa or jwt_id_empresa
+    else:
+        # admin_empresa o usuario: el JWT manda. Si manda query param
+        # distinto al JWT, lo ignoramos silenciosamente — no avisamos
+        # al cliente para no facilitar enumeración de empresas ajenas.
+        id_empresa = jwt_id_empresa
 
     if not id_empresa:
-        # Caso del sudo_erp sin empresa activa: NO debería pasar porque
-        # /catalogs/* requiere contexto de empresa. Si pasa, instruir al
-        # sudo_erp a usar el switch-company o las rutas de /admin-erp.
+        # sudo_erp sin empresa seleccionada: avisar con mensaje claro
+        # que dirige al lugar correcto (el selector del navbar).
         return None, (
             jsonify(
                 {
                     "error": (
-                        "Sin empresa activa. Si eres administrador del sistema, "
-                        "selecciona una empresa o usa el panel ERP."
+                        "Sin empresa activa. Selecciona una empresa desde el "
+                        "selector del navbar para operar en este catálogo."
                     ),
                 }
             ),
