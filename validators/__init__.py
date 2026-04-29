@@ -2,7 +2,7 @@
 # Punto único de importación para todos los schemas de marshmallow.
 #
 # Uso en routes:
-#   from validators import LoginSchema, CreateUnitSchema, CreatePoiSchema
+#   from validators import LoginSchema, CreateUserSchema, UpdateUserSchema
 #
 # Nota: la carpeta se llama 'validators' en lugar de 'schemas' para evitar
 # colisiones con el módulo interno de marshmallow en Python/Windows.
@@ -16,7 +16,14 @@ from validators.poi_validators import (
     UpdatePoiSchema,
 )
 from validators.erp_validators import CreateEmpresaAdminSchema
-from validators.usuario_validators import CreateUsuarioCompletoSchema
+
+# user_validators reemplaza al antiguo usuario_validators (que se elimina)
+# tras esta migración. CreateUserSchema sustituye a CreateUsuarioCompletoSchema.
+from validators.user_validators import (
+    CreateUserSchema,
+    UpdateUserSchema,
+    StatusUserSchema,
+)
 
 __all__ = [
     "LoginSchema",
@@ -28,5 +35,7 @@ __all__ = [
     "CreatePoiGroupSchema",
     "UpdatePoiSchema",
     "CreateEmpresaAdminSchema",
-    "CreateUsuarioCompletoSchema",
+    "CreateUserSchema",
+    "UpdateUserSchema",
+    "StatusUserSchema",
 ]
