@@ -31,6 +31,7 @@ from routes.telemetry_routes import telemetry_bp
 from routes.monitor_routes import monitor_bp
 from routes.catalogs_routes import catalogs_bp
 from routes.company_routes import company_bp
+from routes.catalog_user_routes import catalog_users_bp
 from routes.erp_routes import erp_bp
 
 logger = logging.getLogger(__name__)
@@ -102,6 +103,7 @@ def create_app() -> Flask:
     app.register_blueprint(telemetry_bp)
     app.register_blueprint(monitor_bp)
     app.register_blueprint(company_bp)
+    app.register_blueprint(catalog_users_bp)
     app.register_blueprint(erp_bp)
 
     # ── Manejador global de errores de rate limit ─────────────────────────────
