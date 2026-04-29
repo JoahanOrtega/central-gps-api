@@ -5,6 +5,7 @@ from services.unit_service import (
     create_unit,
     get_unit_detail,
     update_unit,
+    delete_unit,
 )
 from utils.auth_guard import jwt_required, permiso_required, validate_empresa_access
 from utils.validation import validate_payload
@@ -255,6 +256,82 @@ def patch_unit(id_unidad: int):
             id_unidad,
             request.user.get("id_empresa"),
             repr(error),
+            exc_info=True,
+        )
+        return jsonify({"error": "Error interno del servidor"}), 500
+
+
+@units_bp.route("/units/<int:id_unidad>", methods=["DELETE"])
+@permiso_required("unidades.eliminar")
+def remove_unit(id_unidad: int):
+    """
+    Elimina (soft-delete) una unidad.
+
+    Autorización:
+      - sudo_erp: permiso bypass.
+      - admin_empresa: permiso heredado del rol si está activo.
+      - usuario: solo si tiene 'unidades.eliminar' asignado vía
+        r_usuario_permisos.
+
+    El frontend debe ocultar el botón "Eliminar" si el usuario no tiene
+    el permiso — esto es solo UX. Si el botón se muestra erróneamente
+    y se hace click, el backend rechaza con 403.
+
+    Por qué soft-delete:
+      Mantener el registro permite:
+        1. Auditoría histórica (qué unidad ejecutó qué viaje, etc.).
+        2. Restauración futura sin re-ingresar IMEI, chip, vel_max...
+        3. Consistencia con el patrón del resto de tablas del sistema.
+
+    Respuestas:
+      200 → { "message": "...", "eliminado": true, "id_unidad": N }
+      403 → empresa no autorizada para el usuario
+      404 → { "code": "UNIT_NOT_FOUND", "message": "..." }
+
+    No usa request body — el id viene en la URL y el id_empresa del JWT
+    o query param. Esto sigue la convención REST: DELETE no debería
+    requerir body.
+    """
+    try:
+        id_empresa = request.args.get("id_empresa", type=int) or request.user.get(
+            "id_empresa"
+        )
+        id_usuario = request.user.get("sub")
+
+        if not id_empresa or not id_usuario:
+            return jsonify({"error": "Datos de autenticación incompletos"}), 400
+
+        if not validate_empresa_access(id_empresa, request.user):
+            return jsonify({"error": "Acceso no autorizado a esta empresa"}), 403
+
+        result, error = delete_unit(
+            id_unidad=id_unidad,
+            id_empresa=id_empresa,
+            id_usuario_cambio=int(id_usuario),
+        )
+
+        if error:
+            status = {
+                "UNIT_NOT_FOUND": 404,
+                "DATABASE_ERROR": 500,
+            }.get(error["code"], 500)
+            return jsonify(error), status
+
+        return (
+            jsonify(
+                {
+                    "message": "Unidad eliminada correctamente",
+                    **result,
+                }
+            ),
+            200,
+        )
+
+    except Exception as exc:
+        logger.error(
+            "Error en DELETE /units/%s: %s",
+            id_unidad,
+            repr(exc),
             exc_info=True,
         )
         return jsonify({"error": "Error interno del servidor"}), 500
