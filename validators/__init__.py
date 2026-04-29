@@ -10,7 +10,11 @@
 from validators.auth_validators import LoginSchema, SwitchCompanySchema
 from validators.password_validators import ChangePasswordSchema
 from validators.unit_validators import CreateUnitSchema, UpdateUnitSchema
-from validators.poi_validators import CreatePoiSchema, CreatePoiGroupSchema
+from validators.poi_validators import (
+    CreatePoiSchema,
+    CreatePoiGroupSchema,
+    UpdatePoiSchema,
+)
 from validators.erp_validators import CreateEmpresaAdminSchema
 
 __all__ = [
@@ -21,5 +25,6 @@ __all__ = [
     "UpdateUnitSchema",
     "CreatePoiSchema",
     "CreatePoiGroupSchema",
+    "UpdatePoiSchema",
     "CreateEmpresaAdminSchema",
 ]

@@ -28,3 +28,7 @@ Actualmente, el proyecto ya cuenta con rutas para consulta de usuarios y autenti
 ```bash
 pip install -r requirements.txt
 ```
+
+
+# 2. Aplicar la migración SQL en tu BD
+psql -U <tu_usuario> -d <tu_db> -f migrations/001_add_status_to_pois.sql

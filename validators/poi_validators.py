@@ -163,3 +163,105 @@ class CreatePoiGroupSchema(Schema):
     observaciones = fields.Str(load_default=None, allow_none=True)
     # El service usa payload["is_default"] directamente — necesita default
     is_default = fields.Bool(load_default=False)
+
+
+class UpdatePoiSchema(Schema):
+    """
+    Valida el payload de PATCH /pois/<id>.
+
+    Diferencias clave respecto a CreatePoiSchema:
+      - TODOS los campos son opcionales: el cliente solo manda lo que cambió.
+      - SIN load_default: marshmallow no inyecta defaults — el service
+        construye el UPDATE dinámico solo con las claves presentes en data.
+        Si pusiéramos load_default=None, marshmallow inyectaría None y el
+        UPDATE sobrescribiría con NULL columnas que el cliente no quería tocar.
+      - SIN @validates_schema cruzado por tipo_poi: el cliente puede mandar
+        solo `nombre` o solo `direccion` sin tener que reenviar la geometría.
+        Si manda nuevos lat/lng o radio, los validators por campo ya cubren
+        rangos válidos; la consistencia geométrica no es responsabilidad
+        del PATCH parcial.
+
+    El service usa data.keys() y data.values() iterando — por eso es CRÍTICO
+    no inyectar defaults aquí. Ese es el único patrón seguro para PATCH.
+
+    Notas de diseño:
+      - `id_empresa` se permite por contexto (sudo_erp), igual que en Create.
+        El service lo separa antes del UPDATE — nunca termina en el SQL.
+      - `id_grupo_pois` reemplaza completamente la lista de grupos del POI
+        si viene; si no viene, no se tocan los grupos existentes.
+    """
+
+    class Meta:
+        unknown = "EXCLUDE"
+
+    # ── Contexto ──────────────────────────────────────────────────────────────
+    id_empresa = fields.Int(allow_none=True)
+
+    # ── Atributos editables ───────────────────────────────────────────────────
+    # Sin load_default: si no viene, no aparece en data.keys().
+    nombre = fields.Str(validate=validate.Length(min=1, max=100))
+    direccion = fields.Str(allow_none=True)
+    observaciones = fields.Str(allow_none=True)
+
+    tipo_poi = fields.Int(
+        validate=validate.OneOf(
+            [1, 2, 3],
+            error="tipo_poi debe ser 1 (marcador), 2 (círculo) o 3 (polígono)",
+        ),
+    )
+
+    # ── Geometría ─────────────────────────────────────────────────────────────
+    lat = fields.Float(
+        allow_none=True,
+        validate=validate.Range(
+            min=-90, max=90, error="Latitud debe estar entre -90 y 90"
+        ),
+    )
+    lng = fields.Float(
+        allow_none=True,
+        validate=validate.Range(
+            min=-180, max=180, error="Longitud debe estar entre -180 y 180"
+        ),
+    )
+    radio = fields.Float(
+        allow_none=True,
+        validate=validate.Range(min=1, error="El radio debe ser mayor a 0"),
+    )
+    polygon_path = fields.Str(allow_none=True)
+    bounds = fields.Str(allow_none=True)
+    area = fields.Float(allow_none=True)
+
+    # ── Apariencia ────────────────────────────────────────────────────────────
+    tipo_marker = fields.Int()
+    url_marker = fields.Str(allow_none=True)
+    marker_path = fields.Str(allow_none=True)
+    marker_color = fields.Str(
+        validate=validate.Regexp(
+            r"^#[0-9a-fA-F]{6}$",
+            error="Color del marcador debe ser hex válido (#RRGGBB)",
+        ),
+    )
+    icon = fields.Str(allow_none=True)
+    icon_color = fields.Str(
+        validate=validate.Regexp(
+            r"^#[0-9a-fA-F]{6}$",
+            error="Color del ícono debe ser hex válido (#RRGGBB)",
+        ),
+    )
+    radio_color = fields.Str(
+        validate=validate.Regexp(
+            r"^#[0-9a-fA-F]{6}$",
+            error="Color del radio debe ser hex válido (#RRGGBB)",
+        ),
+    )
+    polygon_color = fields.Str(
+        validate=validate.Regexp(
+            r"^#[0-9a-fA-F]{6}$",
+            error="Color del polígono debe ser hex válido (#RRGGBB)",
+        ),
+    )
+
+    # ── Grupos ────────────────────────────────────────────────────────────────
+    # Si viene, reemplaza completamente la asignación de grupos del POI.
+    # Si no viene en data.keys(), el service no toca r_grupo_pois_pois.
+    id_grupo_pois = fields.List(fields.Int())
