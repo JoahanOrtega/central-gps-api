@@ -16,6 +16,7 @@ from validators.poi_validators import (
     UpdatePoiSchema,
 )
 from validators.erp_validators import CreateEmpresaAdminSchema
+from validators.usuario_validators import CreateUsuarioCompletoSchema
 
 __all__ = [
     "LoginSchema",
@@ -27,4 +28,5 @@ __all__ = [
     "CreatePoiGroupSchema",
     "UpdatePoiSchema",
     "CreateEmpresaAdminSchema",
+    "CreateUsuarioCompletoSchema",
 ]
