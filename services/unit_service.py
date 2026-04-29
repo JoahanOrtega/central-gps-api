@@ -521,3 +521,74 @@ def update_unit(
             cursor.close()
         if connection:
             release_db_connection(connection)
+
+
+def delete_unit(id_unidad, id_empresa, id_usuario_cambio):
+    """
+    Soft-delete de una unidad (status=1 → status=0).
+
+    Misma estrategia que delete_poi: la unidad permanece en BD para
+    auditoría e histórico. El listado get_units() filtra por status=1
+    así que para el usuario es indistinguible de un DELETE real.
+
+    Las relaciones (operadores, grupos) NO se tocan: si el sudo_erp
+    decide más adelante reactivar la unidad, su asignación de operador
+    y grupos se preserva. Mientras esté en status=0, esas relaciones
+    no son visibles porque el JOIN con t_unidades.status=1 las filtra.
+
+    Por qué un solo UPDATE con RETURNING:
+      Atomicidad. La verificación "existe + pertenece a empresa +
+      está activa" y el UPDATE ocurren en una sola transacción.
+      Si lo hiciéramos en dos queries (SELECT + UPDATE), una unidad
+      podría ser eliminada por otro usuario entre ambas queries y
+      terminaríamos respondiendo 200 OK con un cambio que no ocurrió.
+
+    Retorna (data, error) siguiendo el patrón de update_unit.
+    """
+    connection = None
+    cursor = None
+    try:
+        connection = get_db_connection()
+        cursor = connection.cursor()
+
+        cursor.execute(
+            """
+            UPDATE t_unidades
+               SET status            = 0,
+                   fecha_cambio      = NOW(),
+                   id_usuario_cambio = %s
+             WHERE id_unidad  = %s
+               AND id_empresa = %s
+               AND status     = 1
+            RETURNING id_unidad
+            """,
+            (id_usuario_cambio, id_unidad, id_empresa),
+        )
+
+        if not cursor.fetchone():
+            return None, {
+                "code": "UNIT_NOT_FOUND",
+                "message": "La unidad no existe o no pertenece a tu empresa",
+            }
+
+        connection.commit()
+        return {"id_unidad": id_unidad, "eliminado": True}, None
+
+    except Exception as e:
+        if connection:
+            connection.rollback()
+        logger.error(
+            "Error en delete_unit id_unidad=%s id_empresa=%s: %s",
+            id_unidad,
+            id_empresa,
+            repr(e),
+        )
+        return None, {
+            "code": "DATABASE_ERROR",
+            "message": "No fue posible eliminar la unidad",
+        }
+    finally:
+        if cursor:
+            cursor.close()
+        if connection:
+            release_db_connection(connection)
