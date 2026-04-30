@@ -1,9 +1,9 @@
-CREAR ARCHIVO NUEVO:
-═══════════════════════════════════════════════════════════════
-  central-gps-api/migrations/004_migrate_role_permissions_to_users.sql
+-- CREAR ARCHIVO NUEVO:
+-- ═══════════════════════════════════════════════════════════════
+--   central-gps-api/migrations/004_migrate_role_permissions_to_users.sql
 
-CONTENIDO COMPLETO:
-═══════════════════════════════════════════════════════════════
+-- CONTENIDO COMPLETO:
+-- ═══════════════════════════════════════════════════════════════
 
 
 -- ─────────────────────────────────────────────────────────────────────────────
