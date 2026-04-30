@@ -393,7 +393,40 @@ def create_permission():
 # Entidades válidas para filtrar el log de auditoría.
 # Lista explícita para prevenir que se pasen valores arbitrarios al servicio
 # que podrían causar comportamientos inesperados en la query de BD.
-_ENTIDADES_VALIDAS = frozenset({"empresa", "usuario", "permiso", "unidad", "poi"})
+_ENTIDADES_VALIDAS = frozenset(
+    {
+        "empresa",
+        "usuario",
+        "usuario_empresa",
+        "permiso",
+        "unidad",
+        "poi",
+        "session",
+    }
+)
+
+# Acciones válidas para filtrar el log.
+# Las acciones que los services del ERP/auth_service registran. Lista
+# blanca para evitar que el frontend pase valores arbitrarios. Si en
+# el futuro agregas acciones nuevas (ej. EXPORT_REPORT), añádelas aquí.
+_ACCIONES_VALIDAS = frozenset(
+    {
+        "LOGIN",
+        "CREATE",
+        "UPDATE",
+        "DELETE",
+        "CREATE_USUARIO",
+        "UPDATE_USUARIO",
+        "INHABILITAR",
+        "REACTIVAR",
+        "DELETE_PERM",
+        "RESET_CLAVE",
+        "SUSPEND",
+        "ACTIVATE",
+        "PROMOTE_ADMIN",
+        "REVOKE_ADMIN",
+    }
+)
 
 # Límite máximo de registros de auditoría por request.
 # Protege contra queries que devuelvan la tabla completa de una vez.
@@ -404,15 +437,20 @@ _AUDIT_LIMIT_MAX = 500
 @sudo_erp_required
 def get_audit():
     """
-    Log de auditoría del sistema.
+    Log de auditoría del sistema con filtros opcionales.
 
-    Query params opcionales:
-      ?limit=100   → número de registros (1–500, default 100)
-      ?entidad=empresa → filtrar por tipo de entidad
+    Query params (todos opcionales, se combinan con AND):
+        ?limit=100          → 1–500, default 100
+        ?entidad=session    → filtrar por tipo de entidad
+        ?id_usuario=42      → filtrar por usuario que ejecutó la acción
+        ?accion=LOGIN       → filtrar por acción específica
+        ?fecha_desde=YYYY-MM-DD  → fecha inicial inclusiva
+        ?fecha_hasta=YYYY-MM-DD  → fecha final inclusiva
+
+    Solo accesible por sudo_erp.
     """
     try:
-        # Parsear y validar limit — previene 500 por valor no numérico
-        # y evita queries sin cota que devuelvan toda la tabla
+        # ── Validar limit ───────────────────────────────────────────
         limit, limit_error = _parse_limit(
             request.args.get("limit"),
             default=100,
@@ -421,8 +459,7 @@ def get_audit():
         if limit_error:
             return jsonify({"error": limit_error}), 400
 
-        # Validar entidad contra lista blanca — previene pasar valores
-        # arbitrarios al servicio que podrían afectar la query de BD
+        # ── Validar entidad ─────────────────────────────────────────
         entidad_raw = request.args.get("entidad", "").strip().lower() or None
         if entidad_raw and entidad_raw not in _ENTIDADES_VALIDAS:
             return (
@@ -437,7 +474,64 @@ def get_audit():
                 400,
             )
 
-        data, error = erp_service.get_audit_log(limit=limit, entidad=entidad_raw)
+        # ── Validar id_usuario ──────────────────────────────────────
+        id_usuario_raw = request.args.get("id_usuario", "").strip()
+        id_usuario = None
+        if id_usuario_raw:
+            try:
+                id_usuario = int(id_usuario_raw)
+                if id_usuario <= 0:
+                    raise ValueError()
+            except ValueError:
+                return jsonify({"error": "id_usuario debe ser un entero positivo"}), 400
+
+        # ── Validar acción ──────────────────────────────────────────
+        accion_raw = request.args.get("accion", "").strip().upper() or None
+        if accion_raw and accion_raw not in _ACCIONES_VALIDAS:
+            return (
+                jsonify(
+                    {
+                        "error": (
+                            f"Acción '{accion_raw}' no válida. "
+                            f"Valores permitidos: {', '.join(sorted(_ACCIONES_VALIDAS))}"
+                        )
+                    }
+                ),
+                400,
+            )
+
+        # ── Validar fechas con regex simple ─────────────────────────
+        # Aceptamos formato YYYY-MM-DD (10 caracteres, dos guiones).
+        # Regex evita inyecciones y formatos ambiguos como "2026/04/30".
+        import re
+
+        DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+        fecha_desde = request.args.get("fecha_desde", "").strip() or None
+        fecha_hasta = request.args.get("fecha_hasta", "").strip() or None
+
+        if fecha_desde and not DATE_RE.match(fecha_desde):
+            return jsonify({"error": "fecha_desde debe tener formato YYYY-MM-DD"}), 400
+        if fecha_hasta and not DATE_RE.match(fecha_hasta):
+            return jsonify({"error": "fecha_hasta debe tener formato YYYY-MM-DD"}), 400
+
+        # Validar coherencia: desde no puede ser mayor que hasta.
+        # El frontend ya valida esto pero defendemos en backend también.
+        if fecha_desde and fecha_hasta and fecha_desde > fecha_hasta:
+            return (
+                jsonify({"error": "fecha_desde debe ser menor o igual a fecha_hasta"}),
+                400,
+            )
+
+        # ── Llamar al service con todos los filtros ─────────────────
+        data, error = erp_service.get_audit_log(
+            limit=limit,
+            entidad=entidad_raw,
+            id_usuario=id_usuario,
+            accion=accion_raw,
+            fecha_desde=fecha_desde,
+            fecha_hasta=fecha_hasta,
+        )
         if error:
             logger.error("Error en GET /admin-erp/auditoria: %s", error)
             return jsonify({"error": "No fue posible obtener el log de auditoría"}), 500
@@ -445,6 +539,34 @@ def get_audit():
 
     except Exception as exc:
         logger.error("Error en GET /admin-erp/auditoria: %s", repr(exc), exc_info=True)
+        return jsonify({"error": "Error interno del servidor"}), 500
+
+
+@erp_bp.route("/auditoria/usuarios", methods=["GET"])
+@sudo_erp_required
+def get_audit_users():
+    """
+    Lista de usuarios que tienen al menos un evento en t_auditoria.
+
+    Sirve para popular el dropdown filtrable del frontend.
+    Devuelve hasta 200 usuarios ordenados por total_eventos DESC.
+
+    Solo accesible por sudo_erp.
+    """
+    try:
+        data, error = erp_service.get_users_with_audit_activity(limit=200)
+        if error:
+            logger.error("Error en GET /admin-erp/auditoria/usuarios: %s", error)
+            return (
+                jsonify({"error": "No fue posible obtener la lista de usuarios"}),
+                500,
+            )
+        return jsonify(data), 200
+
+    except Exception as exc:
+        logger.error(
+            "Error en GET /admin-erp/auditoria/usuarios: %s", repr(exc), exc_info=True
+        )
         return jsonify({"error": "Error interno del servidor"}), 500
 
 

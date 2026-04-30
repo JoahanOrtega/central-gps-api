@@ -1,6 +1,8 @@
 import logging
 from flask import Blueprint, jsonify, request
 from services.auth_service import authenticate_user
+from services.erp_service import _registrar_auditoria
+from db.connection import get_db_connection, release_db_connection
 from services.company_service import get_user_companies
 from services.password_service import change_password
 from services.refresh_token_service import (
@@ -17,7 +19,6 @@ from utils.jwt_handler import (
 from utils.limiter import limiter
 from utils.validation import validate_payload
 from validators import LoginSchema, SwitchCompanySchema, ChangePasswordSchema
-from db.connection import get_db_connection, release_db_connection
 from config import Config
 
 logger = logging.getLogger(__name__)
@@ -124,6 +125,39 @@ def login():
             ip_origen=request.remote_addr,
             user_agent=request.headers.get("User-Agent"),
         )
+
+        # Registrar el login exitoso en la bitácora de auditoría.
+        # Usamos entidad="session" + id_entidad=user_id para que el log sea
+        # consistente con el resto: "el usuario X realizó la acción LOGIN
+        # sobre la sesión X". datos_nuevos guarda el user_agent y el rol
+        # del usuario al momento del login — útil para análisis forense
+        # ("¿este usuario admin se conectó desde un user-agent inusual?").
+        # NO loguear errores aquí: si falla, el login del usuario debe
+        # continuar normalmente. La auditoría es secundaria al producto.
+        try:
+            audit_conn = get_db_connection()
+            audit_cursor = audit_conn.cursor()
+            _registrar_auditoria(
+                cursor=audit_cursor,
+                connection=audit_conn,
+                id_usuario=user["id"],
+                entidad="session",
+                id_entidad=user["id"],
+                accion="LOGIN",
+                datos_nuevos={
+                    "rol": user.get("rol"),
+                    "user_agent": request.headers.get("User-Agent", "")[:255],
+                },
+            )
+            audit_cursor.close()
+            release_db_connection(audit_conn)
+        except Exception as audit_exc:
+            # NO interrumpir el login si la auditoría falla — solo loguear.
+            logger.warning(
+                "No se pudo registrar audit LOGIN para id_usuario=%s: %s",
+                user["id"],
+                repr(audit_exc),
+            )
 
         response = jsonify(
             {

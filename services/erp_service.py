@@ -685,10 +685,27 @@ def create_permission(clave: str, nombre: str, modulo: str, descripcion: str):
 # ─────────────────────────────────────────────
 
 
-def get_audit_log(limit: int = 100, entidad: str = None):
+def get_audit_log(
+    limit: int = 100,
+    entidad: str | None = None,
+    id_usuario: int | None = None,
+    accion: str | None = None,
+    fecha_desde: str | None = None,
+    fecha_hasta: str | None = None,
+):
     """
-    Devuelve el log de auditoría del sistema.
-    Se puede filtrar por entidad (empresa, usuario, permiso...).
+    Devuelve el log de auditoría del sistema con filtros opcionales.
+
+    Filtros (todos opcionales, se combinan con AND):
+        entidad:     'empresa', 'usuario', 'session', etc.
+        id_usuario:  ID del usuario que ejecutó la acción.
+        accion:      'LOGIN', 'CREATE_USUARIO', 'UPDATE_USUARIO', etc.
+        fecha_desde: 'YYYY-MM-DD' — fecha inicial INCLUSIVA.
+        fecha_hasta: 'YYYY-MM-DD' — fecha final INCLUSIVA (cubre hasta 23:59:59).
+
+    Construimos la query dinámicamente con WHERE acumulativo. Cada filtro
+    añade su condición usando placeholders %s — sin concatenación de
+    strings (defensa contra SQL injection).
     """
     connection = None
     cursor = None
@@ -696,49 +713,76 @@ def get_audit_log(limit: int = 100, entidad: str = None):
         connection = get_db_connection()
         cursor = connection.cursor()
 
+        # Construcción dinámica del WHERE.
+        # Lista paralela: condiciones SQL + valores para los placeholders.
+        conditions: list[str] = []
+        params: list = []
+
         if entidad:
+            conditions.append("entidad = %s")
+            params.append(entidad)
+
+        if id_usuario is not None:
+            # NOTA: la vista v_erp_auditoria NO expone el id_usuario crudo,
+            # solo email_usuario y nombre_usuario. Tenemos que filtrar por
+            # email para mantener compatibilidad con la vista, o consultar
+            # contra t_auditoria directo. Vamos por la primera opción —
+            # menos riesgo, mismos índices.
             cursor.execute(
-                """
-                SELECT
-                    id_auditoria,
-                    email_usuario,
-                    nombre_usuario,
-                    rol_usuario,
-                    entidad,
-                    id_entidad,
-                    accion,
-                    datos_anteriores,
-                    datos_nuevos,
-                    ip_origen,
-                    fecha_registro
-                FROM v_erp_auditoria
-                WHERE entidad = %s
-                ORDER BY fecha_registro DESC
-                LIMIT %s
-                """,
-                (entidad, limit),
+                "SELECT usuario FROM t_usuarios WHERE id = %s LIMIT 1",
+                (id_usuario,),
             )
-        else:
-            cursor.execute(
-                """
-                SELECT
-                    id_auditoria,
-                    email_usuario,
-                    nombre_usuario,
-                    rol_usuario,
-                    entidad,
-                    id_entidad,
-                    accion,
-                    datos_anteriores,
-                    datos_nuevos,
-                    ip_origen,
-                    fecha_registro
-                FROM v_erp_auditoria
-                ORDER BY fecha_registro DESC
-                LIMIT %s
-                """,
-                (limit,),
-            )
+            row = cursor.fetchone()
+            if row:
+                conditions.append("email_usuario = %s")
+                params.append(row[0])
+            else:
+                # Usuario no existe: forzar resultado vacío (1=0) en lugar
+                # de devolver TODO el log. Heurística: fallar silencioso
+                # con resultado vacío es menos peligroso que filtrar mal.
+                conditions.append("1 = 0")
+
+        if accion:
+            # Aceptamos accion exacta (LOGIN, CREATE_USUARIO, etc.).
+            # Comparación case-insensitive para tolerar variaciones del frontend.
+            conditions.append("UPPER(accion) = UPPER(%s)")
+            params.append(accion)
+
+        if fecha_desde:
+            # fecha_desde a las 00:00:00 — incluye todo el día desde.
+            conditions.append("fecha_registro >= %s")
+            params.append(f"{fecha_desde} 00:00:00")
+
+        if fecha_hasta:
+            # fecha_hasta a las 23:59:59 — incluye todo el día final.
+            conditions.append("fecha_registro <= %s")
+            params.append(f"{fecha_hasta} 23:59:59")
+
+        where_clause = ""
+        if conditions:
+            where_clause = "WHERE " + " AND ".join(conditions)
+
+        query = f"""
+              SELECT
+                  id_auditoria,
+                  email_usuario,
+                  nombre_usuario,
+                  rol_usuario,
+                  entidad,
+                  id_entidad,
+                  accion,
+                  datos_anteriores,
+                  datos_nuevos,
+                  ip_origen,
+                  fecha_registro
+              FROM v_erp_auditoria
+              {where_clause}
+              ORDER BY fecha_registro DESC
+              LIMIT %s
+          """
+        params.append(limit)
+
+        cursor.execute(query, tuple(params))
 
         rows = cursor.fetchall()
         cols = [desc[0] for desc in cursor.description]
@@ -747,6 +791,63 @@ def get_audit_log(limit: int = 100, entidad: str = None):
 
     except Exception as e:
         logger.error("Error en get_audit_log: %s", repr(e))
+        return None, str(e)
+    finally:
+        if cursor:
+            cursor.close()
+        if connection:
+            release_db_connection(connection)
+
+
+def get_users_with_audit_activity(limit: int = 200):
+    """
+    Devuelve la lista de usuarios que tienen al menos UN registro en
+    t_auditoria. Sirve para popular el dropdown filtrable del frontend
+    en la página de Auditoría.
+
+    Por qué NO devolver TODOS los usuarios del sistema:
+        - Muchos nunca generan eventos auditables (ej. perfiles legacy)
+        - El dropdown sería innecesariamente largo
+        - El UX correcto es mostrar solo usuarios "relevantes" para
+          auditoría (los que aparecen en la tabla)
+
+    Returns:
+        Tupla (lista, error). Lista de dicts con:
+            { id, usuario (email), nombre, rol, total_eventos }
+        Ordenado por total_eventos DESC para que los más activos
+        aparezcan primero.
+    """
+    connection = None
+    cursor = None
+    try:
+        connection = get_db_connection()
+        cursor = connection.cursor()
+
+        # JOIN con t_usuarios para resolver el id (la vista solo trae el
+        # email). count(*) por usuario para mostrar actividad relativa.
+        cursor.execute(
+            """
+              SELECT
+                  u.id,
+                  u.usuario,
+                  u.nombre,
+                  r.clave AS rol,
+                  COUNT(a.id_auditoria) AS total_eventos
+              FROM t_auditoria a
+              JOIN t_usuarios u ON u.id = a.id_usuario
+              LEFT JOIN t_roles r ON r.id_rol = u.id_rol
+              GROUP BY u.id, u.usuario, u.nombre, r.clave
+              ORDER BY total_eventos DESC, u.nombre ASC
+              LIMIT %s
+              """,
+            (limit,),
+        )
+        rows = cursor.fetchall()
+        cols = [desc[0] for desc in cursor.description]
+        return [dict(zip(cols, row)) for row in rows], None
+
+    except Exception as e:
+        logger.error("Error en get_users_with_audit_activity: %s", repr(e))
         return None, str(e)
     finally:
         if cursor:
