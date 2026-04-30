@@ -73,15 +73,15 @@ UTC_TZ = timezone.utc
 APP_TZ = timezone(timedelta(hours=-6))  # America/Mexico_City (sin DST)
 
 # ── Constantes de recorridos ──────────────────────────────────────────────────
-MIN_MOVING_SPEED = 1.0            # km/h — umbral para considerar "en movimiento"
-MIN_TRIP_DISTANCE_KM = 0.05       # km mínimo para incluir un recorrido
-MIN_TRIP_POINTS = 3               # puntos mínimos para un recorrido válido
-RECENT_TRIPS_DAYS = 7             # ventana de búsqueda de recorridos recientes
+MIN_MOVING_SPEED = 1.0  # km/h — umbral para considerar "en movimiento"
+MIN_TRIP_DISTANCE_KM = 0.05  # km mínimo para incluir un recorrido
+MIN_TRIP_POINTS = 3  # puntos mínimos para un recorrido válido
+RECENT_TRIPS_DAYS = 7  # ventana de búsqueda de recorridos recientes
 
 # ── Colores de polyline (fiel al CASE WHEN del legacy) ────────────────────────
-COLOR_NORMAL = "#4caf50"          # verde   — velocidad normal
-COLOR_WARNING = "#ff9800"         # naranja — cerca del límite (vel_max - 5)
-COLOR_DANGER = "#ea1f25"          # rojo    — exceso de velocidad
+COLOR_NORMAL = "#4caf50"  # verde   — velocidad normal
+COLOR_WARNING = "#ff9800"  # naranja — cerca del límite (vel_max - 5)
+COLOR_DANGER = "#ea1f25"  # rojo    — exceso de velocidad
 
 # ── Cache de vel_max ──────────────────────────────────────────────────────────
 # TTL de 5 min: la velocidad máxima de una unidad cambia cuando el catálogo
@@ -540,7 +540,15 @@ def get_route_by_mode(
     id_empresa: int | None = None,
 ) -> list[dict[str, Any]]:
     """
-    Modos: today | yesterday | day_before_yesterday | latest
+    Modos: current | latest | today | yesterday | day_before_yesterday
+
+    - current: viaje EN CURSO. Desde el último encendido hasta ahora.
+               Solo tiene sentido cuando la unidad está prendida — si está
+               apagada devuelve [] (el frontend ya oculta el botón Actual
+               en ese caso).
+    - latest:  ÚLTIMO viaje completado. Delimitado por los dos apagados
+               más recientes.
+
     Todos los rangos se calculan en UTC-6 y se consultan en UTC.
     """
     if id_empresa is not None and not check_unit_belongs_to_company(imei, id_empresa):
@@ -555,6 +563,9 @@ def get_route_by_mode(
 
     if mode == "latest":
         return _get_latest_trip(imei, vel_max)
+
+    if mode == "current":
+        return _get_current_trip(imei, vel_max)
 
     return []
 
@@ -628,6 +639,90 @@ def _get_latest_trip(imei: str, vel_max: float = 0.0) -> list[dict[str, Any]]:
         rows = cursor.fetchall()
 
     return [map_route_row(row, vel_max) for row in rows]
+
+
+def _get_current_trip(imei: str, vel_max: float = 0.0) -> list[dict[str, Any]]:
+    """
+    Recorrido EN CURSO — desde el último encendido hasta el momento actual.
+
+    Diferencia con _get_latest_trip:
+      - latest:  desde apagado anterior HASTA último apagado (cerrado)
+      - current: desde último encendido HASTA ahora (abierto)
+
+    Lógica:
+      1. Buscar el evento más reciente con tipo_alerta=33 (encendido motor).
+      2. Si NO existe encendido posterior al último apagado → la unidad
+         está apagada → devolver lista vacía (no hay viaje en curso).
+      3. Si SÍ existe → traer todos los puntos desde ese encendido
+         hasta ahora.
+
+    Casos cubiertos:
+      - Unidad nueva sin telemetría: []
+      - Unidad apagada hace tiempo: []
+      - Unidad encendida ahora mismo: puntos desde el encendido hasta now()
+      - Unidad encendida y luego apagada: [] (cae a "latest" mejor)
+    """
+    with telemetry_cursor() as cursor:
+        # 1. Buscar el último encendido del motor.
+        cursor.execute(
+            """
+            SELECT fecha_hora_gps FROM public.t_data
+             WHERE imei = %s
+               AND tipo_alerta = %s
+               AND fecha_hora_gps IS NOT NULL
+             ORDER BY fecha_hora_gps DESC
+             LIMIT 1
+            """,
+            (imei, TIPO_ALERTA_ENCENDIDO),
+        )
+        last_on_row = cursor.fetchone()
+
+        # Fallback: si no hay tipo_alerta=33, usar STATUS_ON.
+        # Algunos dispositivos viejos no emiten tipo_alerta y solo cambian status.
+        if not last_on_row:
+            cursor.execute(
+                """
+                SELECT fecha_hora_gps FROM public.t_data
+                 WHERE imei = %s
+                   AND status = %s
+                   AND fecha_hora_gps IS NOT NULL
+                 ORDER BY fecha_hora_gps DESC
+                 LIMIT 1
+                """,
+                (imei, STATUS_ON),
+            )
+            last_on_row = cursor.fetchone()
+
+        if not last_on_row:
+            # Unidad nunca se ha encendido — no hay viaje en curso.
+            return []
+
+        last_on_at = last_on_row[0]
+
+        # 2. Verificar que NO haya un apagado POSTERIOR al último encendido.
+        # Si hay apagado posterior → la unidad ya no está en viaje. Devolver
+        # vacío para que el frontend muestre el mensaje "Sin viaje en curso".
+        cursor.execute(
+            """
+            SELECT 1 FROM public.t_data
+             WHERE imei = %s
+               AND tipo_alerta = %s
+               AND fecha_hora_gps IS NOT NULL
+               AND fecha_hora_gps > %s
+             LIMIT 1
+            """,
+            (imei, TIPO_ALERTA_APAGADO, last_on_at),
+        )
+        if cursor.fetchone():
+            # Hay un apagado más reciente que el último encendido → ya no
+            # está en viaje. El usuario debería usar "Último" en su lugar.
+            return []
+
+    # 3. Hay viaje en curso — devolver los puntos desde el encendido hasta ahora.
+    # NOTA: usamos datetime.utcnow() en lugar de NOW() en SQL para que el
+    # rango sea coherente con el resto de las funciones (que usan UTC).
+    end_utc = datetime.utcnow()
+    return get_positions_in_range(imei, last_on_at, end_utc, 5000, vel_max)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

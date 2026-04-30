@@ -56,7 +56,11 @@ def _empresa_or_400():
 def get_route(imei):
     """
     Recorrido por modo predefinido.
-    Param: mode = latest | today | yesterday | day_before_yesterday
+    Param: mode = current | latest | today | yesterday | day_before_yesterday
+
+    - current: viaje en curso. Si la unidad está apagada, devuelve [].
+    - latest: último viaje completado.
+    - today/yesterday/day_before_yesterday: día completo en UTC-6.
     """
     try:
         empresa, err = _empresa_or_400()
@@ -64,7 +68,13 @@ def get_route(imei):
             return err
 
         mode = request.args.get("mode", "").strip()
-        if mode not in ("latest", "today", "yesterday", "day_before_yesterday"):
+        if mode not in (
+            "current",
+            "latest",
+            "today",
+            "yesterday",
+            "day_before_yesterday",
+        ):
             return jsonify({"error": "mode inválido"}), 400
 
         result = get_route_by_mode(imei, mode, empresa)
