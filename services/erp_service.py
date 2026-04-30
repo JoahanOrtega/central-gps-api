@@ -1600,3 +1600,289 @@ def resetear_clave_usuario(
             cursor.close()
         if connection:
             release_db_connection(connection)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MÓDULO: Gestión de permisos por usuario (PR feat/erp-permissions-management)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Después de la migración 004, los permisos se gestionan a nivel de usuario
+# (r_usuario_permisos) en lugar de a nivel de rol. Estas funciones soportan:
+#   1. Listar usuarios con conteo de permisos por empresa
+#   2. Obtener permisos específicos de un usuario en una empresa
+#   3. Reemplazar el set completo de permisos de un usuario en una empresa
+#
+# El sudo_erp es el único que puede usar estas funciones (validado en routes).
+
+
+def list_users_with_permissions_count():
+    """
+    Devuelve la lista de usuarios activos con su rol y conteo de permisos
+    por empresa.
+
+    Cada fila representa una "asignación usuario-empresa": un usuario que
+    pertenece a varias empresas aparecerá una vez por cada empresa.
+
+    Útil para popular la tabla principal de la página /admin-erp/permisos
+    donde el sudo elige qué usuario+empresa editar.
+
+    Returns:
+        Tupla (lista, error). Lista de dicts con:
+            {
+                id_usuario, usuario, nombre, rol_clave, rol_nombre,
+                id_empresa, empresa,
+                total_permisos
+            }
+    """
+    connection = None
+    cursor = None
+    try:
+        connection = get_db_connection()
+        cursor = connection.cursor()
+
+        # JOIN con t_roles para resolver el rol (etiqueta).
+        # JOIN con r_empresa_usuarios + t_empresas para listar las empresas
+        # asociadas al usuario.
+        # LEFT JOIN con r_usuario_permisos para contar; los usuarios sin
+        # permisos asignados igualmente aparecen (con count=0).
+        #
+        # NO se incluye sudo_erp (id_rol=1) porque su modelo de permisos es
+        # distinto (heredan TODO via r_rol_permisos + bypass en código).
+        cursor.execute("""
+            SELECT
+                u.id                        AS id_usuario,
+                u.usuario                   AS usuario,
+                u.nombre                    AS nombre,
+                r.clave                     AS rol_clave,
+                r.nombre                    AS rol_nombre,
+                e.id_empresa                AS id_empresa,
+                e.nombre                   AS empresa,
+                COALESCE(perm.total, 0)     AS total_permisos
+            FROM t_usuarios u
+            JOIN t_roles r ON r.id_rol = u.id_rol
+            JOIN r_empresa_usuarios eu ON eu.id_usuario = u.id
+            JOIN t_empresas e ON e.id_empresa = eu.id_empresa
+            LEFT JOIN (
+                SELECT id_usuario, id_empresa, COUNT(*) AS total
+                FROM r_usuario_permisos
+                GROUP BY id_usuario, id_empresa
+            ) perm ON perm.id_usuario = u.id AND perm.id_empresa = e.id_empresa
+            WHERE u.status = 1
+              AND r.clave IN ('admin_empresa', 'usuario')
+              AND e.status = 1
+            ORDER BY r.id_rol ASC, u.nombre ASC, e.nombre ASC
+            """)
+        rows = cursor.fetchall()
+        cols = [desc[0] for desc in cursor.description]
+        return [dict(zip(cols, row)) for row in rows], None
+
+    except Exception as e:
+        logger.error("Error en list_users_with_permissions_count: %s", repr(e))
+        return None, str(e)
+    finally:
+        if cursor:
+            cursor.close()
+        if connection:
+            release_db_connection(connection)
+
+
+def get_user_permissions_in_company(id_usuario: int, id_empresa: int):
+    """
+    Devuelve los permisos asignados a un usuario en una empresa específica.
+
+    Útil para popular el modal de edición que muestra "qué tiene este
+    usuario en esta empresa". El frontend marca los checkboxes según
+    los permisos que vengan en este array.
+
+    Args:
+        id_usuario:  ID del usuario.
+        id_empresa:  ID de la empresa.
+
+    Returns:
+        Tupla (lista, error). Lista de dicts con todos los permisos del
+        catálogo, cada uno con un flag `asignado` indicando si el usuario
+        lo tiene o no:
+            {
+                id_permiso, clave, nombre, modulo, descripcion,
+                asignado: bool
+            }
+    """
+    connection = None
+    cursor = None
+    try:
+        connection = get_db_connection()
+        cursor = connection.cursor()
+
+        # LEFT JOIN para incluir TODOS los permisos del catálogo, incluso
+        # los que el usuario NO tiene asignados. La columna 'asignado'
+        # resultante es true si hay match en r_usuario_permisos.
+        cursor.execute(
+            """
+            SELECT
+                p.id_permiso,
+                p.clave,
+                p.nombre,
+                p.modulo,
+                p.descripcion,
+                (rup.id_usuario_permiso IS NOT NULL) AS asignado
+            FROM t_permisos p
+            LEFT JOIN r_usuario_permisos rup
+                   ON rup.id_permiso  = p.id_permiso
+                  AND rup.id_usuario  = %s
+                  AND rup.id_empresa  = %s
+            WHERE p.status = 1
+            ORDER BY p.modulo ASC, p.clave ASC
+            """,
+            (id_usuario, id_empresa),
+        )
+        rows = cursor.fetchall()
+        cols = [desc[0] for desc in cursor.description]
+        return [dict(zip(cols, row)) for row in rows], None
+
+    except Exception as e:
+        logger.error(
+            "Error en get_user_permissions_in_company id_usuario=%s id_empresa=%s: %s",
+            id_usuario,
+            id_empresa,
+            repr(e),
+        )
+        return None, str(e)
+    finally:
+        if cursor:
+            cursor.close()
+        if connection:
+            release_db_connection(connection)
+
+
+def replace_user_permissions(
+    id_usuario: int,
+    id_empresa: int,
+    permisos_claves: list[str],
+    id_usuario_actor: int,
+):
+    """
+    Reemplaza COMPLETAMENTE el set de permisos de un usuario en una empresa.
+
+    Estrategia: DELETE-then-INSERT en una transacción única.
+      1. DELETE todos los permisos actuales del usuario en esa empresa
+      2. INSERT los permisos nuevos basándose en las claves recibidas
+    Si algo falla, ROLLBACK completo — ningún cambio parcial.
+
+    Esta es la operación que el sudo invoca al guardar el modal de edición
+    de permisos. El frontend manda el set COMPLETO (no diffs).
+
+    Args:
+        id_usuario:        Usuario al que se le reemplazan los permisos.
+        id_empresa:        Empresa específica.
+        permisos_claves:   Lista de claves (ej. ["clientes.ver", "unidades.editar"]).
+                           Lista vacía es válida — significa "quitarle todos los permisos".
+        id_usuario_actor:  Usuario que está haciendo el cambio (sudo). Se guarda
+                           en id_usuario_registro/id_usuario_cambio para auditoría.
+
+    Returns:
+        Tupla (resultado, error). resultado es un dict con:
+            {
+                permisos_anteriores: int,  # cuántos tenía antes
+                permisos_nuevos: int,      # cuántos tiene ahora
+            }
+
+    Errores comunes:
+        - permisos_claves contiene una clave que no existe en t_permisos:
+          el INSERT se hace por id_permiso (resuelto del catálogo); las
+          claves desconocidas se ignoran silenciosamente. El resultado
+          retornado refleja cuántas se aplicaron realmente.
+        - id_usuario o id_empresa no existen: la FK lo rechaza con error
+          de integridad → se devuelve en `error`.
+    """
+    connection = None
+    cursor = None
+    try:
+        connection = get_db_connection()
+        cursor = connection.cursor()
+
+        # Contar lo que había antes (para reporte en datos_anteriores de audit).
+        cursor.execute(
+            """
+            SELECT COUNT(*) FROM r_usuario_permisos
+             WHERE id_usuario = %s AND id_empresa = %s
+            """,
+            (id_usuario, id_empresa),
+        )
+        permisos_anteriores = cursor.fetchone()[0]
+
+        # 1. DELETE — borrar todos los permisos actuales del usuario en esa empresa.
+        cursor.execute(
+            """
+            DELETE FROM r_usuario_permisos
+             WHERE id_usuario = %s AND id_empresa = %s
+            """,
+            (id_usuario, id_empresa),
+        )
+
+        # 2. INSERT — agregar los permisos nuevos.
+        # Resolvemos las claves a id_permiso desde t_permisos en el mismo
+        # INSERT (subquery con IN). Las claves que no existan se ignoran.
+        if permisos_claves:
+            cursor.execute(
+                """
+                INSERT INTO r_usuario_permisos
+                       (id_usuario, id_empresa, id_permiso, id_usuario_registro)
+                SELECT %s, %s, p.id_permiso, %s
+                FROM t_permisos p
+                WHERE p.clave = ANY(%s)
+                  AND p.status = 1
+                ON CONFLICT (id_usuario, id_empresa, id_permiso) DO NOTHING
+                """,
+                (id_usuario, id_empresa, id_usuario_actor, permisos_claves),
+            )
+
+        # Contar lo que quedó.
+        cursor.execute(
+            """
+            SELECT COUNT(*) FROM r_usuario_permisos
+             WHERE id_usuario = %s AND id_empresa = %s
+            """,
+            (id_usuario, id_empresa),
+        )
+        permisos_nuevos = cursor.fetchone()[0]
+
+        # Auditar el cambio en t_auditoria.
+        # entidad="usuario_permisos" (entidad nueva, NO confundir con entidad="permiso"
+        # que es para CRUD del catálogo).
+        _registrar_auditoria(
+            cursor=cursor,
+            connection=connection,
+            id_usuario=id_usuario_actor,
+            entidad="usuario_permisos",
+            id_entidad=id_usuario,
+            accion="REPLACE_PERMISSIONS",
+            datos_anteriores={"total": permisos_anteriores, "id_empresa": id_empresa},
+            datos_nuevos={
+                "total": permisos_nuevos,
+                "id_empresa": id_empresa,
+                "claves": permisos_claves,
+            },
+        )
+
+        connection.commit()
+
+        return {
+            "permisos_anteriores": permisos_anteriores,
+            "permisos_nuevos": permisos_nuevos,
+        }, None
+
+    except Exception as e:
+        if connection:
+            connection.rollback()
+        logger.error(
+            "Error en replace_user_permissions id_usuario=%s id_empresa=%s: %s",
+            id_usuario,
+            id_empresa,
+            repr(e),
+        )
+        return None, str(e)
+    finally:
+        if cursor:
+            cursor.close()
+        if connection:
+            release_db_connection(connection)

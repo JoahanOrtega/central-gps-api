@@ -398,6 +398,7 @@ _ENTIDADES_VALIDAS = frozenset(
         "empresa",
         "usuario",
         "usuario_empresa",
+        "usuario_permisos",
         "permiso",
         "unidad",
         "poi",
@@ -421,6 +422,7 @@ _ACCIONES_VALIDAS = frozenset(
         "REACTIVAR",
         "DELETE_PERM",
         "RESET_CLAVE",
+        "REPLACE_PERMISSIONS",
         "SUSPEND",
         "ACTIVATE",
         "PROMOTE_ADMIN",
@@ -933,6 +935,191 @@ def reset_company_user_password(id_empresa: int, id_usuario: int):
         logger.error(
             "Error en POST /admin-erp/empresas/%s/usuarios/%s/reset-password: %s",
             id_empresa,
+            id_usuario,
+            repr(exc),
+            exc_info=True,
+        )
+        return jsonify({"error": "Error interno del servidor"}), 500
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Gestión de permisos por usuario (PR feat/erp-permissions-management)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@erp_bp.route("/users-permissions", methods=["GET"])
+@sudo_erp_required
+def get_users_with_permissions():
+    """
+    Lista de usuarios con conteo de permisos por empresa.
+
+    Útil para popular la tabla principal de la página de gestión.
+
+    Solo accesible por sudo_erp.
+    """
+    try:
+        data, error = erp_service.list_users_with_permissions_count()
+        if error:
+            logger.error("Error en GET /admin-erp/users-permissions: %s", error)
+            return (
+                jsonify({"error": "No fue posible obtener la lista de usuarios"}),
+                500,
+            )
+        return jsonify(data), 200
+
+    except Exception as exc:
+        logger.error(
+            "Error en GET /admin-erp/users-permissions: %s",
+            repr(exc),
+            exc_info=True,
+        )
+        return jsonify({"error": "Error interno del servidor"}), 500
+
+
+@erp_bp.route("/users/<int:id_usuario>/permissions", methods=["GET"])
+@sudo_erp_required
+def get_user_permissions(id_usuario: int):
+    """
+    Permisos de un usuario en una empresa específica.
+
+    Query params:
+        ?id_empresa=N  (requerido) — empresa para la que se consultan permisos.
+
+    Devuelve TODOS los permisos del catálogo, cada uno con flag asignado.
+
+    Solo accesible por sudo_erp.
+    """
+    try:
+        # Validar id_empresa
+        id_empresa_raw = request.args.get("id_empresa", "").strip()
+        if not id_empresa_raw:
+            return jsonify({"error": "Parámetro id_empresa es requerido"}), 400
+
+        try:
+            id_empresa = int(id_empresa_raw)
+            if id_empresa <= 0:
+                raise ValueError()
+        except ValueError:
+            return jsonify({"error": "id_empresa debe ser un entero positivo"}), 400
+
+        # Validar id_usuario (Flask ya lo convierte a int, pero por si acaso)
+        if id_usuario <= 0:
+            return jsonify({"error": "id_usuario debe ser un entero positivo"}), 400
+
+        data, error = erp_service.get_user_permissions_in_company(
+            id_usuario=id_usuario,
+            id_empresa=id_empresa,
+        )
+        if error:
+            logger.error(
+                "Error en GET /admin-erp/users/%s/permissions: %s",
+                id_usuario,
+                error,
+            )
+            return (
+                jsonify({"error": "No fue posible obtener los permisos del usuario"}),
+                500,
+            )
+
+        return jsonify(data), 200
+
+    except Exception as exc:
+        logger.error(
+            "Error en GET /admin-erp/users/%s/permissions: %s",
+            id_usuario,
+            repr(exc),
+            exc_info=True,
+        )
+        return jsonify({"error": "Error interno del servidor"}), 500
+
+
+@erp_bp.route("/users/<int:id_usuario>/permissions", methods=["PUT"])
+@sudo_erp_required
+def update_user_permissions(id_usuario: int):
+    """
+    Reemplaza el set completo de permisos de un usuario en una empresa.
+
+    Body JSON:
+        {
+            "id_empresa": N,
+            "permisos": ["clientes.ver", "unidades.editar", ...]
+        }
+
+    Importante:
+        - El frontend manda el SET COMPLETO de permisos a aplicar (no diffs).
+        - El backend hace DELETE-then-INSERT en una transacción.
+        - Lista vacía es válida ("quitarle todos los permisos").
+
+    Solo accesible por sudo_erp.
+    """
+    try:
+        data = request.get_json(silent=True)
+        if not data:
+            return jsonify({"error": "El cuerpo de la solicitud es requerido"}), 400
+
+        # Validar id_empresa
+        id_empresa = data.get("id_empresa")
+        if not isinstance(id_empresa, int) or id_empresa <= 0:
+            return jsonify({"error": "id_empresa debe ser un entero positivo"}), 400
+
+        # Validar permisos (lista)
+        permisos = data.get("permisos")
+        if not isinstance(permisos, list):
+            return (
+                jsonify({"error": "permisos debe ser una lista de claves de permiso"}),
+                400,
+            )
+
+        # Validar que cada elemento de la lista es string
+        if not all(isinstance(p, str) for p in permisos):
+            return (
+                jsonify(
+                    {"error": "permisos debe contener solo strings (claves de permiso)"}
+                ),
+                400,
+            )
+
+        # Sanity check: lista no demasiado larga (defensa contra abuso)
+        if len(permisos) > 500:
+            return (
+                jsonify({"error": "Demasiados permisos en la solicitud (máximo 500)"}),
+                400,
+            )
+
+        # Llamar al service
+        result, error = erp_service.replace_user_permissions(
+            id_usuario=id_usuario,
+            id_empresa=id_empresa,
+            permisos_claves=permisos,
+            id_usuario_actor=int(request.user["sub"]),
+        )
+
+        if error:
+            logger.error(
+                "Error en PUT /admin-erp/users/%s/permissions: %s",
+                id_usuario,
+                error,
+            )
+            return (
+                jsonify(
+                    {"error": "No fue posible actualizar los permisos del usuario"}
+                ),
+                500,
+            )
+
+        return (
+            jsonify(
+                {
+                    "message": "Permisos actualizados correctamente",
+                    **result,
+                }
+            ),
+            200,
+        )
+
+    except Exception as exc:
+        logger.error(
+            "Error en PUT /admin-erp/users/%s/permissions: %s",
             id_usuario,
             repr(exc),
             exc_info=True,
