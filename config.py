@@ -79,3 +79,13 @@ class Config:
     TELEMETRY_DB_USER: str = os.getenv("TELEMETRY_DB_USER", "postgres")
     TELEMETRY_DB_PASSWORD: str = _require("TELEMETRY_DB_PASSWORD")
     TELEMETRY_DB_PORT: str = os.getenv("TELEMETRY_DB_PORT", "5432")
+    # ── Redis (pub/sub para eventos en tiempo real) ────────────────────────────
+    # En desarrollo: redis://localhost:6379/0
+    # En producción: redis://:password@host:6379/0
+    REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+
+    # ── POI Worker ────────────────────────────────────────────────────────────
+    # Segundos entre cada ciclo de detección de geocercas. Default: 15.
+    WORKER_POLL_INTERVAL: int = int(os.getenv("WORKER_POLL_INTERVAL", "15"))
+    # "false" para deshabilitar el worker (útil en tests o entornos sin Redis).
+    WORKER_ENABLED: str = os.getenv("WORKER_ENABLED", "true")
