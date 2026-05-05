@@ -1,12 +1,14 @@
 """
 Flujo por ciclo:
   1. Leer de BD principal: alertas activas (t_alertas_poi + t_pois).
-  2. Leer de BD telemetria: ultimo GPS de cada unidad activa (t_data).
-  3. Para cada par (unidad, POI): calcular si esta dentro del perimetro.
-  4. Comparar con estado previo en r_poi_unidades (BD principal).
-  5. Si cambio de estado: insertar en t_eventos (BD telemetria).
-  6. Actualizar r_poi_unidades (BD principal).
-  7. Publicar evento en Redis -> SSE -> frontend.
+  2. Leer de BD principal: unidades activas por empresa (t_unidades).
+  3. Leer de BD telemetria: ultimo GPS de los IMEIs encontrados (t_data).
+  4. Combinar unidades + GPS en Python.
+  5. Para cada par (unidad, POI): calcular si esta dentro del perimetro.
+  6. Comparar con estado previo en r_poi_unidades (BD principal).
+  7. Si cambio de estado: insertar en t_eventos (BD telemetria).
+  8. Actualizar r_poi_unidades (BD principal).
+  9. Publicar evento en Redis -> SSE -> frontend.
 """
 
 from __future__ import annotations
@@ -79,26 +81,33 @@ _SQL_ALERTAS_ACTIVAS = """
     ORDER BY a.id_empresa
 """
 
-# Lee ultimo GPS de cada unidad activa de una empresa (BD telemetria).
-# Incluye id_data para el FK en t_eventos — necesario para trazabilidad.
-# Solo unidades con dato reciente (< 30 min) para no procesar desconectadas.
-_SQL_ULTIMOS_GPS = """
-    SELECT DISTINCT ON (u.id_unidad)
-        u.id_unidad,
-        u.numero,
-        u.imei,
-        d.latitud,
-        d.longitud,
-        d.velocidad,
-        d.fecha_hora_gps,
-        d.id_data
-    FROM t_unidades u
-    JOIN t_data d ON d.imei = u.imei
-    WHERE
-        u.id_empresa = %(id_empresa)s
-        AND u.status = 1
-        AND d.fecha_hora_gps >= NOW() - INTERVAL '30 minutes'
-    ORDER BY u.id_unidad, d.fecha_hora_gps DESC
+# Lee unidades activas de una empresa (BD principal).
+# Se usa para obtener los IMEIs y luego buscar GPS en telemetria.
+_SQL_UNIDADES_EMPRESA = """
+    SELECT id_unidad, numero, imei
+    FROM t_unidades
+    WHERE id_empresa = %(id_empresa)s
+      AND status = 1
+      AND imei IS NOT NULL
+      AND imei != ''
+"""
+
+# Lee el ultimo GPS de una lista de IMEIs (BD telemetria — t_data).
+# DISTINCT ON garantiza un solo registro por IMEI: el mas reciente.
+# Solo considera pings de los ultimos 30 minutos para no procesar
+# unidades desconectadas.
+_SQL_GPS_POR_IMEIS = """
+    SELECT DISTINCT ON (imei)
+        imei,
+        latitud,
+        longitud,
+        velocidad,
+        fecha_hora_gps,
+        id_data
+    FROM t_data
+    WHERE imei = ANY(%(imeis)s)
+      AND fecha_hora_gps >= NOW() - INTERVAL '30 minutes'
+    ORDER BY imei, fecha_hora_gps DESC
 """
 
 # Lee estado actual de una unidad en un POI (BD principal)
@@ -117,7 +126,6 @@ _SQL_ESTADO_ACTUAL = """
 """
 
 # Upsert del estado en r_poi_unidades (BD principal).
-# ON CONFLICT garantiza atomicidad — no hay race conditions.
 _SQL_UPSERT_ESTADO = """
     INSERT INTO r_poi_unidades (
         id_poi, id_unidad, id_empresa,
@@ -143,16 +151,6 @@ _SQL_UPSERT_ESTADO = """
 """
 
 # Inserta en t_eventos del servidor de telemetria (hypertable TimescaleDB).
-# Refleja la estructura real de la tabla:
-#   id_data       -> FK al ping GPS que genero el evento (trazabilidad)
-#   id_empresa    -> para filtrar por empresa sin JOIN
-#   id_unidad     -> unidad que entro/salio del POI
-#   fecha         -> solo la fecha (optimiza queries de tipo "eventos del dia")
-#   evento        -> tipo de evento: 10=entro, 11=salio, 12=perm.max, etc.
-#   id_elemento   -> el POI que disparo el evento
-#   fecha_hora_gmt -> timestamp exacto del evento segun el GPS
-#   fecha_registro -> cuando el worker lo detecto e inserto
-#   payload       -> JSON con datos extra (detalles de permanencia, velocidad)
 _SQL_INSERT_EVENTO = """
     INSERT INTO public.t_eventos (
         id_data,
@@ -183,11 +181,7 @@ _SQL_INSERT_EVENTO = """
 
 
 def _ejecutar_ciclo() -> None:
-    """
-    Un ciclo completo de deteccion de geocercas.
-    Se ejecuta cada POLL_INTERVAL segundos por APScheduler.
-    Los errores se capturan para que el scheduler no detenga la ejecucion.
-    """
+    """Ciclo completo de deteccion. Captura errores para que el scheduler continue."""
     try:
         _ciclo_interno()
     except Exception as exc:
@@ -200,14 +194,11 @@ def _ejecutar_ciclo() -> None:
 
 def _ciclo_interno() -> None:
     """
-    Implementacion del ciclo sin manejo de errores de nivel top.
+    Implementacion del ciclo de deteccion.
 
     Usa DOS conexiones separadas:
-      conn_main  -> r_poi_unidades, t_alertas_poi (BD principal)
-      conn_telem -> t_data (GPS), t_eventos (insercion) (BD telemetria)
-
-    Esto es correcto porque las tablas viven en servidores distintos
-    y los pools no deben mezclarse.
+      conn_main  -> BD principal (t_unidades, t_alertas_poi, r_poi_unidades)
+      conn_telem -> BD telemetria (t_data GPS, t_eventos INSERT)
     """
     conn_main = conn_telem = None
 
@@ -227,7 +218,7 @@ def _ciclo_interno() -> None:
             logger.debug("Sin alertas activas — ciclo terminado.")
             return
 
-        # ── 2. Agrupar por empresa ────────────────────────────────────────
+        # ── 2. Agrupar alertas por empresa ────────────────────────────────
         alertas_por_empresa: dict[int, list[dict]] = {}
         for alerta in alertas:
             emp = alerta["id_empresa"]
@@ -238,24 +229,74 @@ def _ciclo_interno() -> None:
         # ── 3. Procesar empresa por empresa ──────────────────────────────
         for id_empresa, alertas_empresa in alertas_por_empresa.items():
 
+            # ── 3a. Leer unidades de BD principal ─────────────────────────
+            # t_unidades vive en BD principal, NO en telemetria.
             try:
-                cur_telem.execute(_SQL_ULTIMOS_GPS, {"id_empresa": id_empresa})
-                col_gps = [d[0] for d in cur_telem.description]
-                unidades_gps = [dict(zip(col_gps, row)) for row in cur_telem.fetchall()]
+                cur_main.execute(_SQL_UNIDADES_EMPRESA, {"id_empresa": id_empresa})
+                col_u = [d[0] for d in cur_main.description]
+                unidades = [dict(zip(col_u, row)) for row in cur_main.fetchall()]
             except Exception as exc:
-                logger.error("Error leyendo GPS empresa=%s: %s", id_empresa, repr(exc))
+                conn_main.rollback()
+                logger.error(
+                    "Error leyendo unidades empresa=%s (BD principal): %s",
+                    id_empresa,
+                    repr(exc),
+                )
                 continue
+
+            if not unidades:
+                continue
+
+            # ── 3b. Buscar GPS reciente en BD telemetria por IMEI ─────────
+            # Solo enviamos los IMEIs al servidor remoto — no hacemos JOIN
+            # con t_unidades porque esa tabla no existe en telemetria.
+            imeis = [u["imei"] for u in unidades if u.get("imei")]
+            if not imeis:
+                continue
+
+            try:
+                cur_telem.execute(_SQL_GPS_POR_IMEIS, {"imeis": imeis})
+                col_g = [d[0] for d in cur_telem.description]
+                gps_por_imei: dict[str, dict] = {
+                    row[col_g.index("imei")]: dict(zip(col_g, row))
+                    for row in cur_telem.fetchall()
+                }
+            except Exception as exc:
+                # Rollback obligatorio — deja la conexion limpia para el
+                # proximo ciclo. Sin esto, "InFailedSqlTransaction" contamina
+                # todas las queries siguientes de la misma conexion.
+                try:
+                    conn_telem.rollback()
+                except Exception:
+                    pass
+                logger.error(
+                    "Error leyendo GPS empresa=%s (BD telemetria): %s",
+                    id_empresa,
+                    repr(exc),
+                )
+                continue
+
+            # ── 3c. Combinar unidades con su GPS en Python ─────────────────
+            unidades_gps = []
+            for u in unidades:
+                gps = gps_por_imei.get(u.get("imei", ""))
+                if gps:
+                    unidades_gps.append({**u, **gps})
 
             if not unidades_gps:
+                logger.debug(
+                    "Empresa=%s: sin GPS reciente para %d unidades",
+                    id_empresa,
+                    len(unidades),
+                )
                 continue
 
-            # ── 4. Para cada unidad x alerta -> detectar evento ──────────
+            # ── 3d. Para cada unidad x alerta -> detectar evento ──────────
             eventos_empresa: list[dict] = []
 
             for unidad in unidades_gps:
                 for alerta in alertas_empresa:
 
-                    # TODO: filtrar por id_grupo_unidades cuando alcance=1
                     eventos = _procesar_par_unidad_poi(
                         unidad=unidad,
                         alerta=alerta,
@@ -267,7 +308,7 @@ def _ciclo_interno() -> None:
                     eventos_empresa.extend(eventos)
                     total_eventos += len(eventos)
 
-            # ── 5. Publicar en Redis ──────────────────────────────────────
+            # ── 3e. Publicar en Redis ─────────────────────────────────────
             if eventos_empresa:
                 _publicar_eventos_redis(id_empresa, eventos_empresa)
 
@@ -275,7 +316,6 @@ def _ciclo_interno() -> None:
             logger.info("Ciclo POI: %d eventos detectados.", total_eventos)
 
     finally:
-        # Siempre devolver conexiones al pool aunque haya errores
         if conn_main:
             release_db_connection(conn_main)
         if conn_telem:
@@ -292,17 +332,6 @@ def _procesar_par_unidad_poi(
 ) -> list[dict]:
     """
     Evalua una unidad contra un POI y genera los eventos correspondientes.
-
-    Args:
-        unidad:     Dict con datos GPS actuales de la unidad (de t_data).
-        alerta:     Dict con configuracion de alerta del POI (de t_alertas_poi).
-        cur_main:   Cursor BD principal (leer/escribir r_poi_unidades).
-        conn_main:  Conexion BD principal (para commit del estado).
-        cur_telem:  Cursor BD telemetria (insertar en t_eventos).
-        conn_telem: Conexion BD telemetria (para commit del evento).
-
-    Returns:
-        Lista de eventos generados. Puede estar vacia si no hubo cambio.
     """
     id_unidad = unidad["id_unidad"]
     id_poi = alerta["id_poi"]
@@ -466,20 +495,9 @@ def _construir_evento(
     alerta: dict,
     detalles: dict | None,
 ) -> dict:
-    """
-    Construye el dict canonico de un evento para BD y Redis.
-
-    Mapeo al esquema real de t_eventos:
-      evento       = tipo_evento  (10=entro, 11=salio, 12=perm.max, etc.)
-      id_elemento  = id_poi       (el POI que disparo el evento)
-      id_data      = id_data      (FK al ping GPS — puede ser None si no disponible)
-      fecha        = date del GPS (para queries por dia sin funciones de tiempo)
-      fecha_hora_gmt = timestamp exacto del evento
-      payload      = JSON con detalles extra (permanencia, velocidad)
-    """
+    """Construye el dict canonico de un evento para BD y Redis."""
     fecha_gps = unidad["fecha_hora_gps"]
     return {
-        # Campos de t_eventos
         "id_data": unidad.get("id_data"),
         "id_empresa": alerta["id_empresa"],
         "id_unidad": unidad["id_unidad"],
@@ -488,7 +506,7 @@ def _construir_evento(
         "id_elemento": alerta["id_poi"],
         "fecha_hora_gmt": fecha_gps,
         "payload": json.dumps(detalles, default=str) if detalles else None,
-        # Campos extras solo para Redis (prefijo _ = no van a BD)
+        # Campos privados solo para Redis (prefijo _ = no van a BD)
         "_numero_unidad": unidad["numero"],
         "_nombre_poi": alerta["poi_nombre"],
         "_descripcion": _descripcion_evento(tipo_evento),
@@ -496,43 +514,30 @@ def _construir_evento(
 
 
 def _insertar_evento_bd(cur_telem, conn_telem, evento: dict) -> None:
-    """
-    Persiste el evento en t_eventos del servidor de telemetria (hypertable).
-
-    Usa el cursor de telemetria — NO el cursor principal.
-    TimescaleDB particiona automaticamente por fecha_hora_gmt.
-
-    Si falla, hace rollback y loggea — no propaga para no detener el ciclo.
-    """
+    """Persiste el evento en t_eventos del servidor de telemetria."""
     try:
-        # Filtrar campos privados antes de insertar
         payload_bd = {k: v for k, v in evento.items() if not k.startswith("_")}
         cur_telem.execute(_SQL_INSERT_EVENTO, payload_bd)
         conn_telem.commit()
     except Exception as exc:
-        conn_telem.rollback()
+        try:
+            conn_telem.rollback()
+        except Exception:
+            pass
         logger.error(
-            "Error insertando en t_eventos tipo=%s id_unidad=%s id_elemento=%s: %s",
+            "Error insertando en t_eventos tipo=%s id_unidad=%s: %s",
             evento.get("evento"),
             evento.get("id_unidad"),
-            evento.get("id_elemento"),
             repr(exc),
         )
 
 
 def _publicar_eventos_redis(id_empresa: int, eventos: list[dict]) -> None:
-    """
-    Publica cada evento en el canal Redis de la empresa.
-    Canal: "eventos_poi:{id_empresa}"
-
-    Si Redis no esta disponible, los eventos ya estan en BD —
-    solo se pierde la notificacion en tiempo real (degradacion graciosa).
-    """
+    """Publica cada evento en el canal Redis de la empresa."""
     try:
         r = _get_redis()
         canal = f"{REDIS_CHANNEL_BASE}:{id_empresa}"
         for evento in eventos:
-            # Construir payload para Redis con nombres legibles
             payload_redis = {
                 "tipo_evento": evento["evento"],
                 "id_empresa": evento["id_empresa"],
@@ -573,7 +578,7 @@ def _minutos_entre(inicio, fin) -> float:
 
 
 def _descripcion_evento(tipo_evento: int) -> str:
-    """Retorna la descripcion legible del tipo de evento para el frontend."""
+    """Retorna la descripcion legible del tipo de evento."""
     return {
         10: "Entro al POI",
         11: "Salio del POI",
@@ -590,10 +595,7 @@ _scheduler: BackgroundScheduler | None = None
 
 
 def iniciar_worker() -> None:
-    """
-    Crea e inicia el BackgroundScheduler con el job de deteccion.
-    Llamar desde create_app() DESPUES de registrar blueprints.
-    """
+    """Crea e inicia el scheduler. Llamar desde create_app()."""
     global _scheduler
 
     if os.getenv("WORKER_ENABLED", "true").lower() == "false":
@@ -601,15 +603,12 @@ def iniciar_worker() -> None:
         return
 
     if _scheduler is not None and _scheduler.running:
-        logger.warning("POI Worker ya esta corriendo — ignorando llamada duplicada.")
+        logger.warning("POI Worker ya esta corriendo.")
         return
 
     _scheduler = BackgroundScheduler(
         timezone="UTC",
-        job_defaults={
-            "coalesce": True,
-            "max_instances": 1,
-        },
+        job_defaults={"coalesce": True, "max_instances": 1},
     )
 
     _scheduler.add_job(
@@ -630,7 +629,7 @@ def iniciar_worker() -> None:
 
 
 def detener_worker() -> None:
-    """Detiene el scheduler de forma graciosa. Llamar en SIGTERM o atexit."""
+    """Detiene el scheduler. Llamar en SIGTERM o atexit."""
     global _scheduler
     if _scheduler and _scheduler.running:
         _scheduler.shutdown(wait=False)
