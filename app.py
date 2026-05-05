@@ -5,6 +5,7 @@ from flask import Flask, jsonify
 from flask_cors import CORS
 from flask_limiter.util import get_remote_address
 from utils.limiter import limiter
+import atexit
 from routes.events_routes import events_bp
 from workers.poi_worker import iniciar_worker, detener_worker
 
@@ -113,6 +114,7 @@ def create_app() -> Flask:
     # app.testing: en tests unitarios no queremos el worker corriendo.
     if not app.testing:
         iniciar_worker()
+        atexit.register(detener_worker)
 
     # ── Manejador global de errores de rate limit ─────────────────────────────
     @app.errorhandler(429)
@@ -129,10 +131,6 @@ def create_app() -> Flask:
     @app.route("/", methods=["GET"])
     def health_check():
         return {"message": "API CentralGPS funcionando correctamente"}, 200
-
-    import atexit
-
-    atexit.register(detener_worker)
 
     return app
 

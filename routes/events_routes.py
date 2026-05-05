@@ -1,7 +1,4 @@
 """
-routes/events_routes.py — Endpoint SSE para eventos de geocerca en tiempo real
-────────────────────────────────────────────────────────────────────────────────
-
 Responsabilidad:
   Exponer el endpoint GET /events/stream que mantiene una conexión HTTP
   abierta y envía eventos de geocerca al frontend a medida que ocurren,
@@ -95,10 +92,12 @@ def stream_eventos():
        el navegador lo soporta. Ver nota en el frontend hook.)
 
     Query params:
-      token (str, requerido): JWT del usuario.
-                              EventSource nativo no soporta headers custom,
-                              así que el token va en la URL como ?token=...
-                              El backend lo lee del query string.
+      token      (str, requerido): JWT del usuario.
+                                   EventSource nativo no soporta headers custom,
+                                   así que el token va en la URL como ?token=...
+      id_empresa (int, opcional):  Requerido solo para sudo_erp, cuyo JWT no
+                                   tiene id_empresa fijo. El frontend lo pasa
+                                   desde companyStore.currentCompany.id_empresa.
 
     Respuesta:
       Content-Type: text/event-stream
@@ -107,7 +106,7 @@ def stream_eventos():
 
     Errores:
       401 → token inválido, expirado o faltante (respuesta JSON, no SSE)
-      403 → usuario sin empresa asignada en el JWT
+      403 → usuario sin empresa asignada y sin ?id_empresa en la URL
     """
     # ── Validar JWT desde query param (EventSource no admite headers) ─────────
     token = request.args.get("token", "").strip()
@@ -119,9 +118,23 @@ def stream_eventos():
     except Exception:
         return {"error": "Token inválido o expirado"}, 401
 
+    # ── Resolver id_empresa ───────────────────────────────────────────────────
+    # Prioridad:
+    #   1. id_empresa del JWT (usuarios normales y admin_empresa)
+    #   2. ?id_empresa en la URL (sudo_erp — su JWT no tiene empresa fija)
     id_empresa: int | None = payload.get("id_empresa")
+
     if not id_empresa:
-        return {"error": "Token sin empresa asignada"}, 403
+        # sudo_erp: leer el parámetro de la URL
+        id_empresa_param = request.args.get("id_empresa", "").strip()
+        if id_empresa_param and id_empresa_param.isdigit():
+            id_empresa = int(id_empresa_param)
+
+    if not id_empresa:
+        return {
+            "error": "Empresa no especificada. "
+            "Para sudo_erp incluir ?id_empresa=<id> en la URL."
+        }, 403
 
     # ── Retornar la respuesta de streaming ────────────────────────────────────
     return Response(

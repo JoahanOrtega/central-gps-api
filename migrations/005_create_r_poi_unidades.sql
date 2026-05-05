@@ -1,168 +1,138 @@
--- ─────────────────────────────────────────────────────────────────────────────
--- Migración 005: crear tabla r_poi_unidades
--- ─────────────────────────────────────────────────────────────────────────────
+-- Migration 005: r_poi_unidades
+-- Tracks current geographic state of each unit relative to each POI.
+-- Answers: is unit X currently INSIDE or OUTSIDE POI Y?
 --
--- Contexto:
---   Esta tabla es el "estado actual" de cada combinación unidad ↔ POI.
---   Responde la pregunta: ¿la unidad X está DENTRO o FUERA del POI Y en
---   este momento?
+-- To apply:
+--   psql -U <user> -d <database> -f migrations/005_create_r_poi_unidades.sql
 --
---   El worker de detección de geocercas (Tarea 2) consulta y actualiza
---   esta tabla en cada ciclo. Si old_in ≠ new_in, hay un evento
---   de entrada (evento=10) o salida (evento=11) que se persiste en
---   t_eventos_poi (Migración 006).
---
--- Equivalencia con legacy PHP:
---   Directa con la tabla `r_poi_unidades` de MariaDB. Se eliminan los
---   campos de alertas (in_out, vel_max, permanencia, etc.) porque en
---   la nueva arquitectura esa configuración vive en t_alertas_poi
---   (Migración 006). Esta tabla es solo estado geográfico puro.
---
--- Particionado:
---   No se particiona. El número de filas es acotado:
---     MAX_FILAS = count(t_unidades_activas) × count(t_pois_por_empresa)
---   Para 1000 unidades × 500 POIs = 500,000 filas — manejable en una
---   sola tabla con los índices correctos.
---
--- Cómo aplicar:
---   psql -U <usuario> -d <base_de_datos> -f migrations/005_create_r_poi_unidades.sql
---
--- Cómo revertir:
+-- To revert:
 --   DROP TABLE IF EXISTS public.r_poi_unidades;
--- ─────────────────────────────────────────────────────────────────────────────
 
 BEGIN;
 
--- ─────────────────────────────────────────────────────────────────────────────
--- 1. Tabla principal
--- ─────────────────────────────────────────────────────────────────────────────
+-- ---------------------------------------------------------------------------
+-- 1. Main table
+-- ---------------------------------------------------------------------------
+-- Row count is bounded: MAX_ROWS = active_units x pois_per_company
+-- For 1000 units x 500 POIs = 500,000 rows — manageable without partitioning.
+--
+-- No FK to t_pois / t_unidades intentionally:
+-- The worker updates these rows every 15s in batch. ON DELETE CASCADE FKs
+-- would leave inconsistent state if a POI is deleted mid-cycle.
+-- Referential integrity is enforced at the service layer.
 
 CREATE TABLE IF NOT EXISTS public.r_poi_unidades (
 
-    -- ── Clave primaria ──────────────────────────────────────────────────────
-    id_poi_unidad   SERIAL          PRIMARY KEY,
+    -- Primary key
+    id_poi_unidad           SERIAL          PRIMARY KEY,
 
-    -- ── Relaciones ──────────────────────────────────────────────────────────
-    -- NO usamos FK a t_pois y t_unidades por rendimiento:
-    -- el worker actualiza estas filas cada 15s en batch. Las FK con
-    -- ON DELETE CASCADE las dejaría en estado inconsistente si se elimina
-    -- un POI mientras el worker está corriendo. La integridad se garantiza
-    -- a nivel de servicio (el worker verifica que el POI/unidad existan
-    -- antes de insertar).
-    id_poi          INTEGER         NOT NULL,
-    id_unidad       INTEGER         NOT NULL,
-    id_empresa      INTEGER         NOT NULL,   -- desnormalizado para queries por empresa sin JOIN
+    -- Relations (no FK by design — see note above)
+    id_poi                  INTEGER         NOT NULL,
+    id_unidad               INTEGER         NOT NULL,
+    id_empresa              INTEGER         NOT NULL,   -- denormalized for company queries without JOIN
 
-    -- ── Estado geográfico actual ─────────────────────────────────────────────
-    -- in_actual: 1 = unidad dentro del POI, 0 = fuera
-    -- Es el campo crítico — el worker compara in_actual contra el nuevo
-    -- cálculo para determinar si hubo cambio.
-    in_actual       SMALLINT        NOT NULL DEFAULT 0
-                    CHECK (in_actual IN (0, 1)),
+    -- Current geographic state
+    -- in_actual: 1 = unit inside POI perimeter, 0 = outside
+    -- This is the critical field — worker compares it against new calculation.
+    in_actual               SMALLINT        NOT NULL DEFAULT 0
+                            CHECK (in_actual IN (0, 1)),
 
-    -- ── Timestamps del evento actual ─────────────────────────────────────────
-    -- fecha_hora_in: cuándo entró al POI en el evento actual.
-    --   NULL si nunca ha entrado, o si ya salió (in_actual=0).
-    -- fecha_hora_out: cuándo salió del POI en el último evento.
-    --   NULL si nunca ha salido.
-    fecha_hora_in   TIMESTAMP       NULL,
-    fecha_hora_out  TIMESTAMP       NULL,
+    -- Timestamps of the current event
+    -- fecha_hora_in:  when the unit entered in the current event. NULL if never entered or already exited.
+    -- fecha_hora_out: when the unit last exited. NULL if never exited.
+    fecha_hora_in           TIMESTAMP       NULL,
+    fecha_hora_out          TIMESTAMP       NULL,
 
-    -- ── Timestamp del último dato GPS procesado ──────────────────────────────
-    -- El worker solo procesa un dato GPS si su fecha_hora_gps es POSTERIOR
-    -- a este campo. Evita reprocesar el mismo punto si el worker tiene lag.
-    fecha_hora_gps  TIMESTAMP       NULL,
+    -- Last GPS timestamp processed for this pair.
+    -- Worker skips GPS data whose timestamp is <= this value to avoid reprocessing.
+    fecha_hora_gps          TIMESTAMP       NULL,
 
-    -- ── Alertas de permanencia ───────────────────────────────────────────────
-    -- alerta_permanencia: flag para saber si ya se disparó la alerta de
-    -- permanencia en el evento actual. Se resetea a 0 cada vez que la
-    -- unidad entra de nuevo (fecha_hora_in se actualiza).
-    -- Equivalente al campo `alerta_permanencia` del legacy PHP.
-    alerta_permanencia SMALLINT     NOT NULL DEFAULT 0
-                       CHECK (alerta_permanencia IN (0, 1)),
+    -- Permanence alert flag.
+    -- 0 = not yet fired for current event. 1 = already fired.
+    -- Resets to 0 each time the unit re-enters (fecha_hora_in updates).
+    alerta_permanencia      SMALLINT        NOT NULL DEFAULT 0
+                            CHECK (alerta_permanencia IN (0, 1)),
 
-    -- ── Alertas de velocidad máxima dentro del POI ───────────────────────────
-    -- fecha_hora_ini_vel_max: cuándo inició el exceso de velocidad dentro del POI.
-    --   NULL si no hay exceso activo.
-    -- vel_max_alcanzada: la velocidad máxima detectada en el exceso activo.
-    fecha_hora_ini_vel_max  TIMESTAMP   NULL,
-    vel_max_alcanzada       NUMERIC(7,2) NULL,
+    -- Max speed alert inside POI
+    -- fecha_hora_ini_vel_max: when the speed excess started. NULL if no active excess.
+    -- vel_max_alcanzada: peak speed detected during the active excess.
+    fecha_hora_ini_vel_max  TIMESTAMP       NULL,
+    vel_max_alcanzada       NUMERIC(7,2)    NULL,
 
-    -- ── Auditoría de la fila ─────────────────────────────────────────────────
-    fecha_registro  TIMESTAMP       NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    fecha_cambio    TIMESTAMP       NULL
+    -- Audit
+    fecha_registro          TIMESTAMP       NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    fecha_cambio            TIMESTAMP       NULL
 
 );
 
 COMMENT ON TABLE public.r_poi_unidades IS
-    'Estado actual de cada unidad respecto a cada POI. '
-    '1 fila por combinación (id_unidad, id_poi). '
-    'El worker de geocercas actualiza esta tabla cada ciclo de detección.';
+    'Current state of each unit relative to each POI. '
+    '1 row per (id_unidad, id_poi) pair. '
+    'Updated by the geofence worker on every detection cycle.';
 
 COMMENT ON COLUMN public.r_poi_unidades.in_actual IS
-    '1 = unidad dentro del perímetro del POI, 0 = fuera.';
+    '1 = unit inside POI perimeter, 0 = outside.';
 
 COMMENT ON COLUMN public.r_poi_unidades.fecha_hora_gps IS
-    'Timestamp del último dato GPS procesado para esta combinación. '
-    'El worker omite datos cuyo timestamp sea <= este valor.';
+    'Timestamp of last GPS data processed for this pair. '
+    'Worker skips data with timestamp <= this value.';
 
 COMMENT ON COLUMN public.r_poi_unidades.alerta_permanencia IS
-    '0 = alerta de permanencia no disparada en el evento actual. '
-    '1 = ya se disparó. Se resetea a 0 en cada nueva entrada.';
+    '0 = permanence alert not yet fired for current event. '
+    '1 = already fired. Resets to 0 on each new entry.';
 
 
--- ─────────────────────────────────────────────────────────────────────────────
--- 2. Restricción de unicidad
--- ─────────────────────────────────────────────────────────────────────────────
--- Garantiza que existe exactamente 1 fila por par (unidad, POI).
--- El worker usa INSERT ... ON CONFLICT (id_unidad, id_poi) DO UPDATE
--- para hacer upsert sin race conditions.
+-- ---------------------------------------------------------------------------
+-- 2. Uniqueness constraint
+-- ---------------------------------------------------------------------------
+-- Guarantees exactly 1 row per (unit, POI) pair.
+-- Worker uses INSERT ... ON CONFLICT (id_unidad, id_poi) DO UPDATE
+-- for atomic upsert without race conditions.
 
 ALTER TABLE public.r_poi_unidades
     ADD CONSTRAINT uq_r_poi_unidades_unidad_poi
     UNIQUE (id_unidad, id_poi);
 
 
--- ─────────────────────────────────────────────────────────────────────────────
--- 3. Índices
--- ─────────────────────────────────────────────────────────────────────────────
+-- ---------------------------------------------------------------------------
+-- 3. Indexes
+-- ---------------------------------------------------------------------------
 
--- Índice principal del worker: "dame todos los registros de la empresa X
--- donde la unidad esté dentro de algún POI (in_actual=1)".
--- El filtro parcial excluye el 80-90% de filas (la mayoría estará fuera).
+-- Main worker index: "give me all records for company X where unit is inside a POI"
+-- Partial filter excludes 80-90% of rows (most units will be outside).
 CREATE INDEX IF NOT EXISTS idx_r_poi_unidades_empresa_in
     ON public.r_poi_unidades (id_empresa)
     WHERE in_actual = 1;
 
--- Índice para el endpoint que responde "¿en qué POI está la unidad X?"
--- Consulta frecuente del mapa en tiempo real.
+-- For the endpoint: "which POI is unit X currently in?"
+-- Frequent query from the live map.
 CREATE INDEX IF NOT EXISTS idx_r_poi_unidades_unidad
     ON public.r_poi_unidades (id_unidad);
 
--- Índice para limpiezas por POI (cuando se elimina un POI, borrar sus filas).
+-- For cleanup when a POI is deleted.
 CREATE INDEX IF NOT EXISTS idx_r_poi_unidades_poi
     ON public.r_poi_unidades (id_poi);
 
 
--- ─────────────────────────────────────────────────────────────────────────────
--- 4. Trigger: actualizar fecha_cambio automáticamente
--- ─────────────────────────────────────────────────────────────────────────────
--- El worker hace UPDATE directo sin pasar fecha_cambio en el payload.
--- El trigger lo garantiza siempre actualizado, igual que en t_pois y
--- otras tablas del proyecto que siguen este patrón.
+-- ---------------------------------------------------------------------------
+-- 4. Trigger: auto-update fecha_cambio
+-- ---------------------------------------------------------------------------
+-- Worker does direct UPDATE without passing fecha_cambio in the payload.
+-- Trigger guarantees it is always updated, same pattern as t_pois and
+-- other tables in this project.
 
 CREATE OR REPLACE FUNCTION public.set_r_poi_unidades_fecha_cambio()
 RETURNS TRIGGER
 LANGUAGE plpgsql
 AS $$
 BEGIN
-    -- Solo actualizar si realmente cambió algún campo relevante.
-    -- Evita escrituras innecesarias si el worker hace UPDATE con los
-    -- mismos valores (p.ej. la unidad sigue dentro y el worker confirma).
+    -- Only update if a relevant field actually changed.
+    -- Avoids unnecessary writes if the worker confirms state without change
+    -- (e.g. unit is still inside and worker confirms it).
     IF (
-        NEW.in_actual       IS DISTINCT FROM OLD.in_actual       OR
-        NEW.fecha_hora_in   IS DISTINCT FROM OLD.fecha_hora_in   OR
-        NEW.fecha_hora_out  IS DISTINCT FROM OLD.fecha_hora_out  OR
+        NEW.in_actual          IS DISTINCT FROM OLD.in_actual          OR
+        NEW.fecha_hora_in      IS DISTINCT FROM OLD.fecha_hora_in      OR
+        NEW.fecha_hora_out     IS DISTINCT FROM OLD.fecha_hora_out     OR
         NEW.alerta_permanencia IS DISTINCT FROM OLD.alerta_permanencia
     ) THEN
         NEW.fecha_cambio = NOW();
@@ -172,8 +142,8 @@ END;
 $$;
 
 COMMENT ON FUNCTION public.set_r_poi_unidades_fecha_cambio() IS
-    'Actualiza fecha_cambio solo cuando cambian campos de estado geográfico. '
-    'Evita escrituras redundantes cuando el worker confirma estado sin cambio.';
+    'Updates fecha_cambio only when geographic state fields change. '
+    'Avoids redundant writes when the worker confirms unchanged state.';
 
 CREATE TRIGGER trg_r_poi_unidades_fecha_cambio
     BEFORE UPDATE ON public.r_poi_unidades
