@@ -1,44 +1,12 @@
 """
-workers/poi_worker.py — Worker de detección de geocercas en tiempo real
-────────────────────────────────────────────────────────────────────────────────
-
-Responsabilidad:
-  Ejecutarse en background cada POLL_INTERVAL segundos, detectar cuando
-  una unidad entra o sale de un POI, y publicar el evento en Redis para
-  que el endpoint SSE lo retransmita al frontend en tiempo real.
-
 Flujo por ciclo:
-  1. Leer de BD principal todas las alertas activas agrupadas por empresa.
-  2. Para cada empresa, leer el último dato GPS de sus unidades activas
-     desde la BD de telemetría.
-  3. Para cada par (unidad, POI), calcular si la unidad está dentro.
-  4. Comparar con el estado previo en r_poi_unidades:
-       - Si old_in != new_in → evento de entrada (10) o salida (11).
-       - Si in_actual=1 y alerta de permanencia activa → verificar tiempo.
-       - Si in_actual=1 y alerta de velocidad activa → verificar velocidad.
-  5. Insertar eventos detectados en t_eventos_poi.
-  6. Actualizar r_poi_unidades con el nuevo estado.
-  7. Publicar cada evento en Redis canal "eventos_poi:{id_empresa}".
-
-Arquitectura de concurrencia:
-  - El worker corre en un thread daemon separado del servidor Flask.
-  - APScheduler (BackgroundScheduler) gestiona el ciclo sin bloquear
-    las peticiones HTTP de Flask.
-  - El worker usa el mismo pool de BD que Flask — las conexiones se
-    devuelven correctamente en cada ciclo incluso si hay errores.
-  - Redis pub/sub desacopla al worker del endpoint SSE: si no hay
-    clientes conectados, los mensajes se descartan sin acumular.
-
-Manejo de errores:
-  - Un error en el ciclo completo NO detiene el worker — se loggea y
-    el scheduler vuelve a ejecutar en el siguiente intervalo.
-  - Un error en UNA empresa NO afecta el procesamiento de las demás.
-  - Si Redis no está disponible, el evento se guarda en BD pero no
-    llega en tiempo real al frontend (degradación graciosa).
-
-Configuración:
-  WORKER_POLL_INTERVAL  → segundos entre ciclos. Default: 15.
-  WORKER_ENABLED        → "false" para deshabilitar en tests. Default: "true".
+  1. Leer de BD principal: alertas activas (t_alertas_poi + t_pois).
+  2. Leer de BD telemetria: ultimo GPS de cada unidad activa (t_data).
+  3. Para cada par (unidad, POI): calcular si esta dentro del perimetro.
+  4. Comparar con estado previo en r_poi_unidades (BD principal).
+  5. Si cambio de estado: insertar en t_eventos (BD telemetria).
+  6. Actualizar r_poi_unidades (BD principal).
+  7. Publicar evento en Redis -> SSE -> frontend.
 """
 
 from __future__ import annotations
@@ -61,36 +29,23 @@ from utils.geofence import punto_en_geocerca
 
 logger = logging.getLogger(__name__)
 
-# ── Configuración ─────────────────────────────────────────────────────────────
+# ── Configuracion ─────────────────────────────────────────────────────────────
 
-# Segundos entre cada ciclo de detección.
-# 15s es el balance entre latencia de notificación y carga en BD.
-# El GPS de los AVL suele enviar cada 30s cuando está en movimiento,
-# así que 15s garantiza detectar el evento en el primer o segundo ciclo.
 POLL_INTERVAL: int = int(os.getenv("WORKER_POLL_INTERVAL", "15"))
-
-# URL de Redis para pub/sub.
 REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-
-# Canal base de Redis. El canal real es "{REDIS_CHANNEL_BASE}:{id_empresa}".
-# Permite que el endpoint SSE suscriba solo a los eventos de su empresa.
 REDIS_CHANNEL_BASE = "eventos_poi"
 
-# ── Instancia Redis (lazy — se crea al primer uso) ────────────────────────────
+# ── Redis (lazy init) ────────────────────────────────────────────────────────
 _redis_client: redis.Redis | None = None
 
 
 def _get_redis() -> redis.Redis:
-    """
-    Retorna la instancia Redis, creándola si no existe.
-    Lazy init para no fallar en el arranque si Redis no está levantado.
-    """
     global _redis_client
     if _redis_client is None:
         _redis_client = redis.from_url(
             REDIS_URL,
-            decode_responses=True,  # str en vez de bytes — más cómodo para JSON
-            socket_timeout=2,  # no bloquear el worker si Redis tarda
+            decode_responses=True,
+            socket_timeout=2,
             socket_connect_timeout=2,
         )
     return _redis_client
@@ -98,10 +53,7 @@ def _get_redis() -> redis.Redis:
 
 # ── Queries SQL ───────────────────────────────────────────────────────────────
 
-# Lee todas las alertas activas con la geometría de su POI.
-# Incluye solo POIs con status=1 (activos — no eliminados).
-# La query es ligera porque t_alertas_poi y t_pois tienen pocos registros
-# comparado con t_data.
+# Lee alertas activas con geometria del POI (BD principal)
 _SQL_ALERTAS_ACTIVAS = """
     SELECT
         a.id_alerta_poi,
@@ -115,7 +67,6 @@ _SQL_ALERTAS_ACTIVAS = """
         a.vel_max_permitida,
         a.alcance,
         a.id_grupo_unidades,
-        -- Geometría del POI
         p.nombre         AS poi_nombre,
         p.tipo_poi,
         p.lat            AS poi_lat,
@@ -128,29 +79,29 @@ _SQL_ALERTAS_ACTIVAS = """
     ORDER BY a.id_empresa
 """
 
-# Lee el último dato GPS de cada unidad activa de una empresa.
-# Solo incluye unidades con dato reciente (< 30 minutos) para no
-# procesar unidades desconectadas que no generarían eventos reales.
-# La BD de telemetría puede ser un servidor distinto al principal.
+# Lee ultimo GPS de cada unidad activa de una empresa (BD telemetria).
+# Incluye id_data para el FK en t_eventos — necesario para trazabilidad.
+# Solo unidades con dato reciente (< 30 min) para no procesar desconectadas.
 _SQL_ULTIMOS_GPS = """
-    SELECT
+    SELECT DISTINCT ON (u.id_unidad)
         u.id_unidad,
         u.numero,
         u.imei,
         d.latitud,
         d.longitud,
         d.velocidad,
-        d.fecha_hora_gps
+        d.fecha_hora_gps,
+        d.id_data
     FROM t_unidades u
     JOIN t_data d ON d.imei = u.imei
     WHERE
         u.id_empresa = %(id_empresa)s
         AND u.status = 1
         AND d.fecha_hora_gps >= NOW() - INTERVAL '30 minutes'
+    ORDER BY u.id_unidad, d.fecha_hora_gps DESC
 """
 
-# Lee el estado actual de una unidad en un POI específico.
-# Se usa para comparar old_in vs new_in y evitar duplicar eventos.
+# Lee estado actual de una unidad en un POI (BD principal)
 _SQL_ESTADO_ACTUAL = """
     SELECT
         id_poi_unidad,
@@ -165,9 +116,8 @@ _SQL_ESTADO_ACTUAL = """
     WHERE id_unidad = %(id_unidad)s AND id_poi = %(id_poi)s
 """
 
-# Upsert del estado en r_poi_unidades.
-# ON CONFLICT garantiza atomicidad — no hay race conditions si dos
-# workers corren en paralelo (aunque no debería pasar).
+# Upsert del estado en r_poi_unidades (BD principal).
+# ON CONFLICT garantiza atomicidad — no hay race conditions.
 _SQL_UPSERT_ESTADO = """
     INSERT INTO r_poi_unidades (
         id_poi, id_unidad, id_empresa,
@@ -192,52 +142,72 @@ _SQL_UPSERT_ESTADO = """
         vel_max_alcanzada      = EXCLUDED.vel_max_alcanzada
 """
 
-# Inserta un evento en t_eventos_poi (tabla particionada).
+# Inserta en t_eventos del servidor de telemetria (hypertable TimescaleDB).
+# Refleja la estructura real de la tabla:
+#   id_data       -> FK al ping GPS que genero el evento (trazabilidad)
+#   id_empresa    -> para filtrar por empresa sin JOIN
+#   id_unidad     -> unidad que entro/salio del POI
+#   fecha         -> solo la fecha (optimiza queries de tipo "eventos del dia")
+#   evento        -> tipo de evento: 10=entro, 11=salio, 12=perm.max, etc.
+#   id_elemento   -> el POI que disparo el evento
+#   fecha_hora_gmt -> timestamp exacto del evento segun el GPS
+#   fecha_registro -> cuando el worker lo detecto e inserto
+#   payload       -> JSON con datos extra (detalles de permanencia, velocidad)
 _SQL_INSERT_EVENTO = """
-    INSERT INTO t_eventos_poi (
-        id_empresa, id_unidad, id_poi,
-        tipo_evento, latitud, longitud, velocidad,
-        detalles, fecha_hora_evento, fecha_registro
+    INSERT INTO public.t_eventos (
+        id_data,
+        id_empresa,
+        id_unidad,
+        fecha,
+        evento,
+        id_elemento,
+        fecha_hora_gmt,
+        fecha_registro,
+        payload
     ) VALUES (
-        %(id_empresa)s, %(id_unidad)s, %(id_poi)s,
-        %(tipo_evento)s, %(latitud)s, %(longitud)s, %(velocidad)s,
-        %(detalles)s, %(fecha_hora_evento)s, NOW()
+        %(id_data)s,
+        %(id_empresa)s,
+        %(id_unidad)s,
+        %(fecha)s,
+        %(evento)s,
+        %(id_elemento)s,
+        %(fecha_hora_gmt)s,
+        NOW(),
+        %(payload)s
     )
     RETURNING id_evento
 """
 
 
-# ── Lógica principal del ciclo ────────────────────────────────────────────────
+# ── Logica principal del ciclo ────────────────────────────────────────────────
 
 
 def _ejecutar_ciclo() -> None:
     """
-    Un ciclo completo de detección de geocercas.
-
+    Un ciclo completo de deteccion de geocercas.
     Se ejecuta cada POLL_INTERVAL segundos por APScheduler.
-    Los errores se capturan aquí para que el scheduler no detenga
-    la ejecución futura.
+    Los errores se capturan para que el scheduler no detenga la ejecucion.
     """
     try:
         _ciclo_interno()
     except Exception as exc:
-        # Error catastrófico (BD caída, OOM, etc.) — loggear pero no
-        # propagar para que APScheduler reintente en el siguiente intervalo.
         logger.error(
-            "Error catastrófico en ciclo POI worker: %s", repr(exc), exc_info=True
+            "Error catastrofico en ciclo POI worker: %s",
+            repr(exc),
+            exc_info=True,
         )
 
 
 def _ciclo_interno() -> None:
     """
-    Implementación del ciclo de detección sin manejo de errores de nivel top.
+    Implementacion del ciclo sin manejo de errores de nivel top.
 
-    Estructura:
-      1. Leer alertas activas (BD principal).
-      2. Agrupar por empresa.
-      3. Para cada empresa, leer GPS de sus unidades (BD telemetría).
-      4. Para cada (unidad, alerta) → detectar evento.
-      5. Persistir y publicar.
+    Usa DOS conexiones separadas:
+      conn_main  -> r_poi_unidades, t_alertas_poi (BD principal)
+      conn_telem -> t_data (GPS), t_eventos (insercion) (BD telemetria)
+
+    Esto es correcto porque las tablas viven en servidores distintos
+    y los pools no deben mezclarse.
     """
     conn_main = conn_telem = None
 
@@ -248,17 +218,16 @@ def _ciclo_interno() -> None:
         cur_main = conn_main.cursor()
         cur_telem = conn_telem.cursor()
 
-        # ── 1. Leer todas las alertas activas ────────────────────────────────
+        # ── 1. Leer alertas activas (BD principal) ────────────────────────
         cur_main.execute(_SQL_ALERTAS_ACTIVAS)
-        alertas_rows = cur_main.fetchall()
         col_alertas = [d[0] for d in cur_main.description]
-        alertas = [dict(zip(col_alertas, row)) for row in alertas_rows]
+        alertas = [dict(zip(col_alertas, row)) for row in cur_main.fetchall()]
 
         if not alertas:
             logger.debug("Sin alertas activas — ciclo terminado.")
             return
 
-        # ── 2. Agrupar alertas por empresa ────────────────────────────────────
+        # ── 2. Agrupar por empresa ────────────────────────────────────────
         alertas_por_empresa: dict[int, list[dict]] = {}
         for alerta in alertas:
             emp = alerta["id_empresa"]
@@ -266,18 +235,13 @@ def _ciclo_interno() -> None:
 
         total_eventos = 0
 
-        # ── 3. Procesar empresa por empresa ───────────────────────────────────
+        # ── 3. Procesar empresa por empresa ──────────────────────────────
         for id_empresa, alertas_empresa in alertas_por_empresa.items():
 
             try:
-                cur_telem.execute(
-                    _SQL_ULTIMOS_GPS,
-                    {"id_empresa": id_empresa},
-                )
-                gps_rows = cur_telem.fetchall()
+                cur_telem.execute(_SQL_ULTIMOS_GPS, {"id_empresa": id_empresa})
                 col_gps = [d[0] for d in cur_telem.description]
-                unidades_gps = [dict(zip(col_gps, row)) for row in gps_rows]
-
+                unidades_gps = [dict(zip(col_gps, row)) for row in cur_telem.fetchall()]
             except Exception as exc:
                 logger.error("Error leyendo GPS empresa=%s: %s", id_empresa, repr(exc))
                 continue
@@ -285,27 +249,25 @@ def _ciclo_interno() -> None:
             if not unidades_gps:
                 continue
 
-            # ── 4. Para cada unidad × alerta → detectar ──────────────────────
+            # ── 4. Para cada unidad x alerta -> detectar evento ──────────
             eventos_empresa: list[dict] = []
 
             for unidad in unidades_gps:
                 for alerta in alertas_empresa:
 
-                    # Filtro de alcance: si es por grupo, verificar membresía.
-                    # Por ahora procesamos todas — el filtro granular por grupo
-                    # se implementa en la Tarea 2C extendida.
                     # TODO: filtrar por id_grupo_unidades cuando alcance=1
-
                     eventos = _procesar_par_unidad_poi(
                         unidad=unidad,
                         alerta=alerta,
                         cur_main=cur_main,
                         conn_main=conn_main,
+                        cur_telem=cur_telem,
+                        conn_telem=conn_telem,
                     )
                     eventos_empresa.extend(eventos)
                     total_eventos += len(eventos)
 
-            # ── 5. Publicar en Redis los eventos de esta empresa ──────────────
+            # ── 5. Publicar en Redis ──────────────────────────────────────
             if eventos_empresa:
                 _publicar_eventos_redis(id_empresa, eventos_empresa)
 
@@ -313,7 +275,7 @@ def _ciclo_interno() -> None:
             logger.info("Ciclo POI: %d eventos detectados.", total_eventos)
 
     finally:
-        # Siempre devolver las conexiones al pool aunque haya errores
+        # Siempre devolver conexiones al pool aunque haya errores
         if conn_main:
             release_db_connection(conn_main)
         if conn_telem:
@@ -325,29 +287,29 @@ def _procesar_par_unidad_poi(
     alerta: dict,
     cur_main,
     conn_main,
+    cur_telem,
+    conn_telem,
 ) -> list[dict]:
     """
-    Evalúa una unidad contra un POI y genera los eventos correspondientes.
-
-    Retorna una lista de dicts de eventos (puede ser vacía si no hay cambio,
-    o contener 1-2 eventos si hay entrada + permanencia simultáneamente).
+    Evalua una unidad contra un POI y genera los eventos correspondientes.
 
     Args:
-        unidad:   Dict con los datos GPS actuales de la unidad.
-        alerta:   Dict con la configuración de alerta del POI.
-        cur_main: Cursor de la BD principal (para leer y escribir estado).
-        conn_main: Conexión principal (para commit).
+        unidad:     Dict con datos GPS actuales de la unidad (de t_data).
+        alerta:     Dict con configuracion de alerta del POI (de t_alertas_poi).
+        cur_main:   Cursor BD principal (leer/escribir r_poi_unidades).
+        conn_main:  Conexion BD principal (para commit del estado).
+        cur_telem:  Cursor BD telemetria (insertar en t_eventos).
+        conn_telem: Conexion BD telemetria (para commit del evento).
 
     Returns:
-        Lista de eventos generados en este ciclo para este par (unidad, POI).
-        Cada evento es un dict listo para enviar por Redis y persistir en BD.
+        Lista de eventos generados. Puede estar vacia si no hubo cambio.
     """
     id_unidad = unidad["id_unidad"]
     id_poi = alerta["id_poi"]
     id_empresa = alerta["id_empresa"]
     eventos: list[dict] = []
 
-    # ── Calcular si la unidad está dentro del POI ─────────────────────────────
+    # ── Calcular si la unidad esta dentro del POI ─────────────────────────
     new_in = punto_en_geocerca(
         lat_punto=float(unidad["latitud"]),
         lng_punto=float(unidad["longitud"]),
@@ -358,7 +320,7 @@ def _procesar_par_unidad_poi(
         polygon_path=alerta["poi_polygon_path"],
     )
 
-    # ── Leer estado previo ────────────────────────────────────────────────────
+    # ── Leer estado previo en r_poi_unidades ─────────────────────────────
     cur_main.execute(_SQL_ESTADO_ACTUAL, {"id_unidad": id_unidad, "id_poi": id_poi})
     row_estado = cur_main.fetchone()
     col_estado = [d[0] for d in cur_main.description]
@@ -367,7 +329,7 @@ def _procesar_par_unidad_poi(
     old_in = estado["in_actual"] if estado else None
     fecha_hora_gps = unidad["fecha_hora_gps"]
 
-    # Evitar reprocesar el mismo dato GPS que ya procesamos en el ciclo anterior
+    # Evitar reprocesar el mismo dato GPS
     if (
         estado
         and estado["fecha_hora_gps"]
@@ -375,7 +337,7 @@ def _procesar_par_unidad_poi(
     ):
         return []
 
-    # ── Preparar el nuevo estado para upsert ─────────────────────────────────
+    # ── Preparar nuevo estado ────────────────────────────────────────────
     nuevo_estado: dict = {
         "id_poi": id_poi,
         "id_unidad": id_unidad,
@@ -389,46 +351,34 @@ def _procesar_par_unidad_poi(
         "vel_max_alcanzada": estado["vel_max_alcanzada"] if estado else None,
     }
 
-    # ── Detectar cambio de estado (entrada / salida) ──────────────────────────
     cambio_estado = (old_in is None) or (old_in != (1 if new_in else 0))
 
+    # ── Detectar entrada / salida ─────────────────────────────────────────
     if cambio_estado and alerta["in_out"] == 1:
-        # Determinar tipo de evento
         tipo_evento = 10 if new_in else 11
 
         if new_in:
-            # La unidad ENTRÓ: registrar hora de entrada, resetear permanencia
             nuevo_estado["fecha_hora_in"] = fecha_hora_gps
             nuevo_estado["alerta_permanencia"] = 0
             nuevo_estado["fecha_hora_ini_vel_max"] = None
             nuevo_estado["vel_max_alcanzada"] = None
         else:
-            # La unidad SALIÓ: registrar hora de salida
             nuevo_estado["fecha_hora_out"] = fecha_hora_gps
 
-        evento = _construir_evento(
-            tipo_evento=tipo_evento,
-            unidad=unidad,
-            alerta=alerta,
-            detalles=None,
-        )
+        evento = _construir_evento(tipo_evento, unidad, alerta, detalles=None)
         eventos.append(evento)
-        _insertar_evento_bd(cur_main, conn_main, evento)
+        _insertar_evento_bd(cur_telem, conn_telem, evento)
 
-    # ── Detectar exceso de permanencia (solo si la unidad está dentro) ────────
+    # ── Detectar exceso de permanencia ────────────────────────────────────
     if (
         new_in
         and alerta["permanencia"] == 1
         and nuevo_estado["alerta_permanencia"] == 0
         and nuevo_estado["fecha_hora_in"] is not None
     ):
-        minutos_dentro = _minutos_entre(
-            nuevo_estado["fecha_hora_in"],
-            fecha_hora_gps,
-        )
+        minutos_dentro = _minutos_entre(nuevo_estado["fecha_hora_in"], fecha_hora_gps)
         minutos_permitidos = alerta["minutos_permanencia"] or 0
 
-        # tipo_permanencia=1: máximo excedido (unidad lleva MÁS de X minutos)
         if alerta["tipo_permanencia"] == 1 and minutos_dentro >= minutos_permitidos:
             detalles = {
                 "fecha_hora_in": str(nuevo_estado["fecha_hora_in"]),
@@ -437,12 +387,9 @@ def _procesar_par_unidad_poi(
             }
             evento = _construir_evento(12, unidad, alerta, detalles)
             eventos.append(evento)
-            _insertar_evento_bd(cur_main, conn_main, evento)
-            nuevo_estado["alerta_permanencia"] = 1  # no volver a disparar
+            _insertar_evento_bd(cur_telem, conn_telem, evento)
+            nuevo_estado["alerta_permanencia"] = 1
 
-        # tipo_permanencia=2: mínimo no cumplido (unidad salió antes de X min)
-        # Este se evalúa en la salida, no durante la permanencia.
-        # Se maneja en el bloque de cambio_estado cuando new_in=False.
         elif (
             not new_in
             and alerta["tipo_permanencia"] == 2
@@ -458,32 +405,29 @@ def _procesar_par_unidad_poi(
             }
             evento = _construir_evento(13, unidad, alerta, detalles)
             eventos.append(evento)
-            _insertar_evento_bd(cur_main, conn_main, evento)
+            _insertar_evento_bd(cur_telem, conn_telem, evento)
             nuevo_estado["alerta_permanencia"] = 1
 
-    # ── Detectar exceso de velocidad dentro del POI ───────────────────────────
+    # ── Detectar exceso de velocidad dentro del POI ───────────────────────
     if new_in and alerta["vel_max"] == 1 and alerta["vel_max_permitida"]:
-        velocidad_actual = float(unidad["velocidad"] or 0)
-        vel_max_permitida = float(alerta["vel_max_permitida"])
+        vel_actual = float(unidad["velocidad"] or 0)
+        vel_permitida = float(alerta["vel_max_permitida"])
         ini_vel = nuevo_estado["fecha_hora_ini_vel_max"]
 
-        if velocidad_actual >= vel_max_permitida and ini_vel is None:
-            # Inicio de exceso
+        if vel_actual >= vel_permitida and ini_vel is None:
             nuevo_estado["fecha_hora_ini_vel_max"] = fecha_hora_gps
-            nuevo_estado["vel_max_alcanzada"] = velocidad_actual
+            nuevo_estado["vel_max_alcanzada"] = vel_actual
             evento = _construir_evento(14, unidad, alerta, detalles=None)
             eventos.append(evento)
-            _insertar_evento_bd(cur_main, conn_main, evento)
+            _insertar_evento_bd(cur_telem, conn_telem, evento)
 
-        elif velocidad_actual >= vel_max_permitida and ini_vel is not None:
-            # Sigue en exceso — actualizar vel máxima si es mayor
-            if velocidad_actual > (float(nuevo_estado["vel_max_alcanzada"] or 0)):
-                nuevo_estado["vel_max_alcanzada"] = velocidad_actual
+        elif vel_actual >= vel_permitida and ini_vel is not None:
+            if vel_actual > float(nuevo_estado["vel_max_alcanzada"] or 0):
+                nuevo_estado["vel_max_alcanzada"] = vel_actual
 
-        elif velocidad_actual < vel_max_permitida and ini_vel is not None:
-            # Fin del exceso de velocidad
+        elif vel_actual < vel_permitida and ini_vel is not None:
             detalles = {
-                "vel_max_permitida": vel_max_permitida,
+                "vel_max_permitida": vel_permitida,
                 "vel_max_alcanzada": float(nuevo_estado["vel_max_alcanzada"] or 0),
                 "duracion_segundos": int(
                     (fecha_hora_gps - ini_vel).total_seconds()
@@ -495,9 +439,9 @@ def _procesar_par_unidad_poi(
             nuevo_estado["vel_max_alcanzada"] = None
             evento = _construir_evento(15, unidad, alerta, detalles)
             eventos.append(evento)
-            _insertar_evento_bd(cur_main, conn_main, evento)
+            _insertar_evento_bd(cur_telem, conn_telem, evento)
 
-    # ── Guardar estado actualizado en r_poi_unidades ──────────────────────────
+    # ── Guardar estado actualizado en r_poi_unidades (BD principal) ───────
     try:
         cur_main.execute(_SQL_UPSERT_ESTADO, nuevo_estado)
         conn_main.commit()
@@ -523,56 +467,55 @@ def _construir_evento(
     detalles: dict | None,
 ) -> dict:
     """
-    Construye el dict de un evento listo para BD y Redis.
+    Construye el dict canonico de un evento para BD y Redis.
 
-    El dict es la representación canónica del evento — se usa tanto para
-    INSERT en t_eventos_poi como para publicar en Redis (JSON serializado).
+    Mapeo al esquema real de t_eventos:
+      evento       = tipo_evento  (10=entro, 11=salio, 12=perm.max, etc.)
+      id_elemento  = id_poi       (el POI que disparo el evento)
+      id_data      = id_data      (FK al ping GPS — puede ser None si no disponible)
+      fecha        = date del GPS (para queries por dia sin funciones de tiempo)
+      fecha_hora_gmt = timestamp exacto del evento
+      payload      = JSON con detalles extra (permanencia, velocidad)
     """
+    fecha_gps = unidad["fecha_hora_gps"]
     return {
-        "tipo_evento": tipo_evento,
+        # Campos de t_eventos
+        "id_data": unidad.get("id_data"),
         "id_empresa": alerta["id_empresa"],
         "id_unidad": unidad["id_unidad"],
-        "numero_unidad": unidad["numero"],
-        "id_poi": alerta["id_poi"],
-        "nombre_poi": alerta["poi_nombre"],
-        "latitud": str(unidad["latitud"]),
-        "longitud": str(unidad["longitud"]),
-        "velocidad": str(unidad["velocidad"]) if unidad["velocidad"] else None,
-        "detalles": json.dumps(detalles) if detalles else None,
-        "fecha_hora_evento": unidad["fecha_hora_gps"],
-        # Campos extra solo para Redis (no van a BD)
+        "fecha": fecha_gps.date() if isinstance(fecha_gps, datetime) else None,
+        "evento": tipo_evento,
+        "id_elemento": alerta["id_poi"],
+        "fecha_hora_gmt": fecha_gps,
+        "payload": json.dumps(detalles, default=str) if detalles else None,
+        # Campos extras solo para Redis (prefijo _ = no van a BD)
+        "_numero_unidad": unidad["numero"],
+        "_nombre_poi": alerta["poi_nombre"],
         "_descripcion": _descripcion_evento(tipo_evento),
     }
 
 
-def _insertar_evento_bd(cur_main, conn_main, evento: dict) -> None:
+def _insertar_evento_bd(cur_telem, conn_telem, evento: dict) -> None:
     """
-    Persiste el evento en t_eventos_poi.
+    Persiste el evento en t_eventos del servidor de telemetria (hypertable).
+
+    Usa el cursor de telemetria — NO el cursor principal.
+    TimescaleDB particiona automaticamente por fecha_hora_gmt.
+
     Si falla, hace rollback y loggea — no propaga para no detener el ciclo.
     """
     try:
-        cur_main.execute(
-            _SQL_INSERT_EVENTO,
-            {
-                "id_empresa": evento["id_empresa"],
-                "id_unidad": evento["id_unidad"],
-                "id_poi": evento["id_poi"],
-                "tipo_evento": evento["tipo_evento"],
-                "latitud": evento["latitud"],
-                "longitud": evento["longitud"],
-                "velocidad": evento["velocidad"],
-                "detalles": evento["detalles"],
-                "fecha_hora_evento": evento["fecha_hora_evento"],
-            },
-        )
-        conn_main.commit()
+        # Filtrar campos privados antes de insertar
+        payload_bd = {k: v for k, v in evento.items() if not k.startswith("_")}
+        cur_telem.execute(_SQL_INSERT_EVENTO, payload_bd)
+        conn_telem.commit()
     except Exception as exc:
-        conn_main.rollback()
+        conn_telem.rollback()
         logger.error(
-            "Error insertando evento tipo=%s id_unidad=%s id_poi=%s: %s",
-            evento["tipo_evento"],
-            evento["id_unidad"],
-            evento["id_poi"],
+            "Error insertando en t_eventos tipo=%s id_unidad=%s id_elemento=%s: %s",
+            evento.get("evento"),
+            evento.get("id_unidad"),
+            evento.get("id_elemento"),
             repr(exc),
         )
 
@@ -580,39 +523,46 @@ def _insertar_evento_bd(cur_main, conn_main, evento: dict) -> None:
 def _publicar_eventos_redis(id_empresa: int, eventos: list[dict]) -> None:
     """
     Publica cada evento en el canal Redis de la empresa.
-
     Canal: "eventos_poi:{id_empresa}"
-    Mensaje: JSON del evento (sin campos privados que empiecen con "_").
 
-    Si Redis no está disponible, loggea un warning y continúa —
-    los eventos ya están en BD, solo se pierde la notificación en tiempo real.
+    Si Redis no esta disponible, los eventos ya estan en BD —
+    solo se pierde la notificacion en tiempo real (degradacion graciosa).
     """
     try:
         r = _get_redis()
         canal = f"{REDIS_CHANNEL_BASE}:{id_empresa}"
         for evento in eventos:
-            # Filtrar campos privados (_descripcion, etc.) antes de serializar
-            payload = {k: v for k, v in evento.items() if not k.startswith("_")}
-            # Serializar fecha como string ISO
-            if isinstance(payload.get("fecha_hora_evento"), datetime):
-                payload["fecha_hora_evento"] = payload["fecha_hora_evento"].isoformat()
-            r.publish(canal, json.dumps(payload, default=str))
+            # Construir payload para Redis con nombres legibles
+            payload_redis = {
+                "tipo_evento": evento["evento"],
+                "id_empresa": evento["id_empresa"],
+                "id_unidad": evento["id_unidad"],
+                "numero_unidad": evento["_numero_unidad"],
+                "id_poi": evento["id_elemento"],
+                "nombre_poi": evento["_nombre_poi"],
+                "descripcion": evento["_descripcion"],
+                "fecha_hora_evento": (
+                    evento["fecha_hora_gmt"].isoformat()
+                    if isinstance(evento["fecha_hora_gmt"], datetime)
+                    else str(evento["fecha_hora_gmt"])
+                ),
+            }
+            r.publish(canal, json.dumps(payload_redis, default=str))
             logger.debug(
-                "Evento publicado en Redis canal=%s tipo=%s unidad=%s poi=%s",
+                "Evento Redis canal=%s tipo=%s unidad=%s poi=%s",
                 canal,
-                evento["tipo_evento"],
-                evento["numero_unidad"],
-                evento["nombre_poi"],
+                evento["evento"],
+                evento["_numero_unidad"],
+                evento["_nombre_poi"],
             )
     except redis.RedisError as exc:
         logger.warning(
-            "Redis no disponible — evento NO enviado en tiempo real: %s",
-            repr(exc),
+            "Redis no disponible — evento NO enviado en tiempo real: %s", repr(exc)
         )
 
 
 def _minutos_entre(inicio, fin) -> float:
-    """Calcula los minutos entre dos timestamps. Retorna 0 si son None."""
+    """Calcula minutos entre dos timestamps. Retorna 0 si son None."""
     if not inicio or not fin:
         return 0.0
     if isinstance(inicio, str):
@@ -623,31 +573,26 @@ def _minutos_entre(inicio, fin) -> float:
 
 
 def _descripcion_evento(tipo_evento: int) -> str:
-    """Retorna la descripción legible de un tipo de evento para el frontend."""
+    """Retorna la descripcion legible del tipo de evento para el frontend."""
     return {
-        10: "Entró al POI",
-        11: "Salió del POI",
-        12: "Permanencia máxima excedida",
-        13: "Permanencia mínima no cumplida",
+        10: "Entro al POI",
+        11: "Salio del POI",
+        12: "Permanencia maxima excedida",
+        13: "Permanencia minima no cumplida",
         14: "Exceso de velocidad inicio",
         15: "Exceso de velocidad fin",
     }.get(tipo_evento, "Evento desconocido")
 
 
-# ── Inicialización del scheduler ──────────────────────────────────────────────
+# ── Scheduler ────────────────────────────────────────────────────────────────
 
 _scheduler: BackgroundScheduler | None = None
 
 
 def iniciar_worker() -> None:
     """
-    Crea e inicia el BackgroundScheduler con el job de detección.
-
-    Llamar desde el factory de Flask (create_app) DESPUÉS de registrar
-    los blueprints. El scheduler corre en un thread daemon — se detiene
-    automáticamente cuando el proceso principal termina.
-
-    Si WORKER_ENABLED=false (útil en tests), no hace nada.
+    Crea e inicia el BackgroundScheduler con el job de deteccion.
+    Llamar desde create_app() DESPUES de registrar blueprints.
     """
     global _scheduler
 
@@ -656,16 +601,12 @@ def iniciar_worker() -> None:
         return
 
     if _scheduler is not None and _scheduler.running:
-        logger.warning("POI Worker ya está corriendo — ignorando llamada duplicada.")
+        logger.warning("POI Worker ya esta corriendo — ignorando llamada duplicada.")
         return
 
     _scheduler = BackgroundScheduler(
-        # Usar UTC internamente para evitar problemas con cambios de horario.
-        # La conversión a America/Mexico_City se hace solo en el frontend.
         timezone="UTC",
         job_defaults={
-            # Si un job tarda más que el intervalo, no lo encola — lo salta.
-            # Evita que ciclos lentos se acumulen si la BD está lenta.
             "coalesce": True,
             "max_instances": 1,
         },
@@ -677,23 +618,19 @@ def iniciar_worker() -> None:
         seconds=POLL_INTERVAL,
         id="poi_geocerca_worker",
         name="POI Geocerca Worker",
-        # Ejecutar inmediatamente al arrancar (no esperar el primer intervalo)
         next_run_time=datetime.now(timezone.utc),
     )
 
     _scheduler.start()
     logger.info(
-        "POI Worker iniciado — ciclo cada %ds, canal Redis: %s:{{id_empresa}}",
+        "POI Worker iniciado — ciclo cada %ds, canal Redis: %s:{id_empresa}",
         POLL_INTERVAL,
         REDIS_CHANNEL_BASE,
     )
 
 
 def detener_worker() -> None:
-    """
-    Detiene el scheduler de forma graciosa.
-    Llamar desde el teardown de la app o en señales SIGTERM.
-    """
+    """Detiene el scheduler de forma graciosa. Llamar en SIGTERM o atexit."""
     global _scheduler
     if _scheduler and _scheduler.running:
         _scheduler.shutdown(wait=False)
