@@ -31,6 +31,7 @@ from routes.company_routes import company_bp
 from routes.catalog_user_routes import catalog_users_bp
 from routes.erp_routes import erp_bp
 from routes.events_routes import events_bp
+from routes.eventos_routes import eventos_bp
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +96,7 @@ def create_app() -> Flask:
     app.register_blueprint(catalog_users_bp)
     app.register_blueprint(erp_bp)
     app.register_blueprint(events_bp)  # SSE de geocercas
+    app.register_blueprint(eventos_bp)
 
     # ── Manejador global de rate limit ────────────────────────────────────────
     @app.errorhandler(429)

@@ -538,6 +538,18 @@ def _publicar_eventos_redis(id_empresa: int, eventos: list[dict]) -> None:
         r = _get_redis()
         canal = f"{REDIS_CHANNEL_BASE}:{id_empresa}"
         for evento in eventos:
+            # Serializar fecha con offset -06:00 via to_app_iso.
+            # Sin esto .isoformat() emite "2026-05-06T16:33:49" (sin TZ)
+            # y el frontend no sabe si es UTC o local — muestra 6 horas
+            # adelantadas en el panel de notificaciones.
+            fecha_gmt = evento["fecha_hora_gmt"]
+            if isinstance(fecha_gmt, datetime):
+                from services.telemetry_service import to_app_iso
+
+                fecha_str = to_app_iso(fecha_gmt) or str(fecha_gmt)
+            else:
+                fecha_str = str(fecha_gmt)
+
             payload_redis = {
                 "tipo_evento": evento["evento"],
                 "id_empresa": evento["id_empresa"],
@@ -546,11 +558,7 @@ def _publicar_eventos_redis(id_empresa: int, eventos: list[dict]) -> None:
                 "id_poi": evento["id_elemento"],
                 "nombre_poi": evento["_nombre_poi"],
                 "descripcion": evento["_descripcion"],
-                "fecha_hora_evento": (
-                    evento["fecha_hora_gmt"].isoformat()
-                    if isinstance(evento["fecha_hora_gmt"], datetime)
-                    else str(evento["fecha_hora_gmt"])
-                ),
+                "fecha_hora_evento": fecha_str,
             }
             r.publish(canal, json.dumps(payload_redis, default=str))
             logger.debug(
