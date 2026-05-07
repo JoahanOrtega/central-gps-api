@@ -31,7 +31,7 @@ _POOL_MAX_MAIN = 20
 # Valores reducidos para dev por la cantidad de rebuilds del backend que
 # pueden dejar conexiones zombi temporalmente del lado del server.
 _POOL_MIN_TELEMETRY = 1
-_POOL_MAX_TELEMETRY = 5
+_POOL_MAX_TELEMETRY = 8
 
 # ── Parámetros TCP keepalive ───────────────────────────────────────────────────
 # Cuando la app está en stand-by, PostgreSQL puede cerrar las conexiones
