@@ -42,15 +42,21 @@ from services.telemetry_service import to_app_iso
 logger = logging.getLogger(__name__)
 
 # Tipos de evento que este modulo maneja
-TIPOS_EVENTO_GEOCERCA = (10, 11, 12, 13, 14, 15)
+#   3/4   = velocidad global (sin POI — id_elemento NULL)
+#   10-15 = geocerca (entrada, salida, permanencia, velocidad en POI)
+#   19    = paso por geocerca (trayectoria cruza sin entrar)
+TIPOS_EVENTO_GEOCERCA = (3, 4, 10, 11, 12, 13, 14, 15, 19)
 
 DESCRIPCION_EVENTO = {
+    3: "Inicio exceso de velocidad",
+    4: "Fin exceso de velocidad",
     10: "Entro al POI",
     11: "Salio del POI",
     12: "Permanencia maxima excedida",
     13: "Permanencia minima no cumplida",
-    14: "Exceso de velocidad inicio",
-    15: "Exceso de velocidad fin",
+    14: "Exceso de velocidad en POI inicio",
+    15: "Exceso de velocidad en POI fin",
+    19: "Paso por geocerca",
 }
 
 # ── Queries SQL ───────────────────────────────────────────────────────────────
@@ -207,11 +213,17 @@ def get_eventos(filtros: dict) -> tuple[dict | None, dict | None]:
         for row in rows:
             ev = dict(zip(cols, row))
 
-            # Agregar nombres desde los maps de BD principal
+            # Agregar nombres desde los maps de BD principal.
+            # id_poi puede ser NULL para eventos globales (ev. 3 y 4) —
+            # en ese caso nombre_poi queda como None (se muestra como "Sin POI" en frontend).
             unidad_info = unidades_map.get(ev["id_unidad"], {})
             ev["numero_unidad"] = unidad_info.get("numero", f"Unidad {ev['id_unidad']}")
             ev["marca_unidad"] = unidad_info.get("marca")
-            ev["nombre_poi"] = pois_map.get(ev["id_poi"], f"POI {ev['id_poi']}")
+            ev["nombre_poi"] = (
+                pois_map.get(ev["id_poi"], f"POI {ev['id_poi']}")
+                if ev["id_poi"] is not None
+                else None
+            )
             ev["descripcion"] = DESCRIPCION_EVENTO.get(
                 ev["tipo_evento"], "Evento desconocido"
             )
