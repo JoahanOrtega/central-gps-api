@@ -352,7 +352,7 @@ _SQL_ALERTAS_ACTIVAS = """
 
 # Lee unidades activas de una empresa con vel_max (BD principal).
 _SQL_UNIDADES_EMPRESA = """
-    SELECT id_unidad, numero, imei, vel_max
+    SELECT id_unidad, id_empresa, numero, imei, vel_max
     FROM t_unidades
     WHERE id_empresa = %(id_empresa)s
       AND status = 1
@@ -1060,16 +1060,30 @@ def _construir_evento_global(
     Para eventos 3 y 4 (velocidad global), id_elemento es NULL.
     """
     fecha_gps = unidad["fecha_hora_gps"]
+
+    # id_empresa debe venir del SELECT de t_unidades (_SQL_UNIDADES_EMPRESA).
+    # Si no viene, loggeamos un warning en lugar de petar con KeyError —
+    # el worker sigue procesando otras unidades. Antes esto causaba un
+    # crash catastrófico cada 15s en cuanto una unidad cruzaba su vel_max.
+    id_empresa = unidad.get("id_empresa")
+    if id_empresa is None:
+        logger.warning(
+            "Unidad sin id_empresa al construir evento global tipo=%s id_unidad=%s — "
+            "revisa _SQL_UNIDADES_EMPRESA",
+            tipo_evento,
+            unidad.get("id_unidad"),
+        )
+
     return {
         "id_data": unidad.get("id_data"),
-        "id_empresa": unidad["id_empresa"],
+        "id_empresa": id_empresa,
         "id_unidad": unidad["id_unidad"],
         "fecha": fecha_gps.date() if isinstance(fecha_gps, datetime) else None,
         "evento": tipo_evento,
         "id_elemento": None,  # ev. 3/4 no tienen POI asociado
         "fecha_hora_gmt": fecha_gps,
         "payload": json.dumps(detalles, default=str) if detalles else None,
-        "_numero_unidad": unidad["numero"],
+        "_numero_unidad": unidad.get("numero", ""),
         "_nombre_poi": None,
         "_descripcion": _descripcion_evento(tipo_evento),
         "_latitud": str(unidad.get("latitud", "")),
