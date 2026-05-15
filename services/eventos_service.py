@@ -42,6 +42,7 @@ from services.telemetry_service import to_app_iso
 logger = logging.getLogger(__name__)
 
 # Tipos de evento que este modulo maneja
+# Incluye todos los eventos del Sistema B generados por el poi_worker:
 #   3/4   = velocidad global (sin POI — id_elemento NULL)
 #   10-15 = geocerca (entrada, salida, permanencia, velocidad en POI)
 #   19    = paso por geocerca (trayectoria cruza sin entrar)
