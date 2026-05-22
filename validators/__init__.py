@@ -24,6 +24,7 @@ from validators.user_validators import (
     UpdateUserSchema,
     StatusUserSchema,
 )
+from validators.client_validators import CreateClientSchema, UpdateClientSchema
 
 __all__ = [
     "LoginSchema",
@@ -38,4 +39,6 @@ __all__ = [
     "CreateUserSchema",
     "UpdateUserSchema",
     "StatusUserSchema",
+    "CreateClientSchema",
+    "UpdateClientSchema",
 ]
