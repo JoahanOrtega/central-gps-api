@@ -17,15 +17,11 @@ logger = logging.getLogger(__name__)
 
 
 # Helper: resolver contexto de empresa y usuario desde el JWT
-def _resolve_context():
-    """
-    Extrae id_empresa e id_usuario del JWT del request actual.
-
-    Retorna (id_empresa, id_usuario, None) si todo está OK.
-    Retorna (None, None, error_response) si falta algún dato.
-    """
-    id_empresa = request.args.get("id_empresa", type=int) or request.user.get(
-        "id_empresa"
+def _resolve_context(body=None):
+    id_empresa = (
+        request.args.get("id_empresa", type=int)
+        or (body or {}).get("id_empresa")
+        or request.user.get("id_empresa")
     )
     id_usuario = request.user.get("sub")
 
@@ -106,11 +102,10 @@ def save_client():
     Responde 409 si la clave ya está en uso en la empresa.
     """
     try:
-        id_empresa, id_usuario, error = _resolve_context()
+        body = request.get_json(silent=True)
+        id_empresa, id_usuario, error = _resolve_context(body)
         if error:
             return error
-
-        body = request.get_json(silent=True)
         payload, validation_error = validate_payload(CreateClientSchema(), body)
         if validation_error:
             return validation_error
