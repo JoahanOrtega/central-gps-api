@@ -787,7 +787,14 @@ def get_audit_log(
         rows = cursor.fetchall()
         cols = [desc[0] for desc in cursor.description]
 
-        return [dict(zip(cols, row)) for row in rows], None
+        def _serialize_row(cols, row):
+            record = dict(zip(cols, row))
+            # Flask no serializa datetime a ISO por defecto — hacerlo explícitamente
+            if record.get("fecha_registro"):
+                record["fecha_registro"] = record["fecha_registro"].isoformat()
+            return record
+
+        return [_serialize_row(cols, row) for row in rows], None
 
     except Exception as e:
         logger.error("Error en get_audit_log: %s", repr(e))
