@@ -180,3 +180,183 @@ def remove_client(id_cliente):
     except Exception as error:
         logger.error("Error en %s: %s", request.path, repr(error), exc_info=True)
         return jsonify({"error": "Error interno del servidor"}), 500
+
+
+@client_bp.route("/catalogs/clients/<int:id_cliente>/alertas", methods=["GET"])
+@jwt_required
+def get_alertas_cliente(id_cliente: int):
+    """
+    Si no tiene POI, responde 422 con código CLIENT_HAS_NO_POI.
+
+    Respuestas:
+      200 -> configuración actual (o defaults si el POI no tiene alerta)
+      404 -> cliente no existe o no pertenece a la empresa
+      422 -> el cliente no tiene poi configurado
+    """
+    try:
+        id_empresa, _, error = _resolve_context()
+        if error:
+            return error
+
+        # Obtener el id_poi del cliente
+        client = get_client_by_id(id_cliente, id_empresa)
+        if not client:
+            return jsonify({"error": "Cliente no encontrado"}), 404
+
+        if not client.get("id_poi"):
+            return (
+                jsonify(
+                    {
+                        "error": "El cliente no tiene un poi configurado. "
+                        "Agrega una ubicación para activar alertas.",
+                        "code": "CLIENT_HAS_NO_POI",
+                    }
+                ),
+                422,
+            )
+
+        result, error = get_alerta_poi(client["id_poi"], id_empresa)
+        if error:
+            status = {"POI_NOT_FOUND": 404, "DATABASE_ERROR": 500}.get(
+                error["code"], 500
+            )
+            return jsonify(error), status
+
+        return jsonify(result), 200
+
+    except Exception as exc:
+        logger.error(
+            "Error en GET /catalogs/clients/%s/alertas: %s",
+            id_cliente,
+            repr(exc),
+            exc_info=True,
+        )
+        return jsonify({"error": "Error interno del servidor"}), 500
+
+
+@client_bp.route("/catalogs/clients/<int:id_cliente>/alertas", methods=["POST"])
+@jwt_required
+def save_alertas_cliente(id_cliente: int):
+    """
+    Respuestas:
+      200 -> alerta guardada correctamente
+      404 -> cliente no existe
+      422 -> cliente sin ubicacion configurada
+    """
+    data = request.get_json(silent=True) or {}
+    data, validation_error = validate_payload(UpsertAlertaPoiSchema(), data)
+    if validation_error:
+        return validation_error
+
+    try:
+        id_empresa, id_usuario, error = _resolve_context()
+        if error:
+            return error
+
+        client = get_client_by_id(id_cliente, id_empresa)
+        if not client:
+            return jsonify({"error": "Cliente no encontrado"}), 404
+
+        if not client.get("id_poi"):
+            return (
+                jsonify(
+                    {
+                        "error": "El cliente no tiene un poi configurado.",
+                        "code": "CLIENT_HAS_NO_POI",
+                    }
+                ),
+                422,
+            )
+
+        result, error = upsert_alerta_poi(
+            id_poi=client["id_poi"],
+            id_empresa=id_empresa,
+            id_usuario=int(id_usuario),
+            payload=data,
+        )
+        if error:
+            status = {"POI_NOT_FOUND": 404, "DATABASE_ERROR": 500}.get(
+                error["code"], 500
+            )
+            return jsonify(error), status
+
+        return (
+            jsonify(
+                {
+                    "message": "Configuración de alertas guardada correctamente",
+                    "alerta": result,
+                }
+            ),
+            200,
+        )
+
+    except Exception as exc:
+        logger.error(
+            "Error en POST /catalogs/clients/%s/alertas: %s",
+            id_cliente,
+            repr(exc),
+            exc_info=True,
+        )
+        return jsonify({"error": "Error interno del servidor"}), 500
+
+
+@client_bp.route("/catalogs/clients/<int:id_cliente>/alertas", methods=["DELETE"])
+@jwt_required
+def delete_alertas_cliente(id_cliente: int):
+    """
+    Desactiva (status=0) las alertas del cliente sin eliminarlas.
+
+    Respuestas:
+      200 -> alertas desactivadas
+      404 -> cliente no existe o sin alerta activa
+      422 -> cliente sin ubicación configurada
+    """
+    try:
+        id_empresa, id_usuario, error = _resolve_context()
+        if error:
+            return error
+
+        client = get_client_by_id(id_cliente, id_empresa)
+        if not client:
+            return jsonify({"error": "Cliente no encontrado"}), 404
+
+        if not client.get("id_poi"):
+            return (
+                jsonify(
+                    {
+                        "error": "El cliente no tiene una ubicación configurada.",
+                        "code": "CLIENT_HAS_NO_POI",
+                    }
+                ),
+                422,
+            )
+
+        result, error = desactivar_alerta_poi(
+            id_poi=client["id_poi"],
+            id_empresa=id_empresa,
+            id_usuario=int(id_usuario),
+        )
+        if error:
+            status = {"ALERTA_NOT_FOUND": 404, "DATABASE_ERROR": 500}.get(
+                error["code"], 500
+            )
+            return jsonify(error), status
+
+        return (
+            jsonify(
+                {
+                    "message": "Alertas desactivadas correctamente",
+                    **result,
+                }
+            ),
+            200,
+        )
+
+    except Exception as exc:
+        logger.error(
+            "Error en DELETE /catalogs/clients/%s/alertas: %s",
+            id_cliente,
+            repr(exc),
+            exc_info=True,
+        )
+        return jsonify({"error": "Error interno del servidor"}), 500
