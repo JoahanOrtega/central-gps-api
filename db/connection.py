@@ -33,7 +33,7 @@ _POOL_MAX_MAIN = 20
 _POOL_MIN_TELEMETRY = 1
 _POOL_MAX_TELEMETRY = 8
 
-# ── Parámetros TCP keepalive ───────────────────────────────────────────────────
+# Parámetros TCP keepalive
 # Cuando la app está en stand-by, PostgreSQL puede cerrar las conexiones
 # inactivas por timeout. Con keepalive, el SO envía paquetes periódicos para
 # mantener la conexión viva y detectar fallos antes de que el pool la use.
@@ -77,7 +77,7 @@ def _make_telemetry_pool():
     )
 
 
-# ── Pool de la base de datos principal ────────────────────────────────────────
+# Pool de la base de datos principal
 try:
     _main_pool = _make_main_pool()
     logger.info(
@@ -90,7 +90,7 @@ except Exception as exc:
     logger.critical("No se pudo crear el pool de BD principal: %s", repr(exc))
     raise
 
-# ── Pool de la base de datos de telemetría ─────────────────────────────────────
+# Pool de la base de datos de telemetría
 try:
     _telemetry_pool = _make_telemetry_pool()
     logger.info(
@@ -100,8 +100,13 @@ try:
         Config.TELEMETRY_DB_NAME,
     )
 except Exception as exc:
-    logger.critical("No se pudo crear el pool de BD telemetría: %s", repr(exc))
-    raise
+    _telemetry_pool = None
+    logger.warning(
+        "Pool BD telemetría NO disponible: %s — "
+        "la API arranca sin telemetría. Los endpoints de mapa/posiciones "
+        "devolverán error hasta que el servidor remoto sea accesible.",
+        repr(exc),
+    )
 
 
 def _is_connection_alive(conn) -> bool:
@@ -173,8 +178,14 @@ def release_db_connection(conn) -> None:
 def get_db_telemetry_connection():
     """
     Obtiene una conexión del pool de BD de telemetría.
-    Mismas reglas que get_db_connection().
+    Si la telemetría no está disponible (pool es None), lanza un error
+    descriptivo en lugar de tumbar la API.
     """
+    if _telemetry_pool is None:
+        raise ConnectionError(
+            "La BD de telemetría no está disponible. "
+            "El servidor remoto no respondió al iniciar la API."
+        )
     return _get_conn_with_retry(_telemetry_pool, _make_telemetry_pool, "telemetry")
 
 
@@ -182,5 +193,5 @@ def release_db_telemetry_connection(conn) -> None:
     """
     Devuelve una conexión al pool de BD de telemetría.
     """
-    if conn:
+    if conn and _telemetry_pool is not None:
         _telemetry_pool.putconn(conn)
