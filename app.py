@@ -33,6 +33,7 @@ from routes.erp_routes import erp_bp
 from routes.events_routes import events_bp
 from routes.eventos_routes import eventos_bp
 from routes.client_routes import client_bp
+from routes.route_routes import route_bp
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +97,7 @@ def create_app() -> Flask:
     app.register_blueprint(company_bp)
     app.register_blueprint(catalog_users_bp)
     app.register_blueprint(erp_bp)
+    app.register_blueprint(route_bp)
     app.register_blueprint(events_bp)  # SSE de geocercas
     app.register_blueprint(eventos_bp)
     app.register_blueprint(client_bp)
