@@ -1,52 +1,3 @@
-"""
-telemetry_service.py — Servicio de telemetría GPS
-
-────────────────────────────────────────────────────────────────────────────────
-Reglas de fechas
-────────────────────────────────────────────────────────────────────────────────
-  - t_data almacena fechas en UTC naive (sin tzinfo).
-  - El frontend opera en UTC-6 (America/Mexico_City).
-  - to_app_iso() convierte cualquier datetime de BD → ISO 8601 con offset -06:00.
-  - now_utc() es la única fuente de "ahora" para queries.
-  - day_range_utc() calcula rangos de día correctamente en UTC-6.
-
-────────────────────────────────────────────────────────────────────────────────
-Reglas del estado del motor
-────────────────────────────────────────────────────────────────────────────────
-  Toda la lógica de "¿está encendida?" vive en utils/engine_state.py — este
-  archivo NO redefine constantes de tipo_alerta ni de status, solo las consume.
-
-  Campo `engine_state` ("on" | "off" | "unknown") incluido en cada respuesta:
-    - Permite al frontend NO recalcular el estado a partir de bits crudos.
-    - Unifica criterios entre backend y frontend (una sola regla, un solo lugar).
-    - Resuelve ambigüedades cuando `tipo_alerta` y `status` difieren
-      (p. ej. pérdidas momentáneas de señal).
-
-────────────────────────────────────────────────────────────────────────────────
-Reglas de recorridos
-────────────────────────────────────────────────────────────────────────────────
-  - Un recorrido comienza en tipo_alerta=33 (encendido motor) o en el
-    primer punto ON después del último apagado.
-  - Un recorrido termina en tipo_alerta=34 (apagado motor) o en el
-    último punto antes del siguiente encendido (con fallback a STATUS_OFF).
-  - strokeColor se calcula por punto según vel_max de la unidad.
-  - IDs de recorrido son ESTABLES: se derivan del timestamp del punto de
-    inicio, no de la posición en la lista. Esto permite que el frontend
-    abra un recorrido y aunque lleguen nuevos datos, el ID siga apuntando
-    al mismo recorrido.
-
-────────────────────────────────────────────────────────────────────────────────
-Optimizaciones vs. versiones previas
-────────────────────────────────────────────────────────────────────────────────
-  - `vel_max` de t_unidades se cachea 5 min — cambia rarísima vez y se pide
-    en prácticamente cada request de ruta.
-  - Todas las consultas usan context managers (`main_cursor` / `telemetry_cursor`)
-    que garantizan liberación del pool aunque haya excepción.
-  - `get_latest_position_by_imei` ahora permite al caller pedir solo los
-    campos que necesita con `include_sensors=False` (default). Reduce bytes
-    ~75% en el caso común.
-"""
-
 from __future__ import annotations
 
 import logging
@@ -65,39 +16,33 @@ from utils.engine_state import (
     resolve_engine_state,
 )
 from utils.ttl_cache import TTLCache
+from utils.gps_spike_filter import filter_gps_spikes
 
 logger = logging.getLogger(__name__)
 
-# ── Zonas horarias ─────────────────────────────────────────────────────────────
+# Zonas horarias
 UTC_TZ = timezone.utc
 APP_TZ = timezone(timedelta(hours=-6))  # America/Mexico_City (sin DST)
 
-# ── Constantes de recorridos ──────────────────────────────────────────────────
+# Constantes de recorridos
 MIN_MOVING_SPEED = 1.0  # km/h — umbral para considerar "en movimiento"
 MIN_TRIP_DISTANCE_KM = 0.05  # km mínimo para incluir un recorrido
 MIN_TRIP_POINTS = 3  # puntos mínimos para un recorrido válido
 RECENT_TRIPS_DAYS = 7  # ventana de búsqueda de recorridos recientes
 
-# ── Colores de polyline (fiel al CASE WHEN del legacy) ────────────────────────
+# Colores de polyline
 COLOR_NORMAL = "#4caf50"  # verde   — velocidad normal
 COLOR_WARNING = "#ff9800"  # naranja — cerca del límite (vel_max - 5)
 COLOR_DANGER = "#ea1f25"  # rojo    — exceso de velocidad
 
-# ── Cache de vel_max ──────────────────────────────────────────────────────────
+# Cache de vel_max
 # TTL de 5 min: la velocidad máxima de una unidad cambia cuando el catálogo
-# se edita, un evento poco frecuente. El TTL asegura que una edición se
-# propague en al menos 5 min sin invalidación manual. Invalidable explícitamente
-# con `_vel_max_cache.invalidate(imei)` desde el handler del PATCH si se desea
 # consistencia inmediata.
 _VEL_MAX_TTL_SECONDS = 300
 _vel_max_cache: TTLCache[float] = TTLCache(ttl_seconds=_VEL_MAX_TTL_SECONDS)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
 # Helpers de tiempo
-# ══════════════════════════════════════════════════════════════════════════════
-
-
 def now_utc() -> datetime:
     """Instante actual en UTC (aware). Única fuente de 'ahora' para queries."""
     return datetime.now(UTC_TZ)
@@ -301,10 +246,7 @@ def invalidate_vel_max_cache(imei: str) -> None:
     _vel_max_cache.invalidate(imei)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
 # Query base de puntos de ruta
-# ══════════════════════════════════════════════════════════════════════════════
-
 _ROUTE_QUERY = """
     SELECT
         fecha_hora_gps,
@@ -313,13 +255,15 @@ _ROUTE_QUERY = """
         velocidad,
         grados,
         status,
-        tipo_alerta
+        tipo_alerta,
+        odometro
     FROM public.t_data
     WHERE imei = %s
       AND fecha_hora_gps >= %s
       AND fecha_hora_gps <= %s
       AND latitud  IS NOT NULL
       AND longitud IS NOT NULL
+      AND (atributos IS NULL OR (atributos::jsonb->>'FIX') != '0')
     ORDER BY fecha_hora_gps ASC
     LIMIT %s
 """
@@ -338,7 +282,10 @@ def _fetch_route_rows(
     """
     with telemetry_cursor() as cursor:
         cursor.execute(_ROUTE_QUERY, (imei, start_utc, end_utc, limit))
-        return cursor.fetchall()
+        rows = cursor.fetchall()
+
+    # Aplicar filtro de saltos GPS antes de devolver los puntos.
+    return filter_gps_spikes(rows)
 
 
 def get_positions_in_range(
