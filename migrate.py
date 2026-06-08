@@ -1,8 +1,4 @@
 #!/usr/bin/env python3
-"""
-migrate.py — Sistema de control de migraciones para CentralGPS API
-"""
-
 import hashlib
 import os
 import sys
@@ -10,37 +6,29 @@ import time
 from pathlib import Path
 
 import psycopg2
-from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
 
 # Configuración
-# Lee las mismas variables de entorno que usa la aplicación Flask,
-# así no hay configuración duplicada.
-
 DB_HOST = os.getenv("DB_HOST", "db")
 DB_PORT = int(os.getenv("DB_PORT", "5432"))
 DB_NAME = os.getenv("DB_NAME", "centralgps_project")
 DB_USER = os.getenv("DB_USER", "postgres")
 DB_PASSWORD = os.getenv("DB_PASSWORD", "")
 
-# Carpeta donde viven los archivos .sql (relativa a este script)
 MIGRATIONS_DIR = Path(__file__).parent / "migrations"
 
-# Colores ANSI para la terminal (se desactivan si no es TTY)
+# Colores ANSI
 _IS_TTY = sys.stdout.isatty()
 
 
 def _color(code: str, text: str) -> str:
-    """Aplica color ANSI solo si la salida es una terminal."""
-    if not _IS_TTY:
-        return text
-    return f"\033[{code}m{text}\033[0m"
+    return f"\033[{code}m{text}\033[0m" if _IS_TTY else text
 
 
-OK = _color("32", "✓")  # verde
-SKIP = _color("33", "→")  # amarillo
-ERROR = _color("31", "✗")  # rojo
-WARN = _color("33", "!")  # amarillo
-INFO = _color("36", "i")  # cyan
+OK = _color("32", "✓")
+SKIP = _color("33", "→")
+ERR = _color("31", "✗")
+WARN = _color("33", "!")
+INFO = _color("36", "i")
 BOLD = lambda t: _color("1", t)
 
 
@@ -48,17 +36,26 @@ BOLD = lambda t: _color("1", t)
 
 
 def _checksum(content: str) -> str:
-    """Calcula el SHA-256 del contenido de un archivo SQL."""
+    """SHA-256 del contenido del archivo SQL."""
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
 def _conectar() -> psycopg2.extensions.connection:
     """
-    Abre una conexión a la BD principal usando las variables de entorno.
-    Lanza una excepción clara si no puede conectarse.
+    Abre conexión a la BD con autocommit=True desde el inicio.
+
+    autocommit=True es necesario porque:
+    1. Las migraciones SQL tienen su propio BEGIN/COMMIT.
+    2. psycopg2 abre una transacción implícita en cuanto ejecuta la
+       primera query, incluyendo el SELECT de schema_migrations.
+    3. Si ya hay una transacción abierta, el BEGIN del SQL falla con
+       'set_session cannot be used inside a transaction'.
+
+    El registro en schema_migrations abre su propia transacción
+    explícita con conn.autocommit=False solo para ese INSERT.
     """
     try:
-        return psycopg2.connect(
+        conn = psycopg2.connect(
             host=DB_HOST,
             port=DB_PORT,
             dbname=DB_NAME,
@@ -66,51 +63,41 @@ def _conectar() -> psycopg2.extensions.connection:
             password=DB_PASSWORD,
             connect_timeout=10,
         )
+        # Activar autocommit inmediatamente — antes de cualquier query
+        conn.autocommit = True
+        return conn
     except psycopg2.OperationalError as e:
-        print(f"\n{ERROR} No se pudo conectar a la BD: {e}")
+        print(f"\n{ERR} No se pudo conectar a la BD: {e}")
         print(f"   Host: {DB_HOST}:{DB_PORT}  BD: {DB_NAME}  Usuario: {DB_USER}")
-        print(
-            f"   Verifica que el contenedor db esté corriendo y las variables de entorno sean correctas."
-        )
         sys.exit(1)
 
 
-def _obtener_aplicadas(cur) -> dict[str, str]:
-    """
-    Retorna un dict {filename: checksum} de las migraciones ya registradas
-    en schema_migrations.
-    """
-    cur.execute(
-        "SELECT filename, checksum FROM public.schema_migrations ORDER BY applied_at"
-    )
-    return {row[0]: row[1] for row in cur.fetchall()}
+def _obtener_aplicadas(conn) -> dict[str, str]:
+    """Retorna {filename: checksum} de las migraciones ya registradas."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT filename, checksum FROM public.schema_migrations ORDER BY applied_at"
+        )
+        return {row[0]: row[1] for row in cur.fetchall()}
 
 
 def _obtener_archivos() -> list[Path]:
-    """
-    Retorna la lista de archivos .sql en migrations/ ordenados numéricamente.
-    Solo incluye archivos que empiezan con dígitos (NNN_nombre.sql).
-    """
+    """Lista de archivos .sql en migrations/ ordenados numéricamente."""
     if not MIGRATIONS_DIR.exists():
-        print(f"{ERROR} No se encontró la carpeta migrations/ en {MIGRATIONS_DIR}")
+        print(f"{ERR} No se encontró la carpeta migrations/ en {MIGRATIONS_DIR}")
         sys.exit(1)
-
-    archivos = sorted(
+    return sorted(
         [f for f in MIGRATIONS_DIR.glob("*.sql") if f.name[0].isdigit()],
         key=lambda f: f.name,
     )
-    return archivos
 
 
 # Comandos
 
 
-def cmd_status(cur) -> None:
-    """
-    Muestra el estado de todas las migraciones: aplicadas, pendientes
-    y archivos con checksum modificado post-deploy.
-    """
-    aplicadas = _obtener_aplicadas(cur)
+def cmd_status(conn) -> None:
+    """Muestra el estado de todas las migraciones."""
+    aplicadas = _obtener_aplicadas(conn)
     archivos = _obtener_archivos()
 
     print(f"\n{BOLD('Estado de migraciones')} — BD: {DB_NAME}@{DB_HOST}\n")
@@ -131,10 +118,7 @@ def cmd_status(cur) -> None:
         else:
             checksum_bd = aplicadas[nombre]
             if checksum_bd != "legacy" and checksum_bd != checksum:
-                # El archivo fue modificado después de aplicarse
-                print(
-                    f"  {WARN} {nombre}  {_color('33', '[MODIFICADO - checksum no coincide]')}"
-                )
+                print(f"  {WARN} {nombre}  {_color('33', '[MODIFICADO]')}")
             else:
                 print(f"  {OK} {nombre}  {_color('90', '[aplicada]')}")
 
@@ -147,17 +131,20 @@ def cmd_status(cur) -> None:
         print(f"  {OK} Todas las migraciones están aplicadas.\n")
 
 
-def cmd_migrate(cur, conn, dry_run: bool = False) -> None:
+def cmd_migrate(conn, dry_run: bool = False) -> None:
     """
     Aplica todas las migraciones pendientes en orden.
 
-    Si dry_run=True, solo muestra qué se aplicaría sin ejecutar nada.
-    Si alguna migración falla, hace rollback de esa migración y detiene
-    el proceso — las anteriores ya aplicadas en este run se mantienen.
-    """
-    aplicadas = _obtener_aplicadas(cur)
-    archivos = _obtener_archivos()
+    La conexión ya viene con autocommit=True desde _conectar().
+    Esto permite que el BEGIN/COMMIT de cada archivo SQL maneje
+    su propia transacción sin conflicto con psycopg2.
 
+    El registro en schema_migrations usa su propia transacción
+    explícita (autocommit=False temporalmente) para garantizar
+    atomicidad del INSERT.
+    """
+    aplicadas = _obtener_aplicadas(conn)
+    archivos = _obtener_archivos()
     pendientes = [f for f in archivos if f.name not in aplicadas]
 
     modo = _color("33", "[DRY RUN] ") if dry_run else ""
@@ -170,7 +157,6 @@ def cmd_migrate(cur, conn, dry_run: bool = False) -> None:
     print(f"  {INFO} {len(pendientes)} migración(es) pendiente(s):\n")
 
     aplicadas_ok = 0
-    aplicadas_err = 0
 
     for archivo in pendientes:
         nombre = archivo.name
@@ -185,50 +171,54 @@ def cmd_migrate(cur, conn, dry_run: bool = False) -> None:
         inicio = time.monotonic()
 
         try:
-            # Cada migración corre en su propia transacción.
-            # Si el archivo ya tiene BEGIN/COMMIT, psycopg2 lo respeta.
-            # Si no, la transacción es implícita.
-            conn.autocommit = False
-            cur.execute(contenido)
+            # 1. Ejecutar el SQL con autocommit=True
+            # La conexión ya está en autocommit=True. El BEGIN/COMMIT del
+            # archivo controla su propia transacción directamente.
+            with conn.cursor() as cur:
+                cur.execute(contenido)
 
-            # Registrar la migración como aplicada
             duracion_ms = int((time.monotonic() - inicio) * 1000)
-            cur.execute(
-                """
-                INSERT INTO public.schema_migrations (filename, checksum, applied_at, duration_ms)
-                VALUES (%s, %s, NOW(), %s)
-                ON CONFLICT (filename) DO NOTHING
-                """,
-                (nombre, checksum, duracion_ms),
-            )
-            conn.commit()
-            conn.autocommit = True
+
+            # 2. Registrar migración en schema_migrations
+            # Transacción explícita solo para este INSERT — garantiza que
+            # el registro sea atómico: o se guarda correctamente o no.
+            conn.autocommit = False
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO public.schema_migrations
+                            (filename, checksum, applied_at, duration_ms)
+                        VALUES (%s, %s, NOW(), %s)
+                        ON CONFLICT (filename) DO NOTHING
+                        """,
+                        (nombre, checksum, duracion_ms),
+                    )
+                conn.commit()
+            finally:
+                # Restaurar autocommit=True para la siguiente migración
+                conn.autocommit = True
 
             print(f"{OK}  {_color('90', f'({duracion_ms} ms)')}")
             aplicadas_ok += 1
 
         except Exception as e:
-            # Rollback de esta migración — las anteriores en este run
-            # ya están commiteadas y no se revierten.
             try:
                 conn.rollback()
-                conn.autocommit = True
             except Exception:
                 pass
+            conn.autocommit = True  # restaurar siempre
 
-            print(f"{ERROR}")
-            print(f"\n  {ERROR} {BOLD('Error al aplicar')} {nombre}:")
+            print(f"{ERR}")
+            print(f"\n  {ERR} {BOLD('Error al aplicar')} {nombre}:")
             print(f"     {e}")
-            print(f"\n  Las migraciones aplicadas antes de este error se mantienen.")
-            print(f"  Corrige el error en {archivo} y vuelve a correr migrate.py.\n")
-            aplicadas_err += 1
+            print(f"\n  Corrige el error en {archivo} y vuelve a correr migrate.py.\n")
             sys.exit(1)
 
     print()
-    if not dry_run:
-        if aplicadas_ok:
-            print(f"  {OK} {aplicadas_ok} migración(es) aplicada(s) correctamente.\n")
-    else:
+    if not dry_run and aplicadas_ok:
+        print(f"  {OK} {aplicadas_ok} migración(es) aplicada(s) correctamente.\n")
+    elif dry_run:
         print(f"  {INFO} Dry run completado — no se aplicó ningún cambio.\n")
 
 
@@ -240,15 +230,12 @@ def main() -> None:
     solo_status = "--status" in sys.argv
 
     conn = _conectar()
-    cur = conn.cursor()
-
     try:
         if solo_status:
-            cmd_status(cur)
+            cmd_status(conn)
         else:
-            cmd_migrate(cur, conn, dry_run=dry_run)
+            cmd_migrate(conn, dry_run=dry_run)
     finally:
-        cur.close()
         conn.close()
 
 
