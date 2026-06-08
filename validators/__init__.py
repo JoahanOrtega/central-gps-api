@@ -41,4 +41,6 @@ __all__ = [
     "StatusUserSchema",
     "CreateClientSchema",
     "UpdateClientSchema",
+    "CreateItinerarySchema",
+    "UpdateItinerarySchema",
 ]
