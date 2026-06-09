@@ -1,335 +1,491 @@
 """
-monitor_service.py — Servicio de monitoreo en vivo de unidades
+monitor_service.py — Lógica de negocio del monitor y el histórico de cumplimiento.
 
-────────────────────────────────────────────────────────────────────────────────
-Responsabilidad
-────────────────────────────────────────────────────────────────────────────────
-  Retorna las unidades activas de una empresa con su última telemetría,
-  listas para renderizar en el mapa del módulo de monitoreo.
+Monitor en tiempo real:
+  - get_monitor(): snapshot actual de todos los itinerarios del día
+  - Usa pg_notify('cumplimiento_evento') para push en tiempo real (SSE)
 
-  Incluye los campos que el drawer de unidades y el TripDrawer necesitan
-  sin peticiones adicionales: vel_max, operador, grupo y el estado del
-  motor (engine_state) ya resuelto por utils.engine_state.
-
-────────────────────────────────────────────────────────────────────────────────
-Optimizaciones incorporadas
-────────────────────────────────────────────────────────────────────────────────
-  1. Acceso a BD con context managers (`main_cursor`, `telemetry_cursor`)
-     que garantizan liberación del pool aunque el bloque lance excepción.
-  2. get_unit_summary_by_imei() usa una query dedicada (4 columnas) en
-     lugar de la query completa de 22 columnas.
-  3. Conteo de engine_state pre-calculado en el backend.
+Histórico:
+  - get_historico(): itinerarios pasados con métricas de cumplimiento
+  - get_historico_paradas(): detalle de paradas de un itinerario ejecutado
+  - get_historico_eventos(): línea de tiempo de eventos de una ejecución
 """
 
-from __future__ import annotations
-
 import logging
-from typing import Any, TypedDict
+from datetime import date
 
-from services.telemetry_service import (
-    get_latest_positions_by_imeis,
-    get_seconds_in_state_for_imei,
-    to_app_iso,
-)
-from utils.db_cursor import main_cursor, telemetry_cursor
-from utils.engine_state import EngineState, resolve_engine_state
+from db.connection import get_db_connection, release_db_connection
 
 logger = logging.getLogger(__name__)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Tipos de respuesta (TypedDict para claridad y reutilización)
-# ══════════════════════════════════════════════════════════════════════════════
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 
-class UnitsLiveCounts(TypedDict):
-    """Conteos agregados del estado del motor para el badge del drawer."""
-
-    total: int
-    engine_on: int
-    engine_off: int
-    engine_unknown: int
+def _rows_to_dicts(cur) -> list[dict]:
+    """Convierte todas las filas del cursor a lista de dicts."""
+    cols = [d[0] for d in cur.description]
+    return [dict(zip(cols, row)) for row in cur.fetchall()]
 
 
-class UnitsLiveResponse(TypedDict):
-    """Respuesta del endpoint GET /monitor/units-live."""
+def _serialize_row(record: dict) -> dict:
+    """Normaliza tipos para JSON."""
+    from decimal import Decimal
+    from datetime import datetime, time
 
-    units: list[dict[str, Any]]
-    counts: UnitsLiveCounts
-
-
-class UnitSummaryResponse(TypedDict):
-    """Respuesta del endpoint GET /monitor/unit-summary/<imei>."""
-
-    id: int
-    numero: str
-    marca: str | None
-    modelo: str | None
-    imei: str
-    vel_max: float | None
-    last_report: str | None
-    status: str
-    engine_state: EngineState
-    segundos_en_estado_actual: int | None
-    hasTelemetry: bool
+    for k, v in record.items():
+        if isinstance(v, datetime):
+            record[k] = v.isoformat()
+        elif isinstance(v, time):
+            record[k] = v.strftime("%H:%M")
+        elif isinstance(v, date):
+            record[k] = v.isoformat()
+        elif isinstance(v, Decimal):
+            record[k] = float(v)
+    return record
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Query del monitor en vivo
+# MONITOR EN TIEMPO REAL
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Query principal: unidades activas + operador + grupo.
-# A nivel de módulo para que el parser de Python no la re-analice en cada request.
-_UNITS_BASE_QUERY = """
-    SELECT
-        u.id_unidad,
-        u.numero                              AS numero,
-        u.marca,
-        u.modelo,
-        u.anio,
-        u.matricula,
-        u.tipo,
-        u.imagen,
-        u.imei,
-        u.chip,
-        u.id_operador,
-        u.status,
-        u.vel_max,
-        o.nombre                        AS operador,
-        COALESCE(g.nombre, 'Sin Grupo') AS grupo
-    FROM t_unidades u
-    LEFT JOIN r_unidad_operador         ro ON ro.id_unidad_operador = u.id_unidad_operador
-    LEFT JOIN t_operadores              o  ON o.id_operador         = ro.id_operador
-    LEFT JOIN r_grupo_unidades_unidades rg ON rg.id_unidad           = u.id_unidad
-    LEFT JOIN t_grupos_unidades         g  ON g.id_grupo_unidades    = rg.id_grupo_unidades
-    WHERE u.id_empresa = %s AND u.status = 1
-"""
 
-_UNITS_SEARCH_FILTER = """
-    AND (
-        LOWER(u.numero)   LIKE LOWER(%s) OR
-        LOWER(u.marca)    LIKE LOWER(%s) OR
-        LOWER(u.modelo)   LIKE LOWER(%s) OR
-        LOWER(o.nombre)   LIKE LOWER(%s)
-    )
-"""
-
-_UNITS_ORDER_BY = " ORDER BY COALESCE(g.nombre, 'zzz') ASC, u.numero ASC"
-
-
-def get_units_with_latest_telemetry(
+def get_monitor(
     id_empresa: int,
-    search: str | None = None,
-) -> UnitsLiveResponse:
+    fecha: str | None = None,
+    id_ruta: int | None = None,
+    id_itinerario: int | None = None,
+) -> list[dict]:
     """
-    Retorna todas las unidades activas de la empresa con su última telemetría.
+    Snapshot del estado actual de todos los itinerarios programados para hoy.
 
-    La respuesta tiene forma:
-        {
-          "units":  [ { ...unidad..., "engine_state": "on"|"off"|"unknown" }, ...],
-          "counts": {
-            "total": 42,
-            "engine_on": 18,
-            "engine_off": 22,
-            "engine_unknown": 2
-          }
-        }
-
-    Los conteos se calculan UNA VEZ en el backend durante el ensamblado de
-    la respuesta, sustituyendo el .filter().length que el UnitsDrawer del
-    frontend ejecutaba en cada render.
+    Para cada itinerario devuelve:
+    - Datos del itinerario (ruta, turno, horario)
+    - Unidad asignada con su estado en tiempo real (en_ruta, en_curso)
+    - Métricas actualizadas por el worker (paradas_abordadas, porcentaje)
+    - Parada actual, anterior y siguiente
+    - Alarmas activas
+    - Progreso de paradas
 
     Args:
-        id_empresa: ID de la empresa activa.
-        search:     Término para filtrar por número, marca, modelo u operador.
-                    Si está vacío o es None, no se aplica filtro.
-
-    Returns:
-        UnitsLiveResponse con lista de unidades y conteos agregados.
+        id_empresa:    Empresa del usuario.
+        fecha:         Fecha a monitorear (default: hoy).
+        id_ruta:       Filtro opcional por ruta.
+        id_itinerario: Filtro opcional por itinerario específico.
     """
+    fecha_consulta = fecha or date.today().isoformat()
+
+    conn = get_db_connection()
     try:
-        # ── Paso 1: cargar unidades + operador + grupo ─────────────────
-        query = _UNITS_BASE_QUERY
-        params: list[Any] = [id_empresa]
-        if search:
-            query += _UNITS_SEARCH_FILTER
-            like = f"%{search}%"
-            params.extend([like, like, like, like])
-        query += _UNITS_ORDER_BY
+        with conn.cursor() as cur:
+            params = [id_empresa, fecha_consulta]
+            clauses = []
 
-        with main_cursor() as cursor:
-            cursor.execute(query, tuple(params))
-            rows = cursor.fetchall()
+            if id_ruta:
+                clauses.append("AND r.id_ruta = %s")
+                params.append(id_ruta)
+            if id_itinerario:
+                clauses.append("AND i.id_itinerario = %s")
+                params.append(id_itinerario)
 
-        # Primer pase: construir lista base de unidades y recopilar IMEIs.
-        units: list[dict[str, Any]] = []
-        imeis: list[str] = []
-        for row in rows:
-            unit_imei = str(row[8]).strip() if row[8] else ""
-            units.append(
-                {
-                    "id": row[0],
-                    "numero": row[1],
-                    "marca": row[2],
-                    "modelo": row[3],
-                    "anio": row[4],
-                    "matricula": row[5],
-                    "tipo": row[6],
-                    "imagen": row[7],
-                    "imei": unit_imei,
-                    "chip": row[9],
-                    "id_operador": row[10],
-                    "status": row[11],
-                    "vel_max": float(row[12]) if row[12] is not None else None,
-                    "operador": row[13],
-                    "grupo": row[14],
-                }
+            cur.execute(
+                f"""
+                SELECT
+                    -- Programación
+                    itf.id_itinerario_fecha,
+                    itf.fecha,
+                    itf.fecha_hora_inicio,
+                    itf.fecha_hora_fin,
+                    itf.status AS status_programacion,
+
+                    -- Itinerario base
+                    i.id_itinerario,
+                    i.turno,
+                    i.tipo,
+                    i.dias,
+                    i.hora_inicio,
+                    i.hora_fin,
+                    i.total_paradas,
+                    i.minutos_tolerancia_inicio,
+                    i.minutos_tolerancia_fin,
+
+                    -- Ruta
+                    r.id_ruta,
+                    r.nombre  AS nombre_ruta,
+                    r.clave   AS clave_ruta,
+                    l.tipo_logistica,
+                    l.trace_color,
+                    l.kilometros,
+
+                    -- Unidad ejecutora (titular)
+                    ifu.id_itinerario_fecha_unidad,
+                    ifu.id_unidad,
+                    ifu.imei,
+                    ifu.tipo_asignacion,
+                    ifu.status AS status_unidad,
+
+                    -- Estado en tiempo real (actualizado por el worker)
+                    ifu.en_ruta,
+                    ifu.en_curso,
+                    ifu.vel_max,
+                    ifu.velocidad_actual,
+                    ifu.fecha_hora_update,
+
+                    -- Métricas de cumplimiento
+                    ifu.paradas_abordadas,
+                    ifu.paradas_omitidas,
+                    ifu.porcentaje_cumplimiento,
+                    ifu.porcentaje_ruta,
+                    ifu.kms_servicio,
+                    ifu.kms_vacio,
+
+                    -- Hitos
+                    ifu.fecha_hora_encendido,
+                    ifu.fecha_hora_arranque,
+                    ifu.fecha_hora_llegada_f1,
+                    ifu.fecha_hora_salida_f1,
+                    ifu.fecha_hora_llegada_destino,
+
+                    -- Alarmas activas
+                    ifu.alarma_encendido,
+                    ifu.alarma_arranque,
+                    ifu.alarma_llegada_f1,
+                    ifu.alarma_retraso,
+                    ifu.alarma_anticipacion,
+                    ifu.alarma_desviacion,
+                    ifu.alarma_parada_omitida,
+                    ifu.alarma_relenti,
+                    ifu.alarma_unidad_detenida,
+
+                    -- Parada actual, anterior y siguiente
+                    -- (ids guardados por el worker para el monitor)
+                    ifu.id_parada_actual,
+                    ifu.id_parada_anterior,
+                    ifu.id_parada_siguiente,
+
+                    -- Datos de la unidad
+                    u.numero  AS numero_unidad,
+                    u.marca   AS marca_unidad,
+
+                    -- Número de apoyos asignados
+                    itf.apoyos
+
+                FROM t_itinerario_fecha itf
+                INNER JOIN t_itinerarios i      ON i.id_itinerario = itf.id_itinerario
+                INNER JOIN t_rutas r            ON r.id_ruta = i.id_ruta
+                INNER JOIN t_logisticas_ruta l  ON l.id_logistica_ruta = i.id_logistica_ruta
+                LEFT  JOIN t_itinerario_fecha_unidad ifu
+                        ON ifu.id_itinerario_fecha = itf.id_itinerario_fecha
+                       AND ifu.tipo_asignacion = 1   -- solo titular
+                       AND ifu.status != 2           -- excluir desasignadas
+                LEFT  JOIN t_unidades u         ON u.id_unidad = ifu.id_unidad
+                WHERE itf.id_empresa = %s
+                  AND itf.fecha = %s
+                  AND itf.status != 0              -- excluir cancelados
+                  {"".join(clauses)}
+                ORDER BY
+                    i.hora_inicio,
+                    r.nombre,
+                    i.turno
+                """,
+                params,
             )
-            if unit_imei:
-                imeis.append(unit_imei)
+            rows = _rows_to_dicts(cur)
 
-        # ── Paso 2: una sola query de telemetría (evita N+1) ───────────
-        telemetry_list = get_latest_positions_by_imeis(imeis)
-        telemetry_map = {t["imei"]: t for t in telemetry_list}
-
-        # ── Paso 3: enriquecer con telemetría + contar engine_state ────
-        counts: UnitsLiveCounts = {
-            "total": len(units),
-            "engine_on": 0,
-            "engine_off": 0,
-            "engine_unknown": 0,
-        }
-
-        enriched_units: list[dict[str, Any]] = []
-        for unit in units:
-            telemetry = telemetry_map.get(unit["imei"])
-            # engine_state y segundos_en_estado_actual vienen pre-resueltos
-            # desde get_latest_positions_by_imeis. Se exponen a nivel de la
-            # unidad para que el frontend no tenga que encadenar `?.` en
-            # el caso común "la unidad tiene telemetría".
-            engine_state: EngineState = (
-                telemetry["engine_state"] if telemetry else "unknown"
-            )
-            seconds_in_state: int | None = (
-                telemetry["segundos_en_estado_actual"] if telemetry else None
-            )
-
-            counts[f"engine_{engine_state}"] += 1  # type: ignore[literal-required]
-
-            enriched_units.append(
-                {
-                    **unit,
-                    "telemetry": telemetry,
-                    "engine_state": engine_state,
-                    "segundos_en_estado_actual": seconds_in_state,
-                }
-            )
-
-        return {"units": enriched_units, "counts": counts}
-
-    except Exception:
-        logger.exception(
-            "Error en get_units_with_latest_telemetry id_empresa=%s", id_empresa
-        )
-        raise
+        return [_serialize_row(r) for r in rows]
+    finally:
+        release_db_connection(conn)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Summary de unidad individual (optimizado)
-# ══════════════════════════════════════════════════════════════════════════════
-
-# Query liviana para el TripDrawer: solo lo que el summary REALMENTE usa.
-# Antes se llamaba a get_latest_position_by_imei() que traía 22 columnas.
-# Ahora: 3 columnas. Menor latencia + menos bytes transferidos.
-_UNIT_SUMMARY_TELEMETRY_QUERY = """
-    SELECT fecha_hora_gps, status, tipo_alerta
-    FROM public.t_data
-    WHERE imei = %s
-    ORDER BY fecha_hora_gps DESC
-    LIMIT 1
-"""
-
-_UNIT_STATIC_DATA_QUERY = """
-    SELECT id_unidad, numero, marca, modelo, imei, vel_max
-    FROM t_unidades
-    WHERE imei = %s AND id_empresa = %s AND status = 1
-    LIMIT 1
-"""
-
-
-def get_unit_summary_by_imei(
-    imei: str,
+def get_monitor_paradas(
+    id_itinerario_fecha_unidad: int,
     id_empresa: int,
-) -> UnitSummaryResponse | None:
+) -> list[dict]:
     """
-    Retorna el resumen de una unidad para el TripDrawer.
+    Estado detallado de las paradas de un itinerario en ejecución.
 
-    Incluye datos básicos de la unidad (t_unidades) + la última fecha y
-    estado del motor (resuelto con engine_state). NO trae sensores extras
-    (voltaje, rfid, odómetro) porque el TripDrawer no los usa.
-
-    Args:
-        imei:       IMEI de la unidad.
-        id_empresa: ID de la empresa (valida pertenencia).
-
-    Returns:
-        UnitSummaryResponse si la unidad existe y pertenece a la empresa,
-        None en caso contrario.
+    Usado por el frontend para mostrar el panel de paradas del monitor.
     """
-    # ── Paso 1: datos estáticos desde la BD principal ──────────────────
-    with main_cursor() as cursor:
-        cursor.execute(_UNIT_STATIC_DATA_QUERY, (imei, id_empresa))
-        unit_row = cursor.fetchone()
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    ifp.id_itinerario_fecha_parada,
+                    ifp.id_parada,
+                    ifp.numero,
+                    ifp.hora_abordaje_programada,
+                    ifp.fecha_hora_llegada,
+                    ifp.fecha_hora_salida,
+                    ifp.minutos_diferencia,
+                    ifp.status,
+                    ifp.dentro_geocerca,
+                    ifp.geocerca_radio,
+                    p.nombre,
+                    p.latitud,
+                    p.longitud,
+                    p.tipo_geocerca
+                FROM t_itinerario_fecha_parada ifp
+                INNER JOIN t_paradas_ruta p ON p.id_parada = ifp.id_parada
+                -- Verificar que pertenece a la empresa
+                INNER JOIN t_itinerario_fecha_unidad ifu
+                        ON ifu.id_itinerario_fecha_unidad = ifp.id_itinerario_fecha_unidad
+                INNER JOIN t_itinerario_fecha itf
+                        ON itf.id_itinerario_fecha = ifu.id_itinerario_fecha
+                WHERE ifp.id_itinerario_fecha_unidad = %s
+                  AND itf.id_empresa = %s
+                ORDER BY ifp.numero ASC
+                """,
+                (id_itinerario_fecha_unidad, id_empresa),
+            )
+            rows = _rows_to_dicts(cur)
 
-    if not unit_row:
-        return None
+        return [_serialize_row(r) for r in rows]
+    finally:
+        release_db_connection(conn)
 
-    clean_imei = str(unit_row[4]).strip() if unit_row[4] else ""
 
-    # ── Paso 2: última telemetría (liviana) desde la BD de t_data ──────
-    # Se abre un cursor separado porque t_unidades y t_data viven en pools
-    # distintos (BD principal vs BD de telemetría). Los context managers
-    # garantizan que cada conexión vuelva a su pool correcto.
-    with telemetry_cursor() as cursor:
-        cursor.execute(_UNIT_SUMMARY_TELEMETRY_QUERY, (clean_imei,))
-        telemetry_row = cursor.fetchone()
+# ══════════════════════════════════════════════════════════════════════════════
+# HISTÓRICO
+# ══════════════════════════════════════════════════════════════════════════════
 
-    # ── Paso 3: ensamblar el summary ───────────────────────────────────
-    has_telemetry = telemetry_row is not None
 
-    last_report: str | None = None
-    status_raw: str | None = None
-    tipo_alerta: int | None = None
+def get_historico(
+    id_empresa: int,
+    fecha_inicio: str,
+    fecha_fin: str,
+    id_ruta: int | None = None,
+    id_itinerario: int | None = None,
+    id_unidad: int | None = None,
+    status: int | None = None,
+) -> list[dict]:
+    """
+    Listado histórico de itinerarios ejecutados con sus métricas.
 
-    if telemetry_row is not None:
-        last_report = to_app_iso(telemetry_row[0])
-        status_raw = (
-            (telemetry_row[1] or "").strip() if telemetry_row[1] is not None else None
-        )
-        tipo_alerta = telemetry_row[2]
+    Incluye solo itinerarios que ya tienen unidad asignada (con o sin
+    cumplimiento registrado). Los programados sin unidad se excluyen.
 
-    engine_state = resolve_engine_state(tipo_alerta, status_raw)
+    Equivale a getHistorico() de la v2.5.
+    """
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            params = [id_empresa, fecha_inicio, fecha_fin]
+            clauses = []
 
-    # Tiempo acumulado en el estado actual — solo tiene sentido calcularlo
-    # si la unidad tiene telemetría. Si el motor nunca ha registrado un
-    # evento tipo_alerta ∈ {33, 34}, la función retorna None y el frontend
-    # simplemente oculta la fila (Ley de Tesler: no mostrar valores vacíos).
-    seconds_in_state: int | None = (
-        get_seconds_in_state_for_imei(clean_imei) if has_telemetry else None
-    )
+            if id_ruta:
+                clauses.append("AND r.id_ruta = %s")
+                params.append(id_ruta)
+            if id_itinerario:
+                clauses.append("AND i.id_itinerario = %s")
+                params.append(id_itinerario)
+            if id_unidad:
+                clauses.append("AND ifu.id_unidad = %s")
+                params.append(id_unidad)
+            if status is not None:
+                clauses.append("AND itf.status = %s")
+                params.append(status)
 
-    return {
-        "id": unit_row[0],
-        "numero": unit_row[1],
-        "marca": unit_row[2],
-        "modelo": unit_row[3],
-        "imei": clean_imei,
-        "vel_max": float(unit_row[5]) if unit_row[5] is not None else None,
-        "last_report": last_report,
-        # Campo `status` conservado por compatibilidad con frontend existente.
-        # Nuevos consumidores deben preferir `engine_state`.
-        "status": status_raw if status_raw is not None else "Sin información",
-        "engine_state": engine_state,
-        "segundos_en_estado_actual": seconds_in_state,
-        "hasTelemetry": has_telemetry,
-    }
+            cur.execute(
+                f"""
+                SELECT
+                    -- Identificadores
+                    itf.id_itinerario_fecha,
+                    ifu.id_itinerario_fecha_unidad,
+                    itf.fecha,
+
+                    -- Itinerario y ruta
+                    i.id_itinerario,
+                    i.turno,
+                    i.tipo,
+                    i.total_paradas,
+                    r.id_ruta,
+                    r.nombre  AS nombre_ruta,
+                    r.clave   AS clave_ruta,
+
+                    -- Ventana horaria programada
+                    itf.fecha_hora_inicio,
+                    itf.fecha_hora_fin,
+                    EXTRACT(EPOCH FROM (itf.fecha_hora_fin - itf.fecha_hora_inicio))::integer / 60
+                        AS minutos_programados,
+
+                    -- Estado
+                    itf.status AS status_programacion,
+                    ifu.status AS status_unidad,
+
+                    -- Unidad
+                    ifu.id_unidad,
+                    ifu.imei,
+                    ifu.tipo_asignacion,
+                    u.numero  AS numero_unidad,
+                    u.marca   AS marca_unidad,
+
+                    -- Hitos de ejecución
+                    ifu.fecha_hora_encendido,
+                    ifu.fecha_hora_arranque,
+                    ifu.fecha_hora_llegada_f1,
+                    ifu.fecha_hora_salida_f1,
+                    ifu.fecha_hora_llegada_destino,
+                    ifu.fecha_hora_salida_destino,
+
+                    -- Tiempo real de recorrido (salida F1 → llegada destino)
+                    CASE
+                        WHEN ifu.fecha_hora_salida_f1 IS NOT NULL
+                             AND ifu.fecha_hora_llegada_destino IS NOT NULL
+                        THEN EXTRACT(EPOCH FROM (
+                            ifu.fecha_hora_llegada_destino - ifu.fecha_hora_salida_f1
+                        ))::integer / 60
+                        ELSE NULL
+                    END AS minutos_real,
+
+                    -- Métricas de cumplimiento
+                    ifu.paradas_abordadas,
+                    ifu.paradas_omitidas,
+                    ifu.porcentaje_cumplimiento,
+                    ifu.porcentaje_ruta,
+                    ifu.porcentaje_paradas,
+                    ifu.kms_servicio,
+                    ifu.kms_vacio,
+                    ifu.kms_totales,
+                    ifu.vel_max,
+                    ifu.eventos_vel_max,
+                    ifu.m_fuera_ruta,
+                    ifu.m_fuera_ruta_pct,
+                    ifu.tiempo_total,
+                    ifu.tiempo_en_ruta,
+                    ifu.tiempo_fuera_ruta,
+                    ifu.abordajes
+
+                FROM t_itinerario_fecha itf
+                INNER JOIN t_itinerarios i      ON i.id_itinerario = itf.id_itinerario
+                INNER JOIN t_rutas r            ON r.id_ruta = i.id_ruta
+                INNER JOIN t_itinerario_fecha_unidad ifu
+                        ON ifu.id_itinerario_fecha = itf.id_itinerario_fecha
+                LEFT  JOIN t_unidades u         ON u.id_unidad = ifu.id_unidad
+                WHERE itf.id_empresa = %s
+                  AND itf.fecha BETWEEN %s AND %s
+                  {"".join(clauses)}
+                ORDER BY
+                    itf.fecha DESC,
+                    i.hora_inicio,
+                    r.nombre,
+                    i.turno
+                """,
+                params,
+            )
+            rows = _rows_to_dicts(cur)
+
+        return [_serialize_row(r) for r in rows]
+    finally:
+        release_db_connection(conn)
+
+
+def get_historico_paradas(
+    id_itinerario_fecha_unidad: int,
+    id_empresa: int,
+) -> list[dict]:
+    """
+    Detalle de paradas con tiempos reales de llegada/salida y diferencias.
+    Usado para el reporte de cumplimiento individual de un itinerario.
+    """
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    ifp.id_itinerario_fecha_parada,
+                    ifp.id_parada,
+                    ifp.numero,
+                    ifp.hora_abordaje_programada,
+                    ifp.fecha_hora_llegada,
+                    ifp.fecha_hora_salida,
+                    ifp.minutos_diferencia,
+                    ifp.status,
+                    p.nombre,
+                    p.latitud,
+                    p.longitud,
+                    p.tipo_geocerca,
+                    p.radio,
+                    -- Tiempo de permanencia en la parada (segundos)
+                    CASE
+                        WHEN ifp.fecha_hora_llegada IS NOT NULL
+                             AND ifp.fecha_hora_salida IS NOT NULL
+                        THEN EXTRACT(EPOCH FROM (
+                            ifp.fecha_hora_salida - ifp.fecha_hora_llegada
+                        ))::integer
+                        ELSE NULL
+                    END AS segundos_permanencia
+                FROM t_itinerario_fecha_parada ifp
+                INNER JOIN t_paradas_ruta p ON p.id_parada = ifp.id_parada
+                INNER JOIN t_itinerario_fecha_unidad ifu
+                        ON ifu.id_itinerario_fecha_unidad = ifp.id_itinerario_fecha_unidad
+                INNER JOIN t_itinerario_fecha itf
+                        ON itf.id_itinerario_fecha = ifu.id_itinerario_fecha
+                WHERE ifp.id_itinerario_fecha_unidad = %s
+                  AND itf.id_empresa = %s
+                ORDER BY ifp.numero ASC
+                """,
+                (id_itinerario_fecha_unidad, id_empresa),
+            )
+            rows = _rows_to_dicts(cur)
+
+        return [_serialize_row(r) for r in rows]
+    finally:
+        release_db_connection(conn)
+
+
+def get_historico_eventos(
+    id_itinerario_fecha_unidad: int,
+    id_empresa: int,
+) -> list[dict]:
+    """
+    Línea de tiempo de eventos GPS de una ejecución.
+    Muestra cada llegada, salida y stop registrado por el worker.
+    """
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    e.id_evento,
+                    e.evento,
+                    CASE e.evento
+                        WHEN 1 THEN 'llegada'
+                        WHEN 2 THEN 'salida'
+                        WHEN 3 THEN 'abordaje'
+                        WHEN 4 THEN 'inicio_stop'
+                        WHEN 5 THEN 'fin_stop'
+                        ELSE 'desconocido'
+                    END AS tipo_evento,
+                    e.fecha_hora_gps,
+                    e.latitud,
+                    e.longitud,
+                    e.velocidad,
+                    e.odometro,
+                    -- Parada relacionada
+                    ifp.id_parada,
+                    ifp.numero AS numero_parada,
+                    p.nombre   AS nombre_parada
+                FROM t_itinerario_fecha_parada_eventos e
+                INNER JOIN t_itinerario_fecha_parada ifp
+                        ON ifp.id_itinerario_fecha_parada = e.id_itinerario_fecha_parada
+                INNER JOIN t_paradas_ruta p
+                        ON p.id_parada = ifp.id_parada
+                INNER JOIN t_itinerario_fecha_unidad ifu
+                        ON ifu.id_itinerario_fecha_unidad = e.id_itinerario_fecha_unidad
+                INNER JOIN t_itinerario_fecha itf
+                        ON itf.id_itinerario_fecha = ifu.id_itinerario_fecha
+                WHERE e.id_itinerario_fecha_unidad = %s
+                  AND itf.id_empresa = %s
+                ORDER BY e.fecha_hora_gps ASC
+                """,
+                (id_itinerario_fecha_unidad, id_empresa),
+            )
+            rows = _rows_to_dicts(cur)
+
+        return [_serialize_row(r) for r in rows]
+    finally:
+        release_db_connection(conn)
