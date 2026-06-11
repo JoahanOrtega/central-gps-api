@@ -46,7 +46,7 @@ def _serialize(record: dict) -> dict:
 
     for k, v in record.items():
         if isinstance(v, datetime):
-            record[k] = v.isoformat()
+            record[k] = v.strftime("%Y-%m-%dT%H:%M:%S-06:00")
         elif isinstance(v, time):
             # TIME de PostgreSQL llega como datetime.time → "HH:MM"
             record[k] = v.strftime("%H:%M")

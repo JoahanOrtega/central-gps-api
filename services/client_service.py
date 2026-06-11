@@ -1,6 +1,7 @@
 import logging
 import secrets
 from db.connection import get_db_connection, release_db_connection
+from utils.date_utils import fmt_dt
 
 logger = logging.getLogger(__name__)
 
@@ -96,8 +97,8 @@ def get_clients(id_empresa: int, search: str | None = None) -> list[dict]:
                     "imagen": row[7],
                     "observaciones": row[8],
                     "id_poi": row[9],
-                    "fecha_registro": row[10].isoformat() if row[10] else None,
-                    "fecha_cambio": row[11].isoformat() if row[11] else None,
+                    "fecha_registro": fmt_dt(row[10]) if row[10] else None,
+                    "fecha_cambio": fmt_dt(row[11]) if row[11] else None,
                     "direccion": row[12],
                     "coordenadas": row[13],
                 }
@@ -174,9 +175,9 @@ def get_client_by_id(id_cliente: int, id_empresa: int) -> dict | None:
             "token_dashboard": row[12],
             "acceso_dashboard_cmp": row[13],
             "acceso_global": row[14],
-            "fecha_registro": row[15].isoformat() if row[15] else None,
+            "fecha_registro": fmt_dt(row[15]) if row[15] else None,
             "id_usuario_registro": row[16],
-            "fecha_cambio": row[17].isoformat() if row[17] else None,
+            "fecha_cambio": fmt_dt(row[17]) if row[17] else None,
             "id_usuario_cambio": row[18],
             "direccion": row[19],
             "coordenadas": row[20],

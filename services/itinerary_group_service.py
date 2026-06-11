@@ -43,7 +43,7 @@ def _serialize_dates(record: dict) -> dict:
     ):
         v = record.get(campo)
         if v is not None and hasattr(v, "isoformat"):
-            record[campo] = v.isoformat()
+            record[campo] = v.strftime("%Y-%m-%dT%H:%M:%S-06:00")
     return record
 
 

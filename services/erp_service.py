@@ -1,6 +1,7 @@
 import logging
 import bcrypt
 from db.connection import get_db_connection, release_db_connection
+from utils.date_utils import fmt_dt
 
 logger = logging.getLogger(__name__)
 
@@ -791,7 +792,7 @@ def get_audit_log(
             record = dict(zip(cols, row))
             # Flask no serializa datetime a ISO por defecto — hacerlo explícitamente
             if record.get("fecha_registro"):
-                record["fecha_registro"] = record["fecha_registro"].isoformat()
+                record["fecha_registro"] = fmt_dt(record["fecha_registro"])
             return record
 
         return [_serialize_row(cols, row) for row in rows], None

@@ -31,11 +31,11 @@ def _rows_to_dicts(cur) -> list[dict]:
 def _serialize_row(record: dict) -> dict:
     """Normaliza tipos para JSON."""
     from decimal import Decimal
-    from datetime import datetime, time
+    from datetime import datetime, time, date
 
     for k, v in record.items():
         if isinstance(v, datetime):
-            record[k] = v.isoformat()
+            record[k] = v.strftime("%Y-%m-%dT%H:%M:%S-06:00")
         elif isinstance(v, time):
             record[k] = v.strftime("%H:%M")
         elif isinstance(v, date):

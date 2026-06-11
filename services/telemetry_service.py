@@ -54,27 +54,29 @@ def now_local() -> datetime:
 
 
 def to_utc(dt: datetime | None) -> datetime | None:
-    """Convierte a UTC. Naive → asume UTC. Aware → convierte."""
+    """
+    Convierte a UTC para operaciones internas (comparaciones, aritmética).
+    Naive → asume UTC-6 (contrato del pipeline: la BD almacena UTC-6).
+    Aware → convierte desde su zona declarada.
+    """
     if dt is None:
         return None
     if dt.tzinfo is None:
-        return dt.replace(tzinfo=UTC_TZ)
+        return dt.replace(tzinfo=APP_TZ).astimezone(UTC_TZ)
     return dt.astimezone(UTC_TZ)
 
 
 def to_app_iso(dt: datetime | None) -> str | None:
     """
-    Datetime de BD (UTC naive) → ISO 8601 con offset -06:00.
-    "2026-04-17 18:33:00" → "2026-04-17T12:33:00-06:00"
+    Datetime de BD (UTC-6 naive) → ISO 8601 con offset -06:00.
+    "2026-06-11 13:30:00" → "2026-06-11T13:30:00-06:00"
 
-    El frontend parsea esto directamente con new Date() sin ambigüedad.
+    La BD almacena UTC-6 sin zona declarada. Se añade el offset directamente
+    sin mover los dígitos — sin conversión de zona.
     """
     if dt is None:
         return None
-    converted = to_utc(dt)
-    # to_utc solo retorna None si dt es None; ya descartamos ese caso arriba.
-    assert converted is not None
-    return converted.astimezone(APP_TZ).isoformat(timespec="seconds")
+    return dt.strftime("%Y-%m-%dT%H:%M:%S-06:00")
 
 
 def day_range_utc(day_offset: int = 0) -> tuple[datetime, datetime]:
@@ -173,6 +175,8 @@ def map_route_row(row: tuple, vel_max: float = 0.0) -> dict[str, Any]:
       4  grados
       5  status
       6  tipo_alerta
+      7  odometro  (no consumido aquí — reservado para el filtro de saltos)
+      8  rfid      (lectura de tarjeta de proximidad, si el punto la trae)
 
     El campo derivado `engine_state` se calcula aquí UNA VEZ POR PUNTO para
     que el frontend no tenga que reinterpretar bits crudos de `status`.
@@ -181,6 +185,13 @@ def map_route_row(row: tuple, vel_max: float = 0.0) -> dict[str, Any]:
     speed = speed_value if speed_value is not None else 0.0
     status = (row[5] or "").strip() if row[5] is not None else None
     tipo_alerta = row[6] if len(row) > 6 else None
+
+    # RFID: la oreja lo extrae del campo DATA o de un slot ASSIGN renombrado.
+    # Viene como string hex (8-20 chars) o vacío/NULL si el punto no trae
+    # lectura. Normalizamos vacío → None para que el frontend pueda filtrar
+    # con un simple truthy check.
+    rfid_raw = row[8] if len(row) > 8 else None
+    rfid = rfid_raw.strip() if isinstance(rfid_raw, str) and rfid_raw.strip() else None
 
     engine_state = resolve_engine_state(tipo_alerta, status)
 
@@ -192,6 +203,7 @@ def map_route_row(row: tuple, vel_max: float = 0.0) -> dict[str, Any]:
         "grados": float(row[4]) if row[4] is not None else None,
         "status": status,
         "tipo_alerta": tipo_alerta,
+        "rfid": rfid,
         "engine_state": engine_state,
         "movement_state": classify_movement(engine_state, speed),
         "strokeColor": get_stroke_color(speed, vel_max),
@@ -256,7 +268,8 @@ _ROUTE_QUERY = """
         grados,
         status,
         tipo_alerta,
-        odometro
+        odometro,
+        rfid
     FROM public.t_data
     WHERE imei = %s
       AND fecha_hora_gps >= %s
@@ -571,7 +584,7 @@ def _get_latest_trip(imei: str, vel_max: float = 0.0) -> list[dict[str, Any]]:
             cursor.execute(
                 """
                 SELECT fecha_hora_gps, latitud, longitud, velocidad,
-                       grados, status, tipo_alerta
+                    grados, status, tipo_alerta, odometro, rfid
                 FROM public.t_data
                 WHERE imei = %s
                   AND fecha_hora_gps > %s
@@ -668,7 +681,7 @@ def _get_current_trip(imei: str, vel_max: float = 0.0) -> list[dict[str, Any]]:
     # 3. Hay viaje en curso — devolver los puntos desde el encendido hasta ahora.
     # NOTA: usamos datetime.utcnow() en lugar de NOW() en SQL para que el
     # rango sea coherente con el resto de las funciones (que usan UTC).
-    end_utc = datetime.utcnow()
+    end_utc = now_utc()
     return get_positions_in_range(imei, last_on_at, end_utc, 5000, vel_max)
 
 
