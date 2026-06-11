@@ -30,6 +30,7 @@ from services.erp_service import (
     _ROL_USUARIO_CLAVE,
     _PERFIL_ADMIN_EMPRESA,
 )
+from utils.date_utils import fmt_dt
 
 logger = logging.getLogger(__name__)
 
@@ -134,7 +135,7 @@ def list_users_by_empresa(id_empresa: int):
                     "id_cliente": row[11],
                     "nombre_cliente": row[12],
                     "dias_consulta": row[13] or 0,
-                    "fecha_registro": row[14].isoformat() if row[14] else None,
+                    "fecha_registro": fmt_dt(row[14]) if row[14] else None,
                 }
             )
 
@@ -250,8 +251,8 @@ def get_user_detail(id_usuario: int, id_empresa: int):
                 "permisos": {
                     "id_permisos": id_permisos,
                 },
-                "fecha_registro": row[12].isoformat() if row[12] else None,
-                "fecha_cambio": row[13].isoformat() if row[13] else None,
+                "fecha_registro": fmt_dt(row[12]) if row[12] else None,
+                "fecha_cambio": fmt_dt(row[13]) if row[13] else None,
             },
             None,
         )
