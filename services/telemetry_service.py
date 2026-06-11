@@ -53,6 +53,11 @@ def now_local() -> datetime:
     return datetime.now(APP_TZ)
 
 
+def now_local_naive() -> datetime:
+    """Instante actual en dígitos UTC-6 sin tzinfo — para comparar contra t_data."""
+    return now_local().replace(tzinfo=None)
+
+
 def to_utc(dt: datetime | None) -> datetime | None:
     """
     Convierte a UTC para operaciones internas (comparaciones, aritmética).
@@ -81,16 +86,20 @@ def to_app_iso(dt: datetime | None) -> str | None:
 
 def day_range_utc(day_offset: int = 0) -> tuple[datetime, datetime]:
     """
-    Rango (inicio, fin) de un día en UTC dado el offset en días desde hoy UTC-6.
+    Rango (inicio, fin) de un día en dígitos UTC-6 NAIVE.
     day_offset=0 → hoy, 1 → ayer, 2 → antier.
 
-    Ejemplo (hoy=2026-04-17 en UTC-6):
-      inicio local = 2026-04-17 00:00:00-06:00 → 2026-04-17 06:00:00 UTC
-      fin local    = 2026-04-17 23:59:59-06:00 → 2026-04-18 05:59:59 UTC
+    Contrato del pipeline: la BD almacena fecha_hora_gps en UTC-6 sin zona.
+    Los límites se generan naive para comparar dígito contra dígito,
+    sin depender de la zona de sesión de PostgreSQL.
+
+    Ejemplo (hoy=2026-06-11 en UTC-6):
+      inicio = 2026-06-11 00:00:00  (naive)
+      fin    = 2026-06-11 23:59:59  (naive)
     """
     target = now_local().date() - timedelta(days=day_offset)
-    start = datetime.combine(target, time.min, tzinfo=APP_TZ).astimezone(UTC_TZ)
-    end = datetime.combine(target, time.max, tzinfo=APP_TZ).astimezone(UTC_TZ)
+    start = datetime.combine(target, time.min)
+    end = datetime.combine(target, time.max)
     return start, end
 
 
@@ -276,7 +285,7 @@ _ROUTE_QUERY = """
       AND fecha_hora_gps <= %s
       AND latitud  IS NOT NULL
       AND longitud IS NOT NULL
-      AND (atributos IS NULL OR (atributos::jsonb->>'FIX') != '0')
+      AND ((atributos::jsonb->>'FIX') IS DISTINCT FROM '0')
     ORDER BY fecha_hora_gps ASC
     LIMIT %s
 """
@@ -577,7 +586,7 @@ def _get_latest_trip(imei: str, vel_max: float = 0.0) -> list[dict[str, Any]]:
 
         if len(offs) == 1:
             # Un solo apagado → desde ese punto hasta ahora
-            cursor.execute(_ROUTE_QUERY, (imei, latest_off, now_utc(), 5000))
+            cursor.execute(_ROUTE_QUERY, (imei, latest_off, now_local_naive(), 5000))
         else:
             prev_off = offs[1][0]
             # Entre el apagado anterior (excl) y el apagado más reciente (incl)
@@ -681,8 +690,8 @@ def _get_current_trip(imei: str, vel_max: float = 0.0) -> list[dict[str, Any]]:
     # 3. Hay viaje en curso — devolver los puntos desde el encendido hasta ahora.
     # NOTA: usamos datetime.utcnow() en lugar de NOW() en SQL para que el
     # rango sea coherente con el resto de las funciones (que usan UTC).
-    end_utc = now_utc()
-    return get_positions_in_range(imei, last_on_at, end_utc, 5000, vel_max)
+    end_local = now_local_naive()
+    return get_positions_in_range(imei, last_on_at, end_local, 5000, vel_max)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -725,11 +734,8 @@ def get_route_by_custom_range(
     except ValueError as exc:
         raise ValueError(f"Formato de fecha/hora inválido: {exc}") from exc
 
-    start_utc = start_naive.replace(tzinfo=APP_TZ).astimezone(UTC_TZ)
-    end_utc = end_naive.replace(tzinfo=APP_TZ).astimezone(UTC_TZ)
-
     vel_max = _get_vel_max(imei)
-    return get_positions_in_range(imei, start_utc, end_utc, limit, vel_max)
+    return get_positions_in_range(imei, start_naive, end_naive, limit, vel_max)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -764,9 +770,9 @@ def _fetch_trips_for_window(
     segmenta en recorridos. Evita duplicación entre get_recent_trips_by_imei
     y get_trip_by_id.
     """
-    end_utc = now_utc()
-    start_utc = end_utc - timedelta(days=days_back)
-    rows = _fetch_route_rows(imei, start_utc, end_utc, max_points)
+    end_local = now_local_naive()
+    start_local = end_local - timedelta(days=days_back)
+    rows = _fetch_route_rows(imei, start_local, end_local, max_points)
     return _split_trips(rows)
 
 
