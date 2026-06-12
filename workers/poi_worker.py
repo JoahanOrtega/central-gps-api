@@ -1204,3 +1204,13 @@ def detener_worker() -> None:
     if _scheduler and _scheduler.running:
         _scheduler.shutdown(wait=False)
         logger.info("POI Worker detenido.")
+
+
+def get_scheduler() -> BackgroundScheduler | None:
+    """Expone el scheduler para que otros módulos registren jobs en él.
+
+    Un solo BackgroundScheduler por proceso: dos schedulers separados
+    bajo gevent compiten por el event loop y uno termina zombi
+    (incidente 2026-06-12: POI colgado, luego Unit State colgado).
+    """
+    return _scheduler

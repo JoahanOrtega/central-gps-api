@@ -218,8 +218,12 @@ def _generar_eventos_sse(id_empresa: int) -> Generator[str, None, None]:
                 # Mensaje real de geocerca — retransmitir al cliente
                 try:
                     data = json.loads(mensaje["data"])
+                    # El payload puede traer un discriminador `sse_event` (ej: los eventos
+                    # de estado de unidad del unit_state_worker). Si no viene, es un evento
+                    # de geocerca clásico — retrocompatible con todo lo existente.
+                    tipo_sse = data.pop("sse_event", "poi_event")
                     yield _formatear_sse(
-                        evento="poi_event",
+                        evento=tipo_sse,
                         data=data,
                         event_id=str(int(time.time() * 1000)),
                     )
