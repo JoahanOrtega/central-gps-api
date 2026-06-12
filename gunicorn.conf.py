@@ -63,6 +63,11 @@ def post_fork(server, worker):
         # ya esten listos cuando el scheduler intente conectarse.
         try:
             from workers.poi_worker import iniciar_worker
+            from workers.unit_state_worker import (
+                iniciar_worker as iniciar_unit_state_worker,
+            )
+
+            iniciar_unit_state_worker()
 
             iniciar_worker()
             logger.info(
@@ -99,8 +104,12 @@ def worker_exit(server, worker):
     if worker.age == 1:
         try:
             from workers.poi_worker import detener_worker
+            from workers.unit_state_worker import (
+                detener_worker as detener_unit_state_worker,
+            )
 
             detener_worker()
+            detener_unit_state_worker()
             logger.info(
                 "POI Worker detenido — worker pid=%s age=%s termino",
                 worker.pid,

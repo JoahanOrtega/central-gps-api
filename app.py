@@ -141,12 +141,18 @@ if __name__ == "__main__":
     """
     import atexit
     from workers.poi_worker import iniciar_worker, detener_worker
+    from workers.unit_state_worker import (
+        iniciar_worker as iniciar_unit_state_worker,
+        detener_worker as detener_unit_state_worker,
+    )
 
     app = create_app()
 
     if os.getenv("FLASK_TESTING", "false").lower() != "true":
         iniciar_worker()
         atexit.register(detener_worker)
+        iniciar_unit_state_worker()
+        atexit.register(detener_unit_state_worker)
 
     debug_mode = os.getenv("FLASK_DEBUG", "false").lower() == "true"
     app.run(
