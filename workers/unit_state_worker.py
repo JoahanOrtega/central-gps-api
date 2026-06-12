@@ -37,8 +37,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from datetime import datetime, timezone
-
+from datetime import datetime, timezone, timedelta
 import redis
 from apscheduler.schedulers.background import BackgroundScheduler
 
@@ -113,9 +112,19 @@ _scheduler: BackgroundScheduler | None = None
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 
+# Cliente Redis compartido del módulo. Crear un cliente por publish
+# (versión anterior) filtraba conexiones huérfanas — cada from_url abre
+# un pool propio que nunca se cierra, y bajo gevent esas conexiones
+# acumuladas interferían con el pubsub del SSE y el publish del POI worker.
+_redis_client: redis.Redis | None = None
+
+
 def _get_redis() -> redis.Redis:
-    """Conexión Redis perezosa (mismo patrón que poi_worker)."""
-    return redis.from_url(REDIS_URL, decode_responses=True)
+    """Conexión Redis perezosa con singleton de módulo."""
+    global _redis_client
+    if _redis_client is None:
+        _redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+    return _redis_client
 
 
 def _ahora_naive_utc6() -> datetime:
@@ -303,42 +312,28 @@ def _evaluar_transicion(
 # ── Arranque / parada (mismo patrón que poi_worker) ───────────────────────────
 
 
-def iniciar_worker() -> None:
-    """Crea e inicia el scheduler. Llamar junto al iniciar_worker de POIs."""
-    global _scheduler
-
+def registrar_en_scheduler(scheduler) -> None:
+    """
+    Registra el job de estados críticos en un scheduler EXISTENTE
+    (el del POI worker). No crea scheduler propio — ver get_scheduler()
+    en poi_worker para la razón.
+    """
     if os.getenv("UNIT_STATE_WORKER_ENABLED", "true").lower() == "false":
         logger.info("Unit State Worker deshabilitado.")
         return
 
-    if _scheduler is not None and _scheduler.running:
-        logger.warning("Unit State Worker ya está corriendo.")
-        return
-
-    _scheduler = BackgroundScheduler(
-        timezone="UTC",
-        job_defaults={"coalesce": True, "max_instances": 1},
-    )
-    _scheduler.add_job(
+    scheduler.add_job(
         func=_ejecutar_ciclo,
         trigger="interval",
         seconds=POLL_INTERVAL,
         id="unit_state_worker",
         name="Unit State Worker",
-        next_run_time=datetime.now(timezone.utc),
+        # Desfase de 7s para no disparar en el mismo segundo que el POI job
+        next_run_time=datetime.now(timezone.utc) + timedelta(seconds=7),
     )
-    _scheduler.start()
     logger.info(
-        "Unit State Worker iniciado — ciclo cada %ds, umbrales: off=%ds, tx=%ds",
+        "Unit State Worker registrado — ciclo cada %ds, umbrales: off=%ds, tx=%ds",
         POLL_INTERVAL,
         APAGADO_PROLONGADO_SEC,
         SIN_TRANSMISION_SEC,
     )
-
-
-def detener_worker() -> None:
-    """Detiene el scheduler. Llamar en SIGTERM o atexit."""
-    global _scheduler
-    if _scheduler and _scheduler.running:
-        _scheduler.shutdown(wait=False)
-        logger.info("Unit State Worker detenido.")

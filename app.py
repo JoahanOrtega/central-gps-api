@@ -140,19 +140,17 @@ if __name__ == "__main__":
     gunicorn.conf.py se encarga de iniciar el worker en post_fork.
     """
     import atexit
-    from workers.poi_worker import iniciar_worker, detener_worker
-    from workers.unit_state_worker import (
-        iniciar_worker as iniciar_unit_state_worker,
-        detener_worker as detener_unit_state_worker,
-    )
+    from workers.poi_worker import iniciar_worker, detener_worker, get_scheduler
+    from workers.unit_state_worker import registrar_en_scheduler
 
     app = create_app()
 
     if os.getenv("FLASK_TESTING", "false").lower() != "true":
         iniciar_worker()
-        atexit.register(detener_worker)
-        iniciar_unit_state_worker()
-        atexit.register(detener_unit_state_worker)
+        sched = get_scheduler()
+        if sched:
+            registrar_en_scheduler(sched)
+        atexit.register(detener_worker)  # apaga el scheduler compartido al salir
 
     debug_mode = os.getenv("FLASK_DEBUG", "false").lower() == "true"
     app.run(

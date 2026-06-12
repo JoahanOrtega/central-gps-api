@@ -62,22 +62,27 @@ def post_fork(server, worker):
         # inicialice la app). El import aqui garantiza que los pools de BD
         # ya esten listos cuando el scheduler intente conectarse.
         try:
-            from workers.poi_worker import iniciar_worker
-            from workers.unit_state_worker import (
-                iniciar_worker as iniciar_unit_state_worker,
-            )
+            from workers.poi_worker import iniciar_worker, get_scheduler
+            from workers.unit_state_worker import registrar_en_scheduler
 
-            iniciar_unit_state_worker()
-
+            # 1. El POI worker crea el scheduler único del proceso
             iniciar_worker()
+
+            # 2. Nuestro job se registra en ese MISMO scheduler
+            #    (dos schedulers separados bajo gevent = uno muere, ver
+            #    incidente 2026-06-12)
+            sched = get_scheduler()
+            if sched:
+                registrar_en_scheduler(sched)
+
             logger.info(
-                "POI Worker iniciado en worker pid=%s age=%s",
+                "Scheduler iniciado (jobs: POI + Unit State) en worker pid=%s age=%s",
                 worker.pid,
                 worker.age,
             )
         except Exception as exc:
             logger.error(
-                "Error al iniciar POI Worker en worker pid=%s: %s",
+                "Error al iniciar scheduler en worker pid=%s: %s",
                 worker.pid,
                 repr(exc),
             )
@@ -104,20 +109,18 @@ def worker_exit(server, worker):
     if worker.age == 1:
         try:
             from workers.poi_worker import detener_worker
-            from workers.unit_state_worker import (
-                detener_worker as detener_unit_state_worker,
-            )
 
+            # Un solo detener: el scheduler es compartido, apagar el del
+            # POI worker detiene también el job de Unit State.
             detener_worker()
-            detener_unit_state_worker()
             logger.info(
-                "POI Worker detenido — worker pid=%s age=%s termino",
+                "Scheduler detenido — worker pid=%s age=%s termino",
                 worker.pid,
                 worker.age,
             )
         except Exception as exc:
             logger.error(
-                "Error al detener POI Worker en worker_exit pid=%s: %s",
+                "Error al detener scheduler en worker_exit pid=%s: %s",
                 worker.pid,
                 repr(exc),
             )
