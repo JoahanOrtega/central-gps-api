@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import json
 from datetime import datetime, timedelta, time, timezone
 from math import radians, sin, cos, sqrt, atan2
 from typing import Any
@@ -167,6 +168,46 @@ def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     return R * 2 * atan2(sqrt(a), sqrt(1 - a))
 
 
+_RFID_VACIOS = {"", "0", "null", "000000000"}
+
+
+def _extraer_rfid(rfid_col, data_col, atributos_col):
+    """
+    Extrae el identificador de tarjeta RFID de un punto de t_data,
+    probando en orden de prioridad los tres lugares donde puede llegar:
+      1. Columna rfid   — la oreja ya lo dejó normalizado (caso ideal v3.0).
+      2. Campo data     — TRIM(data), como lo leía el v2.5 (la mayoría de unidades).
+      3. JSON atributos — M_ASSIGN1 / S_ASSIGN1 del ASSIGN_MAP Suntech
+                          (unidades que solo reportan la tarjeta aquí).
+    Retorna el ID como string, o None si el punto no trae lectura válida.
+    """
+    if isinstance(rfid_col, str):
+        v = rfid_col.strip()
+        if v and v.lower() not in _RFID_VACIOS:
+            return v
+
+    if isinstance(data_col, str):
+        v = data_col.strip()
+        if v and v.lower() not in _RFID_VACIOS:
+            return v
+
+    if atributos_col:
+        try:
+            attrs = (
+                atributos_col
+                if isinstance(atributos_col, dict)
+                else json.loads(atributos_col)
+            )
+            for slot in ("M_ASSIGN1", "S_ASSIGN1"):
+                v = str(attrs.get(slot, "")).strip()
+                if v and v.lower() not in _RFID_VACIOS:
+                    return v
+        except (json.JSONDecodeError, TypeError, AttributeError):
+            pass
+
+    return None
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Mapper de fila de t_data
 # ══════════════════════════════════════════════════════════════════════════════
@@ -199,8 +240,11 @@ def map_route_row(row: tuple, vel_max: float = 0.0) -> dict[str, Any]:
     # Viene como string hex (8-20 chars) o vacío/NULL si el punto no trae
     # lectura. Normalizamos vacío → None para que el frontend pueda filtrar
     # con un simple truthy check.
-    rfid_raw = row[8] if len(row) > 8 else None
-    rfid = rfid_raw.strip() if isinstance(rfid_raw, str) and rfid_raw.strip() else None
+    rfid = _extraer_rfid(
+        row[8] if len(row) > 8 else None,  # columna rfid
+        row[9] if len(row) > 9 else None,  # campo data
+        row[10] if len(row) > 10 else None,  # atributos JSON
+    )
 
     engine_state = resolve_engine_state(tipo_alerta, status)
 
@@ -278,7 +322,9 @@ _ROUTE_QUERY = """
         status,
         tipo_alerta,
         odometro,
-        rfid
+        rfid,
+        data,
+        atributos
     FROM public.t_data
     WHERE imei = %s
       AND fecha_hora_gps >= %s
@@ -593,7 +639,7 @@ def _get_latest_trip(imei: str, vel_max: float = 0.0) -> list[dict[str, Any]]:
             cursor.execute(
                 """
                 SELECT fecha_hora_gps, latitud, longitud, velocidad,
-                    grados, status, tipo_alerta, odometro, rfid
+                    grados, status, tipo_alerta, odometro, rfid, data, atributos
                 FROM public.t_data
                 WHERE imei = %s
                   AND fecha_hora_gps > %s
