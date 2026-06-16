@@ -181,7 +181,7 @@ def create_operator(payload, id_empresa, id_usuario_registro):
                 id_usuario_registro,
                 status
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s, 1)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s, 1)
             RETURNING id_operador
             """,
             (
