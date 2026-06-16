@@ -28,6 +28,8 @@ from services.operator_assignment_service import (
     unassign_operator,
 )
 from validators.operator_validators import (
+    CreateOperatorSchema,
+    UpdateOperatorSchema,
     CreateOperatorGroupSchema,
     UpdateOperatorGroupSchema,
 )
@@ -57,13 +59,6 @@ def _resolve_empresa_context(body=None):
         or request.user.get("id_empresa")
     )
     id_usuario = request.user.get("sub")
-    logger.warning(
-        "DEBUG ctx: id_empresa=%r id_usuario=%r body=%r user_keys=%r",
-        id_empresa,
-        id_usuario,
-        body,
-        list(request.user.keys()),
-    )
 
     if not id_empresa or not id_usuario:
         return (
