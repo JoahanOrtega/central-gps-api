@@ -1,19 +1,3 @@
-"""
-operator_validators.py — Schemas de validación para el catálogo de operadores.
-
-Schemas:
-  - CreateOperatorSchema  → POST /operadores
-  - UpdateOperatorSchema  → PATCH /operadores/<id>
-  - CreateOperatorGroupSchema / UpdateOperatorGroupSchema → grupos (Entrega 3)
-
-Convención marshmallow del proyecto:
-  - unknown = "EXCLUDE": los campos no declarados se descartan en silencio,
-    así el payload llega limpio al service.
-  - Campos de fecha como Str (no Date) porque el frontend manda 'YYYY-MM-DD'
-    o cadena vacía; el service convierte '' → NULL. Validar el formato exacto
-    aquí sería frágil con el calendario del frontend.
-"""
-
 from marshmallow import Schema, fields, validate
 
 # ─── Operadores ───────────────────────────────────────────────────────────────
@@ -25,7 +9,6 @@ class CreateOperatorSchema(Schema):
     class Meta:
         unknown = "EXCLUDE"
 
-    id_empresa = fields.Int(load_default=None, allow_none=True)
     # nombre es el único obligatorio (coincide con NOT NULL en t_operadores).
     nombre = fields.Str(required=True, validate=validate.Length(min=1, max=200))
 
@@ -51,10 +34,6 @@ class CreateOperatorSchema(Schema):
         load_default=None, allow_none=True, validate=validate.Length(max=10)
     )
 
-    # El identificador de tarjeta RFID — el objetivo de todo el módulo.
-    rfid_tag = fields.Str(
-        load_default=None, allow_none=True, validate=validate.Length(max=50)
-    )
     erp_link = fields.Str(load_default=None, allow_none=True)
 
     # Geocerca / POI asociado al operador.
@@ -81,7 +60,6 @@ class UpdateOperatorSchema(Schema):
     class Meta:
         unknown = "EXCLUDE"
 
-    id_empresa = fields.Int(allow_none=True)
     nombre = fields.Str(validate=validate.Length(min=1, max=200))
     clave = fields.Str(allow_none=True, validate=validate.Length(max=50))
     telefono = fields.Str(allow_none=True, validate=validate.Length(max=50))
@@ -91,7 +69,6 @@ class UpdateOperatorSchema(Schema):
     vencimiento_licencia = fields.Str(allow_none=True)
     licencia = fields.Str(allow_none=True, validate=validate.Length(max=50))
     tipo_licencia = fields.Str(allow_none=True, validate=validate.Length(max=10))
-    rfid_tag = fields.Str(allow_none=True, validate=validate.Length(max=50))
     erp_link = fields.Str(allow_none=True)
     id_poi = fields.Int(allow_none=True)
     id_unidad_operador = fields.Int(allow_none=True)

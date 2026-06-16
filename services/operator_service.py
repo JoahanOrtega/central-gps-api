@@ -25,7 +25,6 @@ _UPDATABLE_OPERATOR_FIELDS = frozenset(
         "licencia",
         "tipo_licencia",
         "vencimiento_licencia",
-        "rfid_tag",
         "erp_link",
     }
 )
@@ -47,12 +46,11 @@ def _map_operator_row(row):
         "licencia": row[10],
         "tipo_licencia": row[11],
         "vencimiento_licencia": row[12].isoformat() if row[12] else None,
-        "rfid_tag": row[13],
-        "erp_link": row[14],
-        "fecha_registro": to_app_iso(row[15]) if row[15] else None,
-        "id_usuario_registro": row[16],
-        "fecha_cambio": to_app_iso(row[17]) if row[17] else None,
-        "id_usuario_cambio": row[18],
+        "erp_link": row[13],
+        "fecha_registro": to_app_iso(row[14]) if row[14] else None,
+        "id_usuario_registro": row[15],
+        "fecha_cambio": to_app_iso(row[16]) if row[16] else None,
+        "id_usuario_cambio": row[17],
     }
 
 
@@ -71,7 +69,6 @@ _OPERATOR_COLUMNS = """
     licencia,
     tipo_licencia,
     vencimiento_licencia,
-    rfid_tag,
     erp_link,
     fecha_registro,
     id_usuario_registro,
@@ -85,8 +82,7 @@ def get_operators(id_empresa, search=None):
     Lista operadores activos (status=1) de una empresa.
 
     Los operadores eliminados (soft-delete, status=0) nunca aparecen en el
-    catálogo. La búsqueda filtra por nombre, clave o rfid_tag — útil para
-    encontrar rápido a quién pertenece una tarjeta.
+    catálogo. La búsqueda filtra por nombre o clave, usando ILIKE con comodines.
     """
     connection = None
     cursor = None
@@ -106,8 +102,7 @@ def get_operators(id_empresa, search=None):
                 AND (
                     LOWER(nombre)   LIKE LOWER(%s)
                     OR LOWER(clave) LIKE LOWER(%s)
-                    OR LOWER(rfid_tag) LIKE LOWER(%s)
-                )
+                    )
             """
             like = f"%{search}%"
             params.extend([like, like, like])
@@ -181,7 +176,6 @@ def create_operator(payload, id_empresa, id_usuario_registro):
                 licencia,
                 tipo_licencia,
                 vencimiento_licencia,
-                rfid_tag,
                 erp_link,
                 fecha_registro,
                 id_usuario_registro,
@@ -203,7 +197,6 @@ def create_operator(payload, id_empresa, id_usuario_registro):
                 payload.get("licencia"),
                 payload.get("tipo_licencia"),
                 payload.get("vencimiento_licencia") or None,
-                payload.get("rfid_tag"),
                 payload.get("erp_link"),
                 id_usuario_registro,
             ),
