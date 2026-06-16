@@ -25,6 +25,7 @@ class CreateOperatorSchema(Schema):
     class Meta:
         unknown = "EXCLUDE"
 
+    id_empresa = fields.Int(load_default=None, allow_none=True)
     # nombre es el único obligatorio (coincide con NOT NULL en t_operadores).
     nombre = fields.Str(required=True, validate=validate.Length(min=1, max=200))
 
@@ -80,6 +81,7 @@ class UpdateOperatorSchema(Schema):
     class Meta:
         unknown = "EXCLUDE"
 
+    id_empresa = fields.Int(allow_none=True)
     nombre = fields.Str(validate=validate.Length(min=1, max=200))
     clave = fields.Str(allow_none=True, validate=validate.Length(max=50))
     telefono = fields.Str(allow_none=True, validate=validate.Length(max=50))
