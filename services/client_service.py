@@ -2,6 +2,7 @@ import logging
 import secrets
 from db.connection import get_db_connection, release_db_connection
 from utils.date_utils import fmt_dt
+from services.poi_service import insert_poi, update_poi_fields
 
 logger = logging.getLogger(__name__)
 
@@ -146,7 +147,19 @@ def get_client_by_id(id_cliente: int, id_empresa: int) -> dict | None:
                 c.fecha_cambio,
                 c.id_usuario_cambio,
                 p.direccion,
-                CONCAT(ROUND(p.lat::numeric, 6), ',', ROUND(p.lng::numeric, 6)) AS coordenadas
+                CASE
+                    WHEN p.lat IS NULL OR p.lng IS NULL THEN NULL
+                    ELSE CONCAT(ROUND(p.lat::numeric, 6), ',', ROUND(p.lng::numeric, 6))
+                END AS coordenadas,
+                p.tipo_poi,
+                p.lat,
+                p.lng,
+                p.radio,
+                p.bounds,
+                p.area,
+                p.polygon_path,
+                p.polygon_color,
+                p.radio_color
             FROM t_clientes c
             LEFT JOIN t_pois p ON p.id_poi = c.id_poi
             WHERE c.id_cliente = %s
@@ -158,6 +171,24 @@ def get_client_by_id(id_cliente: int, id_empresa: int) -> dict | None:
 
         if not row:
             return None
+
+        # Objeto poi completo para que el GeoFenceTab repinte la geocerca al
+        # editar (igual que en operadores). Solo se arma si el cliente tiene
+        # POI ligado (row[21]=tipo_poi presente y lat/lng no nulos).
+        poi = None
+        if row[9] is not None and row[22] is not None and row[23] is not None:
+            poi = {
+                "tipo_poi": row[21],
+                "direccion": row[19],
+                "lat": float(row[22]) if row[22] is not None else None,
+                "lng": float(row[23]) if row[23] is not None else None,
+                "radio": row[24],
+                "bounds": row[25],
+                "area": row[26],
+                "polygon_path": row[27],
+                "polygon_color": row[28],
+                "radio_color": row[29],
+            }
 
         return {
             "id_cliente": row[0],
@@ -181,6 +212,7 @@ def get_client_by_id(id_cliente: int, id_empresa: int) -> dict | None:
             "id_usuario_cambio": row[18],
             "direccion": row[19],
             "coordenadas": row[20],
+            "poi": poi,
         }
 
     finally:
@@ -240,6 +272,38 @@ def create_client(payload: dict, id_empresa: int, id_usuario: int) -> dict:
         connection = get_db_connection()
         cursor = connection.cursor()
 
+        # Domicilio (geocerca): si el payload trae un objeto "poi" con coordenadas,
+        # creamos el POI DENTRO de esta misma transacción usando insert_poi (que no
+        # hace commit propio). Así el POI y el cliente se crean atómicamente: si
+        # falla el INSERT del cliente, el rollback deshace también el POI. Si no
+        # viene "poi", se usa id_poi del payload (compatibilidad).
+        poi_data = payload.get("poi")
+        id_poi = payload.get("id_poi")
+        if (
+            poi_data
+            and poi_data.get("lat") is not None
+            and poi_data.get("lng") is not None
+        ):
+            id_poi = insert_poi(
+                cursor=cursor,
+                payload={
+                    "tipo_elemento": "cliente",
+                    "nombre": payload.get("nombre"),
+                    "direccion": poi_data.get("direccion"),
+                    "tipo_poi": poi_data.get("tipo_poi"),
+                    "lat": poi_data.get("lat"),
+                    "lng": poi_data.get("lng"),
+                    "radio": poi_data.get("radio"),
+                    "bounds": poi_data.get("bounds"),
+                    "area": poi_data.get("area"),
+                    "radio_color": poi_data.get("radio_color"),
+                    "polygon_path": poi_data.get("polygon_path"),
+                    "polygon_color": poi_data.get("polygon_color"),
+                },
+                id_empresa=id_empresa,
+                id_usuario_registro=id_usuario,
+            )
+
         cursor.execute(
             """
             INSERT INTO t_clientes (
@@ -274,7 +338,7 @@ def create_client(payload: dict, id_empresa: int, id_usuario: int) -> dict:
                 payload.get("email"),
                 payload.get("imagen"),
                 payload.get("observaciones"),
-                payload.get("id_poi"),
+                id_poi,
                 _generate_token(),
                 _generate_token(),
                 id_usuario,
@@ -355,17 +419,23 @@ def update_client(
                 set_parts.append(f"{field} = %s")
                 values.append(payload[field])
 
-    if not set_parts:
-        # No hay nada que actualizar — devuelve el estado actual sin tocar la BD
+    # Si no hay campos del cliente que actualizar Y tampoco viene un poi,
+    # no hay nada que hacer — devuelve el estado actual sin tocar la BD.
+    tiene_poi = bool(payload.get("poi"))
+    if not set_parts and not tiene_poi:
         return existing
 
-    # Siempre actualizar auditoría
-    set_parts.append("id_usuario_cambio = %s")
-    values.append(id_usuario)
-    set_parts.append("fecha_cambio = NOW()")
+    # Solo armar el SET de t_clientes si hay campos del cliente que cambiar.
+    # (Puede venir solo el poi: en ese caso set_parts queda vacío y se salta
+    # el UPDATE de t_clientes, pero sí se procesa la geocerca más abajo.)
+    if set_parts:
+        # Siempre actualizar auditoría cuando se toca el cliente
+        set_parts.append("id_usuario_cambio = %s")
+        values.append(id_usuario)
+        set_parts.append("fecha_cambio = NOW()")
 
-    # Añadir los filtros al final del params
-    values.extend([id_cliente, id_empresa])
+        # Añadir los filtros al final del params
+        values.extend([id_cliente, id_empresa])
 
     connection = None
     cursor = None
@@ -373,10 +443,59 @@ def update_client(
         connection = get_db_connection()
         cursor = connection.cursor()
 
-        cursor.execute(
-            f"UPDATE t_clientes SET {', '.join(set_parts)} WHERE id_cliente = %s AND id_empresa = %s",
-            tuple(values),
-        )
+        if set_parts:
+            cursor.execute(
+                f"UPDATE t_clientes SET {', '.join(set_parts)} WHERE id_cliente = %s AND id_empresa = %s",
+                tuple(values),
+            )
+
+        # Domicilio (geocerca): si llega el objeto "poi" con coordenadas, lo
+        # gestionamos en la misma transacción (atómico):
+        #   - Si el cliente YA tiene id_poi → UPDATE de ese POI (conserva el id).
+        #   - Si NO tiene → creamos uno nuevo y ligamos su id_poi al cliente.
+        poi_data = payload.get("poi")
+        if (
+            poi_data
+            and poi_data.get("lat") is not None
+            and poi_data.get("lng") is not None
+        ):
+            geo_payload = {
+                "tipo_poi": poi_data.get("tipo_poi"),
+                "direccion": poi_data.get("direccion"),
+                "lat": poi_data.get("lat"),
+                "lng": poi_data.get("lng"),
+                "radio": poi_data.get("radio"),
+                "bounds": poi_data.get("bounds"),
+                "area": poi_data.get("area"),
+                "radio_color": poi_data.get("radio_color"),
+                "polygon_path": poi_data.get("polygon_path"),
+                "polygon_color": poi_data.get("polygon_color"),
+            }
+            id_poi_actual = existing.get("id_poi")
+            if id_poi_actual:
+                update_poi_fields(
+                    cursor=cursor,
+                    id_poi=id_poi_actual,
+                    id_empresa=id_empresa,
+                    payload=geo_payload,
+                    id_usuario_cambio=id_usuario,
+                )
+            else:
+                nuevo_id_poi = insert_poi(
+                    cursor=cursor,
+                    payload={
+                        "tipo_elemento": "cliente",
+                        "nombre": payload.get("nombre") or existing.get("nombre"),
+                        **geo_payload,
+                    },
+                    id_empresa=id_empresa,
+                    id_usuario_registro=id_usuario,
+                )
+                cursor.execute(
+                    "UPDATE t_clientes SET id_poi = %s WHERE id_cliente = %s AND id_empresa = %s",
+                    (nuevo_id_poi, id_cliente, id_empresa),
+                )
+
         connection.commit()
 
         return get_client_by_id(id_cliente, id_empresa)
