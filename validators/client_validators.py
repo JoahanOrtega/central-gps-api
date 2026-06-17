@@ -1,6 +1,32 @@
 from marshmallow import Schema, fields, validate
 
 
+class ClientPoiSchema(Schema):
+    """
+    Geocerca (POI) del cliente — objeto anidado en el payload.
+
+    Refleja los campos que produce el GeoFenceTab del frontend. El service
+    (create_client / update_client) toma este objeto y crea o actualiza el
+    registro en t_pois dentro de la misma transacción, ligando el id_poi.
+
+    tipo_poi: 1 = circular (usa radio), 2 = poligonal (usa polygon_path/area).
+    """
+
+    class Meta:
+        unknown = "EXCLUDE"
+
+    tipo_poi = fields.Int(load_default=1, allow_none=True)
+    direccion = fields.Str(load_default=None, allow_none=True)
+    lat = fields.Float(load_default=None, allow_none=True)
+    lng = fields.Float(load_default=None, allow_none=True)
+    radio = fields.Int(load_default=None, allow_none=True)
+    bounds = fields.Str(load_default=None, allow_none=True)
+    area = fields.Str(load_default=None, allow_none=True)
+    polygon_path = fields.Str(load_default=None, allow_none=True)
+    polygon_color = fields.Str(load_default=None, allow_none=True)
+    radio_color = fields.Str(load_default=None, allow_none=True)
+
+
 class CreateClientSchema(Schema):
     """
     Valida el payload de POST /catalogs/clients.
@@ -52,6 +78,7 @@ class CreateClientSchema(Schema):
     # Relaciones
     # id_poi conecta al cliente con su ubicación geográfica (tabla t_pois)
     id_poi = fields.Int(load_default=None, allow_none=True)
+    poi = fields.Nested(ClientPoiSchema, load_default=None, allow_none=True)
 
     # imagen guarda la ruta/nombre del archivo
     imagen = fields.Str(
@@ -98,6 +125,7 @@ class UpdateClientSchema(Schema):
     email = fields.Email(load_default=None, allow_none=True)
     observaciones = fields.Str(load_default=None, allow_none=True)
     id_poi = fields.Int(load_default=None, allow_none=True)
+    poi = fields.Nested(ClientPoiSchema, load_default=None, allow_none=True)
     imagen = fields.Str(
         load_default=None,
         allow_none=True,
