@@ -1,6 +1,7 @@
 import logging
 from db.connection import get_db_connection, release_db_connection
 from services.telemetry_service import to_app_iso
+from services.poi_service import insert_poi, update_poi_fields
 
 logger = logging.getLogger(__name__)
 
@@ -12,6 +13,10 @@ logger = logging.getLogger(__name__)
 # schema marshmallow ya filtra campos no declarados, este set bloquea cualquier
 # campo nuevo hasta que se decida explícitamente que es editable. id_empresa,
 # fecha_registro e id_usuario_registro NUNCA se editan tras la creación.
+#
+# NOTA: la columna rfid_tag existe en t_operadores (heredada del esquema v2.5)
+# pero NO se gestiona desde este catálogo. El RFID se usa en el módulo de
+# aforos, no para identificar operadores. La columna se deja intacta en la BD.
 _UPDATABLE_OPERATOR_FIELDS = frozenset(
     {
         "id_poi",
@@ -82,7 +87,7 @@ def get_operators(id_empresa, search=None):
     Lista operadores activos (status=1) de una empresa.
 
     Los operadores eliminados (soft-delete, status=0) nunca aparecen en el
-    catálogo. La búsqueda filtra por nombre o clave, usando ILIKE con comodines.
+    catálogo. La búsqueda filtra por nombre o clave.
     """
     connection = None
     cursor = None
@@ -102,10 +107,10 @@ def get_operators(id_empresa, search=None):
                 AND (
                     LOWER(nombre)   LIKE LOWER(%s)
                     OR LOWER(clave) LIKE LOWER(%s)
-                    )
+                )
             """
             like = f"%{search}%"
-            params.extend([like, like, like])
+            params.extend([like, like])
         query += " ORDER BY id_operador DESC"
 
         cursor.execute(query, tuple(params))
@@ -122,6 +127,50 @@ def get_operators(id_empresa, search=None):
             cursor.close()
         if connection:
             release_db_connection(connection)
+
+
+def _attach_poi(cursor, operador):
+    """
+    Adjunta los datos de la geocerca (POI) al detalle de un operador.
+
+    Si el operador tiene id_poi, consulta t_pois y agrega un objeto "poi" con
+    los campos que el frontend necesita para repintar la geocerca en el mapa
+    (GeoFenceTab). Si no tiene domicilio, "poi" queda en None.
+
+    Solo se usa en el detalle (get_operator), no en el listado — el catálogo
+    no necesita la geometría de cada operador.
+    """
+    id_poi = operador.get("id_poi")
+    if not id_poi:
+        operador["poi"] = None
+        return
+
+    cursor.execute(
+        """
+        SELECT tipo_poi, direccion, lat, lng, radio, bounds, area,
+               polygon_path, polygon_color, radio_color
+        FROM t_pois
+        WHERE id_poi = %s AND status = 1
+        """,
+        (id_poi,),
+    )
+    row = cursor.fetchone()
+    if row is None:
+        operador["poi"] = None
+        return
+
+    operador["poi"] = {
+        "tipo_poi": row[0],
+        "direccion": row[1],
+        "lat": float(row[2]) if row[2] is not None else None,
+        "lng": float(row[3]) if row[3] is not None else None,
+        "radio": row[4],
+        "bounds": row[5],
+        "area": row[6],
+        "polygon_path": row[7],
+        "polygon_color": row[8],
+        "radio_color": row[9],
+    }
 
 
 def get_operator(id_operador, id_empresa):
@@ -146,6 +195,7 @@ def get_operator(id_operador, id_empresa):
             return None
         operador = _map_operator_row(row)
         _attach_groups(cursor, [operador])
+        _attach_poi(cursor, operador)
         return operador
     finally:
         if cursor:
@@ -161,6 +211,39 @@ def create_operator(payload, id_empresa, id_usuario_registro):
     try:
         connection = get_db_connection()
         cursor = connection.cursor()
+
+        # Domicilio (geocerca): si el payload trae un objeto "poi" con coordenadas,
+        # creamos el POI DENTRO de esta misma transacción usando insert_poi (que no
+        # hace commit propio). Así el POI y el operador se crean atómicamente: si
+        # falla el INSERT del operador, el rollback deshace también el POI — sin
+        # POIs huérfanos. El id_poi resultante se liga en la columna id_poi.
+        poi_data = payload.get("poi")
+        id_poi = payload.get("id_poi")
+        if (
+            poi_data
+            and poi_data.get("lat") is not None
+            and poi_data.get("lng") is not None
+        ):
+            id_poi = insert_poi(
+                cursor=cursor,
+                payload={
+                    "tipo_elemento": "operador",
+                    "nombre": payload.get("nombre"),
+                    "direccion": poi_data.get("direccion"),
+                    "tipo_poi": poi_data.get("tipo_poi"),
+                    "lat": poi_data.get("lat"),
+                    "lng": poi_data.get("lng"),
+                    "radio": poi_data.get("radio"),
+                    "bounds": poi_data.get("bounds"),
+                    "area": poi_data.get("area"),
+                    "radio_color": poi_data.get("radio_color"),
+                    "polygon_path": poi_data.get("polygon_path"),
+                    "polygon_color": poi_data.get("polygon_color"),
+                },
+                id_empresa=id_empresa,
+                id_usuario_registro=id_usuario_registro,
+            )
+
         cursor.execute(
             """
             INSERT INTO t_operadores (
@@ -186,7 +269,7 @@ def create_operator(payload, id_empresa, id_usuario_registro):
             """,
             (
                 id_empresa,
-                payload.get("id_poi"),
+                id_poi,
                 payload.get("id_unidad_operador"),
                 payload.get("clave"),
                 payload.get("nombre"),
@@ -237,13 +320,16 @@ def update_operator(id_operador, id_empresa, payload, id_usuario_cambio):
         connection = get_db_connection()
         cursor = connection.cursor()
 
-        # Verificar pertenencia antes de tocar nada.
+        # Verificar pertenencia antes de tocar nada. Traemos id_poi para saber
+        # si el operador ya tiene domicilio (geocerca) y decidir crear vs actualizar.
         cursor.execute(
-            "SELECT 1 FROM t_operadores WHERE id_operador = %s AND id_empresa = %s AND status = 1",
+            "SELECT id_poi FROM t_operadores WHERE id_operador = %s AND id_empresa = %s AND status = 1",
             (id_operador, id_empresa),
         )
-        if cursor.fetchone() is None:
+        row = cursor.fetchone()
+        if row is None:
             return None
+        id_poi_actual = row[0]
 
         # Construir SET dinámico solo con campos editables presentes en payload.
         fields = []
@@ -279,6 +365,59 @@ def update_operator(id_operador, id_empresa, payload, id_usuario_cambio):
                 group_ids=payload.get("id_grupo_operadores") or [],
                 replace=True,
             )
+
+        # Domicilio (geocerca): si llega el objeto "poi" con coordenadas, lo
+        # gestionamos dentro de esta misma transacción (atómico):
+        #   - Si el operador YA tiene id_poi → UPDATE de ese POI (no deja basura).
+        #   - Si NO tiene → creamos uno nuevo y ligamos su id_poi al operador.
+        poi_data = payload.get("poi")
+        if (
+            poi_data
+            and poi_data.get("lat") is not None
+            and poi_data.get("lng") is not None
+        ):
+            # Campos de geocerca comunes a crear y actualizar. NO incluimos
+            # "nombre" aquí: en el update no debe sobrescribir el nombre del POI
+            # (t_pois.nombre es NOT NULL y al editar solo el domicilio llegaría
+            # null). El nombre se fija al crear el POI.
+            geo_payload = {
+                "tipo_poi": poi_data.get("tipo_poi"),
+                "direccion": poi_data.get("direccion"),
+                "lat": poi_data.get("lat"),
+                "lng": poi_data.get("lng"),
+                "radio": poi_data.get("radio"),
+                "bounds": poi_data.get("bounds"),
+                "area": poi_data.get("area"),
+                "radio_color": poi_data.get("radio_color"),
+                "polygon_path": poi_data.get("polygon_path"),
+                "polygon_color": poi_data.get("polygon_color"),
+            }
+            if id_poi_actual:
+                # Actualiza el POI existente conservando su id_poi y su nombre.
+                update_poi_fields(
+                    cursor=cursor,
+                    id_poi=id_poi_actual,
+                    id_empresa=id_empresa,
+                    payload=geo_payload,
+                    id_usuario_cambio=id_usuario_cambio,
+                )
+            else:
+                # Crea un POI nuevo y lo liga al operador. Aquí sí ponemos nombre
+                # (el del operador) porque es un INSERT y t_pois.nombre es NOT NULL.
+                nuevo_id_poi = insert_poi(
+                    cursor=cursor,
+                    payload={
+                        "tipo_elemento": "operador",
+                        "nombre": payload.get("nombre"),
+                        **geo_payload,
+                    },
+                    id_empresa=id_empresa,
+                    id_usuario_registro=id_usuario_cambio,
+                )
+                cursor.execute(
+                    "UPDATE t_operadores SET id_poi = %s WHERE id_operador = %s AND id_empresa = %s",
+                    (nuevo_id_poi, id_operador, id_empresa),
+                )
 
         connection.commit()
         return {"id_operador": id_operador}

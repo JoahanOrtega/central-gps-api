@@ -1,6 +1,48 @@
+"""
+operator_validators.py — Schemas de validación para el catálogo de operadores.
+
+Schemas:
+  - CreateOperatorSchema  → POST /operadores
+  - UpdateOperatorSchema  → PATCH /operadores/<id>
+  - CreateOperatorGroupSchema / UpdateOperatorGroupSchema → grupos (Entrega 3)
+
+Convención marshmallow del proyecto:
+  - unknown = "EXCLUDE": los campos no declarados se descartan en silencio,
+    así el payload llega limpio al service.
+  - Campos de fecha como Str (no Date) porque el frontend manda 'YYYY-MM-DD'
+    o cadena vacía; el service convierte '' → NULL. Validar el formato exacto
+    aquí sería frágil con el calendario del frontend.
+"""
+
 from marshmallow import Schema, fields, validate
 
 # ─── Operadores ───────────────────────────────────────────────────────────────
+
+
+class OperatorPoiSchema(Schema):
+    """
+    Geocerca (POI) del domicilio del operador — objeto anidado en el payload.
+
+    Refleja los campos que produce el GeoFenceTab del frontend. El service
+    (create_operator) toma este objeto y crea el registro en t_pois dentro de
+    la misma transacción del operador, ligando el id_poi resultante.
+
+    tipo_poi: 1 = circular (usa radio), 2 = poligonal (usa polygon_path/area).
+    """
+
+    class Meta:
+        unknown = "EXCLUDE"
+
+    tipo_poi = fields.Int(load_default=1, allow_none=True)
+    direccion = fields.Str(load_default=None, allow_none=True)
+    lat = fields.Float(load_default=None, allow_none=True)
+    lng = fields.Float(load_default=None, allow_none=True)
+    radio = fields.Int(load_default=None, allow_none=True)
+    bounds = fields.Str(load_default=None, allow_none=True)
+    area = fields.Str(load_default=None, allow_none=True)
+    polygon_path = fields.Str(load_default=None, allow_none=True)
+    polygon_color = fields.Str(load_default=None, allow_none=True)
+    radio_color = fields.Str(load_default=None, allow_none=True)
 
 
 class CreateOperatorSchema(Schema):
@@ -38,6 +80,9 @@ class CreateOperatorSchema(Schema):
 
     # Geocerca / POI asociado al operador.
     id_poi = fields.Int(load_default=None, allow_none=True)
+    # Domicilio (geocerca) como objeto anidado — el service lo convierte en
+    # un registro de t_pois. Si viene, tiene prioridad sobre id_poi.
+    poi = fields.Nested(OperatorPoiSchema, load_default=None, allow_none=True)
     # Asignación a unidad (relación r_unidad_operador).
     id_unidad_operador = fields.Int(load_default=None, allow_none=True)
 
@@ -71,6 +116,7 @@ class UpdateOperatorSchema(Schema):
     tipo_licencia = fields.Str(allow_none=True, validate=validate.Length(max=10))
     erp_link = fields.Str(allow_none=True)
     id_poi = fields.Int(allow_none=True)
+    poi = fields.Nested(OperatorPoiSchema, allow_none=True)
     id_unidad_operador = fields.Int(allow_none=True)
     id_grupo_operadores = fields.List(fields.Int(strict=True))
 

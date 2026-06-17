@@ -99,73 +99,91 @@ def get_pois(id_empresa, search=None):
             release_db_connection(connection)
 
 
+def insert_poi(cursor, payload, id_empresa, id_usuario_registro):
+    """
+    Inserta un POI usando un cursor EXTERNO (no abre conexión ni hace commit).
+
+    Pensado para componerse dentro de transacciones más grandes — quien llama
+    es responsable del commit/rollback. Retorna el id_poi generado.
+
+    Para uso autónomo (abrir conexión + commit) usar create_poi().
+    """
+    query = """
+        INSERT INTO t_pois (
+            id_empresa,
+            tipo_elemento,
+            id_elemento,
+            nombre,
+            direccion,
+            tipo_poi,
+            tipo_marker,
+            url_marker,
+            marker_path,
+            marker_color,
+            icon,
+            icon_color,
+            lat,
+            lng,
+            radio,
+            bounds,
+            area,
+            radio_color,
+            polygon_path,
+            polygon_color,
+            observaciones,
+            fecha_registro,
+            id_usuario_registro
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s)
+        RETURNING id_poi
+    """
+    values = (
+        id_empresa,
+        payload.get("tipo_elemento", "poi"),
+        payload.get("id_elemento"),
+        payload.get("nombre"),
+        payload.get("direccion"),
+        payload.get("tipo_poi"),
+        payload.get("tipo_marker", 1),
+        payload.get("url_marker"),
+        payload.get("marker_path"),
+        payload.get("marker_color", "#000000"),
+        payload.get("icon"),
+        payload.get("icon_color", "#000000"),
+        payload.get("lat"),
+        payload.get("lng"),
+        payload.get("radio"),
+        payload.get("bounds"),
+        payload.get("area"),
+        payload.get("radio_color", "#000000"),
+        payload.get("polygon_path"),
+        payload.get("polygon_color", "#000000"),
+        payload.get("observaciones"),
+        id_usuario_registro,
+    )
+    cursor.execute(query, values)
+    poi_id = cursor.fetchone()[0]
+    save_poi_groups(
+        cursor=cursor,
+        id_poi=poi_id,
+        group_ids=payload.get("id_grupo_pois", []),
+    )
+    return poi_id
+
+
 def create_poi(payload, id_empresa, id_usuario_registro):
-    # payload debe contener los campos del POI, id_empresa se toma del token
+    """
+    Crea un POI de forma autónoma (abre conexión, inserta y hace commit).
+
+    Wrapper delgado sobre insert_poi() para uso directo desde el catálogo de POIs.
+    Comportamiento idéntico a la versión anterior — retorna {"id_poi": N}.
+    """
     connection = None
     cursor = None
     try:
         connection = get_db_connection()
         cursor = connection.cursor()
-        query = """
-            INSERT INTO t_pois (
-                id_empresa,
-                tipo_elemento,
-                id_elemento,
-                nombre,
-                direccion,
-                tipo_poi,
-                tipo_marker,
-                url_marker,
-                marker_path,
-                marker_color,
-                icon,
-                icon_color,
-                lat,
-                lng,
-                radio,
-                bounds,
-                area,
-                radio_color,
-                polygon_path,
-                polygon_color,
-                observaciones,
-                fecha_registro,
-                id_usuario_registro
-            )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s)
-            RETURNING id_poi
-        """
-        values = (
-            id_empresa,
-            payload.get("tipo_elemento", "poi"),
-            payload.get("id_elemento"),
-            payload.get("nombre"),
-            payload.get("direccion"),
-            payload.get("tipo_poi"),
-            payload.get("tipo_marker", 1),
-            payload.get("url_marker"),
-            payload.get("marker_path"),
-            payload.get("marker_color", "#000000"),
-            payload.get("icon"),
-            payload.get("icon_color", "#000000"),
-            payload.get("lat"),
-            payload.get("lng"),
-            payload.get("radio"),
-            payload.get("bounds"),
-            payload.get("area"),
-            payload.get("radio_color", "#000000"),
-            payload.get("polygon_path"),
-            payload.get("polygon_color", "#000000"),
-            payload.get("observaciones"),
-            id_usuario_registro,
-        )
-        cursor.execute(query, values)
-        poi_id = cursor.fetchone()[0]
-        save_poi_groups(
-            cursor=cursor,
-            id_poi=poi_id,
-            group_ids=payload.get("id_grupo_pois", []),
-        )
+        poi_id = insert_poi(cursor, payload, id_empresa, id_usuario_registro)
         connection.commit()
         return {"id_poi": poi_id}
     except Exception as e:
@@ -183,6 +201,49 @@ def create_poi(payload, id_empresa, id_usuario_registro):
             cursor.close()
         if connection:
             release_db_connection(connection)
+
+
+def update_poi_fields(cursor, id_poi, id_empresa, payload, id_usuario_cambio):
+    """
+    Actualiza los campos editables de un POI usando un cursor EXTERNO
+    (no abre conexión ni hace commit). Solo toca t_pois — no maneja grupos.
+
+    Pensado para componerse en transacciones más grandes (p. ej. el update de
+    un operador con domicilio). Quien llama es responsable del commit/rollback.
+
+    Retorna True si el POI existe en la empresa y se actualizó; False si no
+    se encontró (id_poi inválido o de otra empresa).
+    """
+    # Verificar pertenencia y estado activo antes de actualizar.
+    cursor.execute(
+        """
+        SELECT id_poi FROM t_pois
+         WHERE id_poi     = %s
+           AND id_empresa = %s
+           AND status     = 1
+        """,
+        (id_poi, id_empresa),
+    )
+    if not cursor.fetchone():
+        return False
+
+    # Filtrar solo campos editables (defensa en profundidad).
+    campos_validos = {k: v for k, v in payload.items() if k in _UPDATABLE_POI_FIELDS}
+    if not campos_validos:
+        return True  # nada que actualizar, pero el POI existe
+
+    set_clauses = [f"{k} = %s" for k in campos_validos.keys()]
+    set_clauses.append("fecha_cambio = NOW()")
+    set_clauses.append("id_usuario_cambio = %s")
+    values = list(campos_validos.values())
+    values.extend([id_usuario_cambio, id_poi, id_empresa])
+
+    cursor.execute(
+        f"UPDATE t_pois SET {', '.join(set_clauses)} "
+        f"WHERE id_poi = %s AND id_empresa = %s",
+        tuple(values),
+    )
+    return True
 
 
 # ─────────────────────────────────────────────────────────────────────────────
