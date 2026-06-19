@@ -382,7 +382,7 @@ _SQL_GPS_POR_IMEIS_TPL = """
         id_data
     FROM t_data
     WHERE imei = ANY(%(imeis)s)
-      AND fecha_hora_gps >= NOW() - INTERVAL '{max_age} minutes'
+      AND fecha_hora_gps >= (NOW() AT TIME ZONE 'America/Mexico_City') - INTERVAL '{max_age} minutes'
     ORDER BY imei, fecha_hora_gps DESC
 """
 
