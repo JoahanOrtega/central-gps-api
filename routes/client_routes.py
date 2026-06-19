@@ -7,17 +7,6 @@ from services.client_service import (
     update_client,
     delete_client,
 )
-from services.client_token_service import (
-    get_client_token_config,
-    regenerate_tracking_token,
-    update_token_config,
-)
-from services.poi_alertas_service import (
-    get_alerta_poi,
-    upsert_alerta_poi,
-    desactivar_alerta_poi,
-)
-from validators.poi_alertas_validator import UpsertAlertaPoiSchema
 from validators.client_validators import CreateClientSchema, UpdateClientSchema
 from utils.auth_guard import jwt_required, validate_empresa_access
 from utils.validation import validate_payload
@@ -366,76 +355,6 @@ def delete_alertas_cliente(id_cliente: int):
     except Exception as exc:
         logger.error(
             "Error en DELETE /catalogs/clients/%s/alertas: %s",
-            id_cliente,
-            repr(exc),
-            exc_info=True,
-        )
-        return jsonify({"error": "Error interno del servidor"}), 500
-
-
-# GET /catalogs/clients/<id>/token  - Lee la configuración de token y dashboard
-@client_bp.route("/catalogs/clients/<int:id_cliente>/token", methods=["GET"])
-@jwt_required
-def get_client_token(id_cliente: int):
-    try:
-        id_empresa, _id_usuario, error_resp = _resolve_context()
-        if error_resp:
-            return error_resp
-
-        config = get_client_token_config(id_cliente, id_empresa)
-        if config is None:
-            return jsonify({"error": "Cliente no encontrado"}), 404
-        return jsonify(config), 200
-    except Exception as exc:
-        logger.error(
-            "Error en GET /catalogs/clients/%s/token: %s",
-            id_cliente,
-            repr(exc),
-            exc_info=True,
-        )
-        return jsonify({"error": "Error interno del servidor"}), 500
-
-
-# POST /catalogs/clients/<id>/token/regenerar  - Genera/regenera el token de rastreo
-@client_bp.route("/catalogs/clients/<int:id_cliente>/token/regenerar", methods=["POST"])
-@jwt_required
-def regenerate_client_token(id_cliente: int):
-    try:
-        id_empresa, _id_usuario, error_resp = _resolve_context()
-        if error_resp:
-            return error_resp
-
-        result = regenerate_tracking_token(id_cliente, id_empresa)
-        if result is None:
-            return jsonify({"error": "Cliente no encontrado"}), 404
-        return jsonify({"message": "Token generado", **result}), 200
-    except Exception as exc:
-        logger.error(
-            "Error en POST /catalogs/clients/%s/token/regenerar: %s",
-            id_cliente,
-            repr(exc),
-            exc_info=True,
-        )
-        return jsonify({"error": "Error interno del servidor"}), 500
-
-
-# PUT /catalogs/clients/<id>/token  - Actualiza las opciones de token/dashboard
-@client_bp.route("/catalogs/clients/<int:id_cliente>/token", methods=["PUT"])
-@jwt_required
-def update_client_token(id_cliente: int):
-    try:
-        data = request.get_json(silent=True) or {}
-        id_empresa, _id_usuario, error_resp = _resolve_context(data)
-        if error_resp:
-            return error_resp
-
-        config = update_token_config(id_cliente, id_empresa, data)
-        if config is None:
-            return jsonify({"error": "Cliente no encontrado"}), 404
-        return jsonify({"message": "Configuración actualizada", **config}), 200
-    except Exception as exc:
-        logger.error(
-            "Error en PUT /catalogs/clients/%s/token: %s",
             id_cliente,
             repr(exc),
             exc_info=True,
