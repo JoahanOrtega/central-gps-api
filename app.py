@@ -4,6 +4,7 @@ import sys
 from flask import Flask, jsonify
 from flask_cors import CORS
 from flask_limiter.util import get_remote_address
+from routes.events_ws import init_ws
 from utils.limiter import limiter
 
 # ─── Configuracion de logging ─────────────────────────────────────────────────
@@ -111,6 +112,9 @@ def create_app() -> Flask:
     app.register_blueprint(itinerary_group_bp)
     app.register_blueprint(compliance_bp)
     app.register_blueprint(operator_bp)
+
+    # ── WebSocket de eventos (coexiste con el SSE /events/stream) ──────────
+    init_ws(app)
 
     # ── Manejador global de rate limit ────────────────────────────────────────
     @app.errorhandler(429)
