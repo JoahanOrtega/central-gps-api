@@ -1,5 +1,5 @@
 import logging
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, jsonify, request, send_file
 from services.unit_service import (
     get_units,
     create_unit,
@@ -7,6 +7,7 @@ from services.unit_service import (
     update_unit,
     delete_unit,
 )
+from services.unit_image_service import save_unit_image, get_unit_image_path
 from utils.auth_guard import jwt_required, permiso_required, validate_empresa_access
 from utils.validation import validate_payload
 from validators import CreateUnitSchema, UpdateUnitSchema
@@ -42,29 +43,12 @@ def list_units():
 @units_bp.route("/units", methods=["POST"])
 @permiso_required("unidades.crear")
 def create_new_unit():
-    """
-    Crea una nueva unidad.
-
-    Autorización (unidades.crear = "Crear unidades"):
-      - sudo_erp       → acceso por bypass de rol.
-      - admin_empresa  → denegado por diseño (el rol NO hereda unidades.crear).
-      - usuario        → permitido solo si el admin_empresa le asigna unidades.crear
-                         explícitamente en r_usuario_permisos.
-
-    Validación (marshmallow):
-      - numero, marca, tipo, imei, chip, fecha_instalacion: obligatorios
-      - imei: exactamente 10 dígitos numéricos
-      - odometro_inicial: >= 0
-      - fecha_instalacion: no futura
-      - tipo: valor del catálogo [1-7]
-
-    Respuesta en error de validación:
-      HTTP 422 { "error": "Datos inválidos", "fields": { "campo": ["mensaje"] } }
-    """
+    """Crea una unidad. admin_empresa no hereda unidades.crear: requiere
+    asignación explícita. Valida con CreateUnitSchema antes de tocar la BD."""
     data = request.get_json(silent=True)
 
-    # Validar antes de tocar la BD — si el payload es inválido, fallar rápido.
-    # `data` queda filtrado: solo campos declarados en CreateUnitSchema.
+    # Si el payload es inválido, fallar rápido. validate_payload deja `data`
+    # filtrado a los campos declarados en el schema.
     data, validation_error = validate_payload(CreateUnitSchema(), data)
     if validation_error:
         return validation_error
@@ -92,41 +76,15 @@ def create_new_unit():
         return jsonify({"error": "Error interno del servidor"}), 500
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Detalle y edición de una unidad
-# ═══════════════════════════════════════════════════════════════════════════
-
-
 @units_bp.route("/units/<int:id_unidad>", methods=["GET"])
 @permiso_required("unidades.editar")
 def get_unit_full_detail(id_unidad: int):
-    """
-    Devuelve el detalle completo de una unidad.
-
-    Autorización (unidades.editar = "Editar unidades"):
-      - sudo_erp       → acceso por bypass de rol. Ve TODOS los campos,
-                         incluido el equipo instalado (IMEI, chip, inputs).
-      - admin_empresa  → tiene unidades.editar por defecto (ver seed). Ve los
-                         campos operativos SIN el equipo instalado.
-      - usuario        → solo si el admin_empresa le asignó unidades.editar en
-                         r_usuario_permisos. Mismas restricciones que arriba.
-
-    Nota: usamos unidades.editar para LEER el detalle también (no solo para
-    editarlo). El listado público sigue protegido solo con jwt_required
-    (cund1 en el legacy) — este endpoint es para la pantalla de edición
-    y comparte su permiso.
-
-    Respuestas:
-      200 → { ...campos de la unidad filtrados por rol }
-      403 → sin permiso unidades.editar (lo devuelve el decorador)
-      404 → unidad no existe o pertenece a otra empresa
-    """
+    """Detalle completo de una unidad para la pantalla de edición (comparte el
+    permiso unidades.editar). Solo sudo_erp ve el equipo instalado."""
     try:
-        # Patrón: el query param ?id_empresa=X permite al sudo_erp operar
-        # sobre una empresa específica (su JWT no tiene id_empresa fijo).
-        # Para admin_empresa/usuario, validate_empresa_access confirma que
-        # el id coincide con su JWT — si intentan pasar otra empresa,
-        # responde 403.
+        # El query param ?id_empresa permite a sudo_erp (sin empresa fija en el
+        # JWT) operar sobre una específica; para los demás roles,
+        # validate_empresa_access confirma que coincida con su token.
         id_empresa = request.args.get("id_empresa", type=int) or request.user.get(
             "id_empresa"
         )
@@ -158,51 +116,18 @@ def get_unit_full_detail(id_unidad: int):
 @units_bp.route("/units/<int:id_unidad>", methods=["PATCH"])
 @permiso_required("unidades.editar")
 def patch_unit(id_unidad: int):
-    """
-    Actualiza parcialmente una unidad.
-
-    Autorización por campo:
-      - sudo_erp       → puede editar todos los campos.
-      - admin_empresa  → puede editar datos operativos (número, marca,
-                         modelo, matrícula, operador, combustible, seguro,
-                         verificación). NO puede editar equipo instalado
-                         (IMEI, chip, modelo AVL, inputs/outputs, fecha
-                         instalación). El servicio rechaza con 403.
-      - usuario        → mismas reglas que admin_empresa (si tiene el
-                         permiso asignado).
-
-    Validación:
-      - Schema UpdateUnitSchema: valida formato de los campos presentes.
-        Todos opcionales — se actualiza solo lo que viene en el body.
-
-    Respuestas:
-      200 → { "message": "...", "actualizado": true }
-      403 → { "code": "FIELDS_NOT_ALLOWED", "message": "..." } (servicio)
-      404 → { "code": "UNIT_NOT_FOUND", "message": "..." }
-      422 → errores de validación de schema
-    """
+    """Actualiza parcialmente una unidad. El servicio rechaza con 403 si un rol
+    sin permiso técnico intenta tocar el equipo instalado (IMEI, chip, etc.)."""
     data = request.get_json(silent=True)
 
-    # Validar formato antes de ir a la BD.
-    # `data` queda filtrado: solo campos declarados en UpdateUnitSchema,
-    # incluido id_empresa como campo de contexto. Cualquier otro campo
-    # que el cliente intente enviar (status, id_rol, etc.) se descarta.
     data, validation_error = validate_payload(UpdateUnitSchema(), data)
     if validation_error:
         return validation_error
 
     try:
-        # id_empresa es un campo de CONTEXTO, no de actualización. Lo
-        # separamos del payload antes de pasarlo al service para que no
-        # termine en el UPDATE SQL (cambiar la empresa de una unidad no
-        # es una operación permitida).
-        #
-        # Fuentes en orden de prioridad:
-        #   1. Query param ?id_empresa=X  (estándar REST para contexto)
-        #   2. Body (compatibilidad con clientes que lo envían dentro del JSON)
-        #   3. JWT (admin_empresa/usuario tienen empresa fija en el token)
-        #
-        # dict.pop() remueve y retorna — si no existe, retorna el default.
+        # id_empresa es contexto, no un campo a actualizar: lo sacamos del body
+        # para que no termine en el UPDATE (cambiar la empresa de una unidad no
+        # está permitido). Prioridad: query param > body > JWT.
         id_empresa_body = data.pop("id_empresa", None)
         id_empresa = (
             request.args.get("id_empresa", type=int)
@@ -218,9 +143,8 @@ def patch_unit(id_unidad: int):
         if not validate_empresa_access(id_empresa, request.user):
             return jsonify({"error": "Acceso no autorizado a esta empresa"}), 403
 
-        # Tras sacar id_empresa, el body podría quedar vacío (ej: cliente
-        # que solo quería hacer "switch de contexto"). Es un no-op desde
-        # la perspectiva del UPDATE — devolvemos un 400 claro.
+        # Tras quitar id_empresa el body puede quedar vacío (solo cambio de
+        # contexto): es un no-op para el UPDATE.
         if not data:
             return jsonify({"error": "No hay campos para actualizar"}), 400
 
@@ -264,34 +188,8 @@ def patch_unit(id_unidad: int):
 @units_bp.route("/units/<int:id_unidad>", methods=["DELETE"])
 @permiso_required("unidades.eliminar")
 def remove_unit(id_unidad: int):
-    """
-    Elimina (soft-delete) una unidad.
-
-    Autorización:
-      - sudo_erp: permiso bypass.
-      - admin_empresa: permiso heredado del rol si está activo.
-      - usuario: solo si tiene 'unidades.eliminar' asignado vía
-        r_usuario_permisos.
-
-    El frontend debe ocultar el botón "Eliminar" si el usuario no tiene
-    el permiso — esto es solo UX. Si el botón se muestra erróneamente
-    y se hace click, el backend rechaza con 403.
-
-    Por qué soft-delete:
-      Mantener el registro permite:
-        1. Auditoría histórica (qué unidad ejecutó qué viaje, etc.).
-        2. Restauración futura sin re-ingresar IMEI, chip, vel_max...
-        3. Consistencia con el patrón del resto de tablas del sistema.
-
-    Respuestas:
-      200 → { "message": "...", "eliminado": true, "id_unidad": N }
-      403 → empresa no autorizada para el usuario
-      404 → { "code": "UNIT_NOT_FOUND", "message": "..." }
-
-    No usa request body — el id viene en la URL y el id_empresa del JWT
-    o query param. Esto sigue la convención REST: DELETE no debería
-    requerir body.
-    """
+    """Soft-delete de una unidad. Se conserva el registro para auditoría
+    histórica y posible restauración sin re-ingresar IMEI, chip, etc."""
     try:
         id_empresa = request.args.get("id_empresa", type=int) or request.user.get(
             "id_empresa"
@@ -333,5 +231,47 @@ def remove_unit(id_unidad: int):
             id_unidad,
             repr(exc),
             exc_info=True,
+        )
+        return jsonify({"error": "Error interno del servidor"}), 500
+
+
+@units_bp.route("/units/upload-image", methods=["POST"])
+@permiso_required("unidades.editar")
+def upload_unit_image():
+    """Recibe una imagen por multipart/form-data, la guarda en el volumen y
+    devuelve su ruta pública para guardarla en el campo imagen de la unidad."""
+    try:
+        file = request.files.get("file")
+        result, error = save_unit_image(file)
+
+        if error:
+            status = {
+                "NO_FILE": 400,
+                "INVALID_TYPE": 400,
+                "TOO_LARGE": 413,
+            }.get(error["code"], 500)
+            return jsonify(error), status
+
+        return jsonify(result), 201
+
+    except Exception as exc:
+        logger.error("Error en POST /units/upload-image: %s", repr(exc), exc_info=True)
+        return jsonify({"error": "Error interno del servidor"}), 500
+
+
+@units_bp.route("/units/images/<nombre>", methods=["GET"])
+def serve_unit_image(nombre):
+    """Sirve una imagen del volumen. Sin auth de empresa: una imagen de unidad
+    no es dato sensible y simplifica el <img src>."""
+    try:
+        ruta = get_unit_image_path(nombre)
+        if not ruta:
+            return jsonify({"error": "Imagen no encontrada"}), 404
+
+        return send_file(ruta)
+
+    except Exception as exc:
+        logger.error(
+            "Error en GET /units/images/%s: %s", nombre, repr(exc), exc_info=True
         )
         return jsonify({"error": "Error interno del servidor"}), 500
