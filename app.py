@@ -40,6 +40,7 @@ from routes.itinerary_routes import itinerary_bp
 from routes.itinerary_group_routes import itinerary_group_bp
 from routes.compliance_routes import compliance_bp
 from routes.operator_routes import operator_bp
+from routes.public_track_routes import public_track_bp
 
 logger = logging.getLogger(__name__)
 
@@ -112,7 +113,7 @@ def create_app() -> Flask:
     app.register_blueprint(itinerary_group_bp)
     app.register_blueprint(compliance_bp)
     app.register_blueprint(operator_bp)
-
+    app.register_blueprint(public_track_bp)
     # ── WebSocket de eventos (coexiste con el SSE /events/stream) ──────────
     init_ws(app)
 

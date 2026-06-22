@@ -7,6 +7,11 @@ from services.unit_service import (
     update_unit,
     delete_unit,
 )
+from services.unit_token_service import (
+    get_unit_token_config,
+    regenerate_tracking_token,
+    revoke_tracking_token,
+)
 from services.unit_image_service import save_unit_image, get_unit_image_path
 from utils.auth_guard import jwt_required, permiso_required, validate_empresa_access
 from utils.validation import validate_payload
@@ -273,5 +278,80 @@ def serve_unit_image(nombre):
     except Exception as exc:
         logger.error(
             "Error en GET /units/images/%s: %s", nombre, repr(exc), exc_info=True
+        )
+        return jsonify({"error": "Error interno del servidor"}), 500
+
+# ─── Token de rastreo de unidad ──────────────────────────────────────────────
+# Mismo patrón que el token de cliente (client_routes.py). El enlace público
+# generado aquí lo consume el blueprint público_track_routes SIN autenticación.
+
+
+def _resolve_empresa_token() -> int | None:
+    """Resuelve la empresa para los endpoints de token. Prioridad: query > JWT."""
+    return request.args.get("id_empresa", type=int) or request.user.get("id_empresa")
+
+
+@units_bp.route("/units/<int:id_unidad>/token", methods=["GET"])
+@jwt_required
+def get_unit_token(id_unidad: int):
+    """Lee la configuración del token de rastreo de la unidad."""
+    try:
+        id_empresa = _resolve_empresa_token()
+        if not id_empresa:
+            return jsonify({"error": "Empresa no definida"}), 400
+
+        config = get_unit_token_config(id_unidad, id_empresa)
+        if config is None:
+            return jsonify({"error": "Unidad no encontrada"}), 404
+        return jsonify(config), 200
+    except Exception as exc:
+        logger.error(
+            "Error en GET /units/%s/token: %s", id_unidad, repr(exc), exc_info=True
+        )
+        return jsonify({"error": "Error interno del servidor"}), 500
+
+
+@units_bp.route("/units/<int:id_unidad>/token/regenerar", methods=["POST"])
+@permiso_required("unidades.editar")
+def regenerate_unit_token(id_unidad: int):
+    """Genera (o regenera) el token de rastreo y activa el acceso público."""
+    try:
+        id_empresa = _resolve_empresa_token()
+        if not id_empresa:
+            return jsonify({"error": "Empresa no definida"}), 400
+
+        result = regenerate_tracking_token(id_unidad, id_empresa)
+        if result is None:
+            return jsonify({"error": "Unidad no encontrada"}), 404
+        return jsonify({"message": "Token generado", **result}), 200
+    except Exception as exc:
+        logger.error(
+            "Error en POST /units/%s/token/regenerar: %s",
+            id_unidad,
+            repr(exc),
+            exc_info=True,
+        )
+        return jsonify({"error": "Error interno del servidor"}), 500
+
+
+@units_bp.route("/units/<int:id_unidad>/token", methods=["DELETE"])
+@permiso_required("unidades.editar")
+def delete_unit_token(id_unidad: int):
+    """Revoca el token: el enlace público deja de funcionar de inmediato."""
+    try:
+        id_empresa = _resolve_empresa_token()
+        if not id_empresa:
+            return jsonify({"error": "Empresa no definida"}), 400
+
+        ok = revoke_tracking_token(id_unidad, id_empresa)
+        if not ok:
+            return jsonify({"error": "Unidad no encontrada"}), 404
+        return jsonify({"message": "Token revocado"}), 200
+    except Exception as exc:
+        logger.error(
+            "Error en DELETE /units/%s/token: %s",
+            id_unidad,
+            repr(exc),
+            exc_info=True,
         )
         return jsonify({"error": "Error interno del servidor"}), 500
