@@ -171,14 +171,18 @@ def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 _RFID_VACIOS = {"", "0", "null", "000000000"}
 
 
-def _extraer_rfid(rfid_col, data_col, atributos_col):
+def _extraer_rfid(rfid_col, data_col):
     """
     Extrae el identificador de tarjeta RFID de un punto de t_data,
-    probando en orden de prioridad los tres lugares donde puede llegar:
+    probando en orden de prioridad los lugares donde la oreja deja una
+    lectura real de tarjeta:
       1. Columna rfid   — la oreja ya lo dejó normalizado (caso ideal v3.0).
-      2. Campo data     — TRIM(data), como lo leía el v2.5 (la mayoría de unidades).
-      3. JSON atributos — M_ASSIGN1 / S_ASSIGN1 del ASSIGN_MAP Suntech
-                          (unidades que solo reportan la tarjeta aquí).
+      2. Campo data     — TRIM(data), donde hoy llegan las lecturas reales
+                          de las unidades con lector físico (p.ej. la 04).
+    NO se lee de atributos (M_ASSIGN1 / S_ASSIGN1): ese slot acarrea
+    telemetría cruda del GPS en unidades SIN lector (un contador creciente,
+    no una tarjeta), y tratarlo como RFID llenaba el recorrido de lecturas
+    fantasma. Mientras la oreja no lo normalice a rfid, no es una fuente fiable.
     Retorna el ID como string, o None si el punto no trae lectura válida.
     """
     if isinstance(rfid_col, str):
@@ -190,20 +194,6 @@ def _extraer_rfid(rfid_col, data_col, atributos_col):
         v = data_col.strip()
         if v and v.lower() not in _RFID_VACIOS:
             return v
-
-    if atributos_col:
-        try:
-            attrs = (
-                atributos_col
-                if isinstance(atributos_col, dict)
-                else json.loads(atributos_col)
-            )
-            for slot in ("M_ASSIGN1", "S_ASSIGN1"):
-                v = str(attrs.get(slot, "")).strip()
-                if v and v.lower() not in _RFID_VACIOS:
-                    return v
-        except (json.JSONDecodeError, TypeError, AttributeError):
-            pass
 
     return None
 
@@ -236,14 +226,13 @@ def map_route_row(row: tuple, vel_max: float = 0.0) -> dict[str, Any]:
     status = (row[5] or "").strip() if row[5] is not None else None
     tipo_alerta = row[6] if len(row) > 6 else None
 
-    # RFID: la oreja lo extrae del campo DATA o de un slot ASSIGN renombrado.
-    # Viene como string hex (8-20 chars) o vacío/NULL si el punto no trae
+    # RFID: solo desde la columna rfid o el campo data (donde llega la
+    # lectura real). Viene como string o vacío/NULL si el punto no trae
     # lectura. Normalizamos vacío → None para que el frontend pueda filtrar
     # con un simple truthy check.
     rfid = _extraer_rfid(
         row[8] if len(row) > 8 else None,  # columna rfid
         row[9] if len(row) > 9 else None,  # campo data
-        row[10] if len(row) > 10 else None,  # atributos JSON
     )
 
     engine_state = resolve_engine_state(tipo_alerta, status)
@@ -323,8 +312,7 @@ _ROUTE_QUERY = """
         tipo_alerta,
         odometro,
         rfid,
-        data,
-        atributos
+        data
     FROM public.t_data
     WHERE imei = %s
       AND fecha_hora_gps >= %s
@@ -639,7 +627,7 @@ def _get_latest_trip(imei: str, vel_max: float = 0.0) -> list[dict[str, Any]]:
             cursor.execute(
                 """
                 SELECT fecha_hora_gps, latitud, longitud, velocidad,
-                    grados, status, tipo_alerta, odometro, rfid, data, atributos
+                    grados, status, tipo_alerta, odometro, rfid, data
                 FROM public.t_data
                 WHERE imei = %s
                   AND fecha_hora_gps > %s

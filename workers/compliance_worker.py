@@ -78,7 +78,10 @@ logger = logging.getLogger("compliance_worker")
 # ── Query de pings ────────────────────────────────────────────────────────────
 
 # Lee los pings de t_data de la BD remota para los IMEIs activos.
-# Solo pings con FIX=1 (señal GPS válida) — mismo criterio que telemetry_service.
+# Excluye solo los puntos con FIX='0' explícito (sin señal GPS); FIX NULL,
+# ausente o atributos no-JSON se incluyen. Mismo criterio de fondo que
+# telemetry_service (IS DISTINCT FROM '0'), pero más defensivo: cubre el NULL
+# y el atributos no parseable por separado antes de castear a jsonb.
 _QUERY_PINGS = """
     SELECT
         imei,
