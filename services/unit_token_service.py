@@ -240,7 +240,8 @@ def get_unit_by_token(token: str) -> dict | None:
                 u.marca,
                 u.modelo,
                 u.imei,
-                t.fecha_expiracion
+                t.fecha_expiracion,
+                u.vel_max
             FROM t_unidades_token t
             JOIN t_unidades u ON u.id_unidad = t.id_unidad
             WHERE t.token = %s
@@ -268,6 +269,7 @@ def get_unit_by_token(token: str) -> dict | None:
             "marca": row[2],
             "modelo": row[3],
             "imei": str(row[4]).strip() if row[4] else None,
+            "vel_max": row[6],
         }
     finally:
         if cursor:

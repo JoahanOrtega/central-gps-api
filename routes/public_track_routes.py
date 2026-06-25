@@ -46,6 +46,7 @@ def track_unit_by_token(token: str):
                         "numero": unidad["numero"],
                         "marca": unidad["marca"],
                         "modelo": unidad["modelo"],
+                        "vel_max": unidad["vel_max"],
                     },
                     "posicion": posicion,
                 }
