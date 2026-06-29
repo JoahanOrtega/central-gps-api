@@ -209,3 +209,31 @@ def validate_empresa_access(id_empresa_solicitada: int, user_payload: dict) -> b
     # Otros roles solo pueden operar en su propia empresa del JWT
     empresa_del_token = user_payload.get("id_empresa")
     return empresa_del_token == id_empresa_solicitada
+
+
+def user_has_permission(user: dict, clave_permiso: str) -> bool:
+    """Indica si un usuario (dict del JWT) tiene un permiso dado.
+
+    Misma lógica que el decorador permiso_required pero como función suelta,
+    para usarla en servicios/rutas donde el chequeo no es de acceso al endpoint
+    sino de una sub-acción (ej. permitir cambiar el login dentro de un update
+    que ya pasó su propia autorización).
+
+    sudo_erp y wildcard "*" siempre dan True.
+    """
+    if not user:
+        return False
+    if user.get("rol") == "sudo_erp":
+        return True
+
+    permisos_raw = user.get("permisos")
+    if permisos_raw == "*":
+        return True
+    if isinstance(permisos_raw, list):
+        permisos_lista = permisos_raw
+    elif isinstance(permisos_raw, str):
+        permisos_lista = [p.strip() for p in permisos_raw.split(",") if p.strip()]
+    else:
+        permisos_lista = []
+
+    return clave_permiso in permisos_lista

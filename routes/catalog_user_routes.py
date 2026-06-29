@@ -40,7 +40,7 @@ from services.user_service import (
     update_user,
     inhabilitar_user,
 )
-from utils.auth_guard import permiso_required
+from utils.auth_guard import permiso_required, user_has_permission
 from utils.validation import validate_payload
 from validators import (
     CreateUserSchema,
@@ -273,12 +273,16 @@ def update_user_endpoint(id_usuario: int):
 
     try:
         id_usuario_cambio = int(request.user["sub"])
+        # Cambiar el usuario/email (login) requiere permiso específico. sudo_erp
+        # lo tiene por bypass; cualquier otro rol necesita "usuarios.editar".
+        puede_editar_login = user_has_permission(request.user, "usuarios.editar")
 
         result, error = update_user(
             id_usuario=id_usuario,
             id_empresa=id_empresa,
             payload=data,
             id_usuario_cambio=id_usuario_cambio,
+            puede_editar_login=puede_editar_login,
         )
 
         if error:
