@@ -399,6 +399,8 @@ def get_latest_positions_by_imeis(imeis: list[str]) -> list[dict[str, Any]]:
         )
         rows = cursor.fetchall()
 
+    last_moving_positions = _fetch_last_moving_positions_by_imeis(filtered)
+
     # ── Query 2: batch de "último cambio de estado" por IMEI ─────────────
     state_change_map = _fetch_last_state_change_by_imeis(filtered)
     now = now_utc()
@@ -409,6 +411,13 @@ def get_latest_positions_by_imeis(imeis: list[str]) -> list[dict[str, Any]]:
         status = (row[6] or "").strip() if row[6] is not None else None
         tipo_alerta = row[10]
         imei = row[0]
+        engine_state = resolve_engine_state(tipo_alerta, status)
+
+        display_position = (
+            last_moving_positions.get(imei) if engine_state == "off" else None
+        )
+        display_latitude = display_position[0] if display_position else row[2]
+        display_longitude = display_position[1] if display_position else row[3]
 
         # Tiempo acumulado en estado actual (segundos desde el último
         # evento tipo_alerta ∈ {33, 34}). None si la unidad nunca ha
@@ -423,8 +432,14 @@ def get_latest_positions_by_imeis(imeis: list[str]) -> list[dict[str, Any]]:
             {
                 "imei": imei,
                 "fecha_hora_gps": to_app_iso(row[1]),
-                "latitud": float(row[2]) if row[2] is not None else None,
-                "longitud": float(row[3]) if row[3] is not None else None,
+                "latitud": (
+                    float(display_latitude) if display_latitude is not None else None
+                ),
+                "longitud": (
+                    float(display_longitude)
+                    if display_longitude is not None
+                    else None
+                ),
                 "velocidad": float(row[4]) if row[4] is not None else None,
                 "grados": float(row[5]) if row[5] is not None else None,
                 "status": status,
@@ -432,11 +447,48 @@ def get_latest_positions_by_imeis(imeis: list[str]) -> list[dict[str, Any]]:
                 "voltaje_bateria": float(row[8]) if row[8] is not None else None,
                 "odometro": row[9],
                 "tipo_alerta": tipo_alerta,
-                "engine_state": resolve_engine_state(tipo_alerta, status),
+                "engine_state": engine_state,
                 "segundos_en_estado_actual": seconds_in_state,
             }
         )
     return result
+
+
+def _fetch_last_moving_positions_by_imeis(
+    imeis: list[str],
+) -> dict[str, tuple[Any, Any]]:
+    """
+    Devuelve la última posición con movimiento confiable del viaje actual.
+    """
+    if not imeis:
+        return {}
+
+    with telemetry_cursor() as cursor:
+        cursor.execute(
+            """
+            WITH last_ignition AS (
+                SELECT DISTINCT ON (imei)
+                    imei, fecha_hora_gps
+                FROM public.t_data
+                WHERE imei = ANY(%s::varchar[])
+                  AND tipo_alerta = %s
+                  AND fecha_hora_gps IS NOT NULL
+                ORDER BY imei, fecha_hora_gps DESC
+            )
+            SELECT DISTINCT ON (d.imei)
+                d.imei, d.latitud, d.longitud
+            FROM public.t_data d
+            LEFT JOIN last_ignition li ON li.imei = d.imei
+            WHERE d.imei = ANY(%s::varchar[])
+              AND d.velocidad >= 3
+              AND d.latitud IS NOT NULL
+              AND d.longitud IS NOT NULL
+              AND (li.fecha_hora_gps IS NULL OR d.fecha_hora_gps >= li.fecha_hora_gps)
+            ORDER BY d.imei, d.fecha_hora_gps DESC
+            """,
+            (imeis, TIPO_ALERTA_ENCENDIDO, imeis),
+        )
+        return {row[0]: (row[1], row[2]) for row in cursor.fetchall()}
 
 
 def _fetch_last_state_change_by_imeis(imeis: list[str]) -> dict[str, datetime]:
