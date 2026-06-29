@@ -309,6 +309,7 @@ def update_user(
     id_empresa: int,
     payload: dict,
     id_usuario_cambio: int,
+    puede_editar_login: bool = False,
 ):
     """
     Actualiza parcialmente un usuario.
@@ -429,12 +430,31 @@ def update_user(
                 values.append(perfil)
 
             elif field == "email":
-                # En este sistema "usuario" funciona como email login.
-                # NO se actualiza el "usuario" porque es identificador inmutable.
-                # Si el cliente manda email, lo persistimos en telefono o lo
-                # ignoramos. Por simplicidad lo ignoramos — no hay columna
-                # email separada en t_usuarios (decisión del legacy).
-                continue
+                # El "usuario" funciona como email login. Es
+                # inmutable salvo que quien edita tenga permiso para cambiarlo
+                # (usuarios.editar; sudo_erp por bypass). Antes
+                # de aplicar, verificamos que el nuevo valor no choque con otro
+                # login existente.
+                if not puede_editar_login:
+                    continue
+
+                nuevo_usuario = (value or "").strip()
+                if not nuevo_usuario:
+                    continue
+
+                cursor.execute(
+                    "SELECT id FROM t_usuarios WHERE usuario = %s AND id != %s",
+                    (nuevo_usuario, id_usuario),
+                )
+                if cursor.fetchone() is not None:
+                    conn.rollback()
+                    return None, {
+                        "code": "USERNAME_TAKEN",
+                        "message": "Ya existe un usuario con ese correo/login.",
+                    }
+
+                set_clauses.append("usuario = %s")
+                values.append(nuevo_usuario)
 
             else:
                 set_clauses.append(f"{field} = %s")
