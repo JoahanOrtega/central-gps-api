@@ -1,52 +1,39 @@
 import logging
+import os
+
 import psycopg2
 from psycopg2 import pool as pg_pool
+
 from config import Config
 
 logger = logging.getLogger(__name__)
 
-# ── Tamaños del pool ───────────────────────────────────────────────────────────
-# Constantes SEPARADAS por tipo de BD porque tienen restricciones distintas:
-#
-#   BD principal (local, contenedor o instalación dedicada):
-#     - Recursos exclusivos para esta app
-#     - Pool grande está OK — escalas hasta el max_connections del PG local
-#     - Default Postgres: max_connections=100
-#     - Regla: maxconn ≤ max_connections / num_workers (con -w 4 → 25/worker)
-#
-#   BD telemetría (servidor REMOTO compartido — 136.119.58.28):
-#     - Otros clientes/servicios usan el mismo Postgres
-#     - max_connections del servidor está limitado y compartido
-#     - Pool conservador para no saturar al resto
-#     - Si vemos errores "too many clients already", bajar más aún
-#
-# Si alguna vez en producción necesitamos más, hay que coordinar con el
-# admin del server remoto; nunca subir a ciegas.
 
-# Pool de BD principal — recursos locales, generoso por default.
-_POOL_MIN_MAIN = 2
-_POOL_MAX_MAIN = 20
+# Pool de BD principal — recursos locales, generoso.
+_POOL_MIN_MAIN = int(os.getenv("MAIN_POOL_MIN", "2"))
+_POOL_MAX_MAIN = int(os.getenv("MAIN_POOL_MAX", "20"))
 
-# Pool de BD telemetría — servidor remoto compartido, conservador.
-# Valores reducidos para dev por la cantidad de rebuilds del backend que
-# pueden dejar conexiones zombi temporalmente del lado del server.
-_POOL_MIN_TELEMETRY = 1
-_POOL_MAX_TELEMETRY = 8
+# Pool de BD de telemetría — recursos remotos, escaso.
+_POOL_MIN_TELEMETRY = int(os.getenv("TELEMETRY_POOL_MIN", "4"))
+_POOL_MAX_TELEMETRY = int(os.getenv("TELEMETRY_POOL_MAX", "12"))
 
-# Parámetros TCP keepalive
-# Cuando la app está en stand-by, PostgreSQL puede cerrar las conexiones
-# inactivas por timeout. Con keepalive, el SO envía paquetes periódicos para
-# mantener la conexión viva y detectar fallos antes de que el pool la use.
-#
-#   keepalives_idle    → segundos de inactividad antes del primer keepalive
-#   keepalives_interval → segundos entre reintentos si no hay respuesta
-#   keepalives_count   → intentos antes de declarar la conexión muerta
-_KEEPALIVE_KWARGS = {
+# Timeout de las queries en milisegundos. Se pasa al servidor remoto al abrir la conexión.
+_STATEMENT_TIMEOUT_MS = int(os.getenv("DB_STATEMENT_TIMEOUT_MS", "25000"))
+
+_COMMON_KWARGS = {
+    "connect_timeout": 10,
     "keepalives": 1,
-    "keepalives_idle": 60,  # primer ping tras 60s inactiva
-    "keepalives_interval": 10,  # reintento cada 10s
-    "keepalives_count": 5,  # 5 intentos antes de cerrar
+    "keepalives_idle": 60,
+    "keepalives_interval": 10,
+    "keepalives_count": 5,
+    # -c pasa opciones de sesión al servidor al abrir la conexión.
+    "options": f"-c statement_timeout={_STATEMENT_TIMEOUT_MS}",
 }
+
+# Cuántas veces intentamos conseguir una conexión VIVA del pool antes de
+# rendirnos. Cubre el caso de varias conexiones muertas seguidas (server
+# remoto que reinició, red intermitente) sin recrear el pool entero.
+_GET_CONN_MAX_RETRIES = 3
 
 
 def _make_main_pool():
@@ -58,8 +45,7 @@ def _make_main_pool():
         user=Config.DB_USER,
         password=Config.DB_PASSWORD,
         port=Config.DB_PORT,
-        connect_timeout=10,
-        **_KEEPALIVE_KWARGS,
+        **_COMMON_KWARGS,
     )
 
 
@@ -72,12 +58,11 @@ def _make_telemetry_pool():
         user=Config.TELEMETRY_DB_USER,
         password=Config.TELEMETRY_DB_PASSWORD,
         port=Config.TELEMETRY_DB_PORT,
-        connect_timeout=10,
-        **_KEEPALIVE_KWARGS,
+        **_COMMON_KWARGS,
     )
 
 
-# Pool de la base de datos principal
+# Inicialización de los pools
 try:
     _main_pool = _make_main_pool()
     logger.info(
@@ -90,7 +75,6 @@ except Exception as exc:
     logger.critical("No se pudo crear el pool de BD principal: %s", repr(exc))
     raise
 
-# Pool de la base de datos de telemetría
 try:
     _telemetry_pool = _make_telemetry_pool()
     logger.info(
@@ -102,96 +86,99 @@ try:
 except Exception as exc:
     _telemetry_pool = None
     logger.warning(
-        "Pool BD telemetría NO disponible: %s — "
-        "la API arranca sin telemetría. Los endpoints de mapa/posiciones "
-        "devolverán error hasta que el servidor remoto sea accesible.",
+        "Pool BD telemetría NO disponible: %s — la API arranca sin telemetría. "
+        "Los endpoints de mapa/posiciones devolverán error hasta que el "
+        "servidor remoto sea accesible.",
         repr(exc),
     )
 
 
 def _is_connection_alive(conn) -> bool:
     """
-    Verifica si una conexión sigue activa enviando una query ligera.
-    Retorna False si la conexión está cerrada o en estado de error.
+    Verifica que una conexión siga viva con una query mínima.
+
+    Usa un cursor propio y lo cierra siempre (context manager), para no dejar
+    cursores colgando durante la validación. Devuelve False si la conexión
+    está cerrada o en estado de error.
     """
     try:
-        conn.cursor().execute("SELECT 1")
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
         return True
     except Exception:
         return False
 
 
-def _get_conn_with_retry(pool, make_pool_fn, pool_attr: str):
+def _get_conn_with_retry(pool):
     """
-    Obtiene una conexión del pool validando que esté viva.
-    Si está muerta (OperationalError por timeout de servidor):
-      1. La descarta del pool
-      2. Recrea el pool completo
-      3. Retorna una conexión nueva
-
-    pool_attr: nombre del atributo global (_main_pool o _telemetry_pool)
+    Obtiene una conexión viva del pool indicado, reintentando si es necesario.
     """
-    global _main_pool, _telemetry_pool
+    if pool is None:
+        raise ConnectionError("El pool solicitado no está disponible.")
 
-    conn = pool.getconn()
+    ultimo_error = None
 
-    # Verificar si la conexión sigue viva
-    if not _is_connection_alive(conn):
-        logger.warning("Conexión muerta detectada en el pool — recreando pool...")
+    for intento in range(1, _GET_CONN_MAX_RETRIES + 1):
+        conn = pool.getconn()
+
+        if _is_connection_alive(conn):
+            return conn
+
+        # Conexión muerta: la cerramos y la sacamos del pool (no la
+        # reutilizamos). El pool abrirá una nueva la próxima vez que se pida.
+        logger.warning(
+            "Conexión muerta descartada del pool (intento %s/%s).",
+            intento,
+            _GET_CONN_MAX_RETRIES,
+        )
         try:
             pool.putconn(conn, close=True)
-        except Exception:
-            pass
+        except Exception as exc:
+            ultimo_error = exc
 
-        # Recrear el pool completo
-        new_pool = make_pool_fn()
-        if pool_attr == "main":
-            _main_pool = new_pool
-        else:
-            _telemetry_pool = new_pool
-
-        conn = new_pool.getconn()
-
-    return conn
+    # Si tras varios intentos no conseguimos una conexión viva, algo mayor
+    # falla (server caído). Fallar con un error claro es mejor que devolver
+    # una conexión rota que reventará más adelante de forma confusa.
+    raise ConnectionError(
+        "No se pudo obtener una conexión viva tras "
+        f"{_GET_CONN_MAX_RETRIES} intentos. Último error: {ultimo_error!r}"
+    )
 
 
+# BD principal
 def get_db_connection():
     """
-    Obtiene una conexión del pool de BD principal.
-    Valida automáticamente que la conexión esté viva — si no lo está,
-    recrea el pool y retorna una conexión nueva.
+    Obtiene una conexión VIVA del pool de BD principal.
 
-    IMPORTANTE: siempre devolver con release_db_connection() en un finally.
+    IMPORTANTE: devolver SIEMPRE con release_db_connection() en un finally,
+    incluso si hubo excepción — si no, la conexión se fuga del pool.
     """
-    return _get_conn_with_retry(_main_pool, _make_main_pool, "main")
+    return _get_conn_with_retry(_main_pool)
 
 
 def release_db_connection(conn) -> None:
-    """
-    Devuelve una conexión al pool de BD principal.
-    Llamar siempre en el bloque finally del código que llamó get_db_connection().
-    """
+    """Devuelve una conexión al pool de BD principal. Llamar en el finally."""
     if conn:
         _main_pool.putconn(conn)
 
 
+# BD telemetría
 def get_db_telemetry_connection():
     """
-    Obtiene una conexión del pool de BD de telemetría.
-    Si la telemetría no está disponible (pool es None), lanza un error
-    descriptivo en lugar de tumbar la API.
+    Obtiene una conexión VIVA del pool de telemetría.
+
+    Si la telemetría no está disponible (pool None por fallo al iniciar),
+    lanza un error descriptivo en vez de tumbar la API.
     """
     if _telemetry_pool is None:
         raise ConnectionError(
             "La BD de telemetría no está disponible. "
             "El servidor remoto no respondió al iniciar la API."
         )
-    return _get_conn_with_retry(_telemetry_pool, _make_telemetry_pool, "telemetry")
+    return _get_conn_with_retry(_telemetry_pool)
 
 
 def release_db_telemetry_connection(conn) -> None:
-    """
-    Devuelve una conexión al pool de BD de telemetría.
-    """
+    """Devuelve una conexión al pool de telemetría. Llamar en el finally."""
     if conn and _telemetry_pool is not None:
         _telemetry_pool.putconn(conn)
