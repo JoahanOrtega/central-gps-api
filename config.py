@@ -67,7 +67,7 @@ class Config:
     FRONTEND_URL: str = os.getenv("FRONTEND_URL", "http://localhost:5173")
 
     # ── Base de datos principal ────────────────────────────────────────────────
-    DB_HOST: str = os.getenv("DB_HOST", "127.0.0.1")
+    DB_HOST: str = os.getenv("DB_HOST", "db")
     DB_NAME: str = os.getenv("DB_NAME", "centralgps")
     DB_USER: str = os.getenv("DB_USER", "postgres")
     DB_PASSWORD: str = _require("DB_PASSWORD")

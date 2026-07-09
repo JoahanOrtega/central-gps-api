@@ -96,13 +96,10 @@ def _ensure_token_row(cursor, id_unidad: int, id_empresa: int):
         (id_unidad, id_empresa),
     )
 
-
-def regenerate_tracking_token(id_unidad: int, id_empresa: int) -> dict | None:
+def regenerate_tracking_token(id_unidad: int, id_empresa: int, minutos_expiracion: int | None = None) -> dict | None:
     """
     Genera (o regenera) el token de rastreo de la unidad y activa el acceso.
-
-    Retorna {"token": <nuevo_token>} o None si la unidad no pertenece a la
-    empresa. Reintenta ante colisión de token (índice único parcial).
+    Si minutos_expiracion se provee, expira en ese tiempo. Si es None, es permanente.
     """
     connection = None
     cursor = None
@@ -119,42 +116,42 @@ def regenerate_tracking_token(id_unidad: int, id_empresa: int) -> dict | None:
 
         _ensure_token_row(cursor, id_unidad, id_empresa)
 
-        # Generar token único (reintenta si colisiona con el índice único).
+        # Generar token único
         nuevo_token = None
         for _ in range(5):
             candidato = _generate_token(_TOKEN_LEN)
-            cursor.execute(
-                "SELECT 1 FROM t_unidades_token WHERE token = %s",
-                (candidato,),
-            )
+            cursor.execute("SELECT 1 FROM t_unidades_token WHERE token = %s", (candidato,))
             if cursor.fetchone() is None:
                 nuevo_token = candidato
                 break
         if nuevo_token is None:
             raise RuntimeError("No se pudo generar un token único")
 
-        # Token permanente por ahora (fecha_expiracion queda NULL). La
-        # actualizacion de fecha_actualizacion deja rastro de la regeneración.
-        cursor.execute(
-            """
+        # Configurar la query de expiración dinámicamente
+        fecha_exp_query = "NULL"
+        params = [nuevo_token]
+        if minutos_expiracion is not None:
+            fecha_exp_query = "(NOW() AT TIME ZONE 'America/Mexico_City') + (%s * INTERVAL '1 minute')"
+            params.append(minutos_expiracion)
+            
+        params.append(id_unidad)
+
+        query = f"""
             UPDATE t_unidades_token
                SET token = %s,
                    acceso_token_rastreo = TRUE,
+                   fecha_expiracion = {fecha_exp_query},
                    fecha_actualizacion = NOW() AT TIME ZONE 'America/Mexico_City'
              WHERE id_unidad = %s
-            """,
-            (nuevo_token, id_unidad),
-        )
+        """
+        
+        cursor.execute(query, tuple(params))
         connection.commit()
         return {"token": nuevo_token}
     except Exception as e:
         if connection:
             connection.rollback()
-        logger.error(
-            "Error en regenerate_tracking_token id_unidad=%s: %s",
-            id_unidad,
-            repr(e),
-        )
+        logger.error("Error en regenerate_tracking_token id_unidad=%s: %s", id_unidad, repr(e))
         raise
     finally:
         if cursor:
