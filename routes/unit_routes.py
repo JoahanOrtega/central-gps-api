@@ -320,7 +320,11 @@ def regenerate_unit_token(id_unidad: int):
         if not id_empresa:
             return jsonify({"error": "Empresa no definida"}), 400
 
-        result = regenerate_tracking_token(id_unidad, id_empresa)
+        data = request.get_json(silent=True) or {}
+        minutos_expiracion = data.get("minutos_expiracion")
+
+        result = regenerate_tracking_token(id_unidad, id_empresa, minutos_expiracion)
+
         if result is None:
             return jsonify({"error": "Unidad no encontrada"}), 404
         return jsonify({"message": "Token generado", **result}), 200
