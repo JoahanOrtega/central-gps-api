@@ -1,5 +1,5 @@
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from flask import Blueprint, request, jsonify
 from db.connection import get_db_connection
 from psycopg2 import errors
@@ -199,29 +199,32 @@ def create_aforo():
 
         id_empresa = data['id_empresa']
         clave = clean_val(data, 'clave')
-        
         fecha_asig = parse_date_safely(clean_val(data, 'fecha_asignacion'))
 
         conn = get_db_connection()
         cur = conn.cursor()
+
+        # 1. Validar Unicidad de RFID de forma estricta global/empresa
+        cur.execute("SELECT id_aforo FROM t_aforos WHERE rfid = %s", (rfid_str,))
+        if cur.fetchone():
+            cur.close()
+            conn.close()
+            return jsonify({"error": f"El código RFID '{rfid_str}' ya se encuentra registrado."}), 400
+
+        # 2. Validar Unicidad de Clave en Aforos por Empresa
+        if clave:
+            cur.execute("SELECT id_aforo FROM t_aforos WHERE clave = %s AND id_empresa = %s", (clave, id_empresa))
+            if cur.fetchone():
+                cur.close()
+                conn.close()
+                return jsonify({"error": f"La clave '{clave}' ya está en uso por otro aforo en esta empresa."}), 400
         
+        # 3. Inserción Directa sin ON CONFLICT para evitar falsos positivos
         query = """
             INSERT INTO t_aforos (
                 id_empresa, id_grupo_aforos, rfid, clave, nombre, departamento, 
                 direccion, id_ruta, referencia, fecha_asignacion, is_blacklist
             ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (rfid) 
-            DO UPDATE SET
-                id_empresa = EXCLUDED.id_empresa,
-                id_grupo_aforos = EXCLUDED.id_grupo_aforos,
-                clave = EXCLUDED.clave,
-                nombre = EXCLUDED.nombre,
-                departamento = EXCLUDED.departamento,
-                direccion = EXCLUDED.direccion,
-                id_ruta = EXCLUDED.id_ruta,
-                referencia = EXCLUDED.referencia,
-                fecha_asignacion = EXCLUDED.fecha_asignacion,
-                is_blacklist = EXCLUDED.is_blacklist
             RETURNING id_aforo;
         """
         
@@ -250,7 +253,7 @@ def create_aforo():
         return jsonify({"error": "La clave o RFID ya se encuentra registrado"}), 400
     except Exception as e:
         logger.error(f"ERROR CRÍTICO EN CREATE_AFORO: {str(e)}", exc_info=True)
-        return jsonify({"error": f"Error al crear/actualizar aforo: {str(e)}"}), 500
+        return jsonify({"error": f"Error al crear aforo: {str(e)}"}), 500
 
 @aforos_bp.route('/<int:id_aforo>', methods=['PUT'])
 def update_aforo(id_aforo):
@@ -267,11 +270,36 @@ def update_aforo(id_aforo):
         if not rfid_str.isdigit():
             return jsonify({"error": "El RFID debe ser estrictamente numérico"}), 400
 
+        clave = clean_val(data, 'clave')
         fecha_asig = parse_date_safely(clean_val(data, 'fecha_asignacion'))
 
         conn = get_db_connection()
         cur = conn.cursor()
         
+        # Obtener la empresa del aforo actual
+        cur.execute("SELECT id_empresa FROM t_aforos WHERE id_aforo = %s", (id_aforo,))
+        aforo_row = cur.fetchone()
+        if not aforo_row:
+            cur.close()
+            conn.close()
+            return jsonify({"error": "Aforo no encontrado"}), 404
+        id_empresa = aforo_row[0]
+
+        # Validar Unicidad de RFID excluyendo el actual
+        cur.execute("SELECT id_aforo FROM t_aforos WHERE rfid = %s AND id_aforo != %s", (rfid_str, id_aforo))
+        if cur.fetchone():
+            cur.close()
+            conn.close()
+            return jsonify({"error": f"El código RFID '{rfid_str}' ya está en uso por otro aforo."}), 400
+
+        # Validar Unicidad de Clave en Aforos por Empresa excluyendo el actual
+        if clave:
+            cur.execute("SELECT id_aforo FROM t_aforos WHERE clave = %s AND id_empresa = %s AND id_aforo != %s", (clave, id_empresa, id_aforo))
+            if cur.fetchone():
+                cur.close()
+                conn.close()
+                return jsonify({"error": f"La clave '{clave}' ya está en uso por otro aforo en esta empresa."}), 400
+
         cur.execute("""
             UPDATE t_aforos SET
                 id_grupo_aforos = %s, rfid = %s, clave = %s, nombre = %s, departamento = %s,
@@ -282,7 +310,7 @@ def update_aforo(id_aforo):
         """, (
             clean_val(data, 'id_grupo_aforos'), 
             rfid_str, 
-            clean_val(data, 'clave'), 
+            clave, 
             data.get('nombre'),
             clean_val(data, 'departamento'), 
             clean_val(data, 'direccion'),
@@ -383,15 +411,23 @@ def create_group():
 
         conn = get_db_connection()
         cur = conn.cursor()
+
+        # Validar Unicidad de Clave en Grupos por Empresa
+        cur.execute("SELECT id_grupo_aforos FROM t_grupos_aforos WHERE clave = %s AND id_empresa = %s", (clave, id_empresa))
+        if cur.fetchone():
+            cur.close()
+            conn.close()
+            return jsonify({"error": f"La clave de grupo '{clave}' ya se encuentra registrada en esta empresa."}), 400
+
         cur.execute("""
             INSERT INTO t_grupos_aforos (id_empresa, id_cliente, clave, nombre, observaciones, id_ruta)
             VALUES (%s, %s, %s, %s, %s, %s)
             RETURNING id_grupo_aforos
         """, (
-            data['id_empresa'], 
+            id_empresa, 
             clean_val(data, 'id_cliente'), 
-            clean_val(data, 'clave'),
-            data['nombre'], 
+            clave,
+            nombre, 
             clean_val(data, 'observaciones'), 
             clean_val(data, 'id_ruta')
         ))
@@ -401,6 +437,8 @@ def create_group():
         conn.close()
 
         return jsonify(get_group(id_grupo)), 201
+    except errors.UniqueViolation:
+        return jsonify({"error": "La clave de grupo ya está en uso"}), 400
     except Exception as e:
         logger.exception("Error en create_group")
         return jsonify({"error": "Error al crear grupo"}), 500
@@ -412,8 +450,28 @@ def update_group(id_grupo_aforos):
         if not data:
             return jsonify({"error": "No se enviaron datos"}), 400
 
+        clave = clean_val(data, 'clave')
+
         conn = get_db_connection()
         cur = conn.cursor()
+
+        # Obtener id_empresa del grupo actual
+        cur.execute("SELECT id_empresa FROM t_grupos_aforos WHERE id_grupo_aforos = %s", (id_grupo_aforos,))
+        grupo_row = cur.fetchone()
+        if not grupo_row:
+            cur.close()
+            conn.close()
+            return jsonify({"error": "Grupo no encontrado"}), 404
+        id_empresa = grupo_row[0]
+
+        # Validar Unicidad de Clave en Grupos excluyendo el actual
+        if clave:
+            cur.execute("SELECT id_grupo_aforos FROM t_grupos_aforos WHERE clave = %s AND id_empresa = %s AND id_grupo_aforos != %s", (clave, id_empresa, id_grupo_aforos))
+            if cur.fetchone():
+                cur.close()
+                conn.close()
+                return jsonify({"error": f"La clave de grupo '{clave}' ya está en uso por otro grupo."}), 400
+
         cur.execute("""
             UPDATE t_grupos_aforos SET
                 id_cliente = %s, clave = %s, nombre = %s, observaciones = %s, id_ruta = %s
@@ -421,7 +479,7 @@ def update_group(id_grupo_aforos):
             RETURNING id_grupo_aforos
         """, (
             clean_val(data, 'id_cliente'), 
-            clean_val(data, 'clave'), 
+            clave, 
             data.get('nombre'),
             clean_val(data, 'observaciones'), 
             clean_val(data, 'id_ruta'), 
@@ -436,6 +494,8 @@ def update_group(id_grupo_aforos):
             return jsonify({"error": "Grupo no encontrado"}), 404
 
         return jsonify(get_group(id_grupo_aforos)), 200
+    except errors.UniqueViolation:
+        return jsonify({"error": "La clave de grupo ya está en uso"}), 400
     except Exception as e:
         logger.exception("Error en update_group")
         return jsonify({"error": "Error al actualizar grupo"}), 500

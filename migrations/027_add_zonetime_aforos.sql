@@ -1,0 +1,9 @@
+BEGIN;
+
+ALTER TABLE t_aforos 
+ALTER COLUMN fecha_registro SET DEFAULT (CURRENT_TIMESTAMP AT TIME ZONE 'America/Mexico_City');
+
+ALTER TABLE t_grupos_aforos 
+ALTER COLUMN fecha_registro SET DEFAULT (CURRENT_TIMESTAMP AT TIME ZONE 'America/Mexico_City');
+
+COMMIT;
