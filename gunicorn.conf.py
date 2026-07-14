@@ -37,30 +37,22 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# ── Variables de entorno leidas por el Dockerfile CMD ────────────────────────
-# Estos valores son defaults — el docker-compose.yml los sobreescribe via
-# la seccion environment del servicio api.
-#
-# No se definen aqui para no duplicar la fuente de verdad — solo se usan
-# en el CMD del Dockerfile como ${WORKERS:-4}.
+# Gunicorn hooks para iniciar y detener el POI Worker scheduler en el worker age=1.
 
 
 def post_fork(server, worker):
     """
-    Hook ejecutado en el proceso hijo despues del fork.
-
-    Solo el worker con age=1 inicia el POI Worker scheduler.
-    Los demas workers (age > 1) procesan requests HTTP sin scheduler.
-
-    Args:
-        server: Instancia del servidor gunicorn (proceso master).
-        worker: Instancia del worker recien creado.
+    Hook ejecutado en el worker hijo DESPUES del fork. Inicia el scheduler
+    del POI Worker solo en el primer worker (age=1). Los demas workers
+    procesan requests HTTP normalmente sin scheduler.
     """
+    from psycogreen.gevent import patch_psycopg
+
+    patch_psycopg()
+    logger.info("psycopg2 parchado para gevent en worker pid=%s", worker.pid)
+
     if worker.age == 1:
-        # Importacion diferida — los modulos del proyecto no estan disponibles
-        # en el scope global de este archivo (se ejecuta antes de que Flask
-        # inicialice la app). El import aqui garantiza que los pools de BD
-        # ya esten listos cuando el scheduler intente conectarse.
+        # Inicia el scheduler del POI Worker solo en el primer worker (age=1).
         try:
             from workers.poi_worker import iniciar_worker, get_scheduler
             from workers.unit_state_worker import registrar_en_scheduler
@@ -96,15 +88,8 @@ def post_fork(server, worker):
 
 def worker_exit(server, worker):
     """
-    Hook ejecutado cuando un worker termina (muerte natural, SIGTERM, restart).
-
-    Detiene el scheduler si este worker era el que lo tenia activo.
-    Sin esto, el scheduler queda en estado zombie cuando gunicorn reemplaza
-    el worker age=1 tras un timeout o un crash.
-
-    Args:
-        server: Instancia del servidor gunicorn.
-        worker: Instancia del worker que esta terminando.
+    Hook ejecutado cuando un worker muere o es reemplazado. Detiene el
+    scheduler del POI Worker si este worker era el que lo tenia activo.
     """
     if worker.age == 1:
         try:
