@@ -1,5 +1,7 @@
 import logging
 import os
+import threading
+import time
 
 import psycopg2
 from psycopg2 import pool as pg_pool
@@ -162,20 +164,63 @@ def release_db_connection(conn) -> None:
         _main_pool.putconn(conn)
 
 
-# BD telemetría
+# Telemetry pool (BD remota, escasa)
+_telemetry_pool_lock = threading.Lock()
+_telemetry_retry_at = 0.0  # monotonic — próximo instante permitido para reintentar
+_TELEMETRY_RETRY_COOLDOWN_S = int(os.getenv("TELEMETRY_POOL_RETRY_COOLDOWN_S", "30"))
+
+
+def _ensure_telemetry_pool():
+    """
+    Asegura que el pool de telemetría esté disponible, reintentando si es necesario.
+    """
+    global _telemetry_pool, _telemetry_retry_at
+
+    # Chequeo rápido sin lock: si ya existe, devolvemos. La mayoría de las
+    # requests no necesitan bloquearse.
+    if _telemetry_pool is not None:
+        return _telemetry_pool
+
+    with _telemetry_pool_lock:
+        # Rechequeo tras adquirir el lock: otro thread pudo haberlo creado mientras
+        if _telemetry_pool is not None:
+            return _telemetry_pool
+
+        ahora = time.monotonic()
+        if ahora < _telemetry_retry_at:
+            raise ConnectionError(
+                "La BD de telemetría no está disponible. "
+                "Próximo reintento de conexión en "
+                f"{int(_telemetry_retry_at - ahora)}s."
+            )
+
+        try:
+            _telemetry_pool = _make_telemetry_pool()
+            logger.info(
+                "Pool BD telemetría recreado en caliente (min=%s, max=%s)",
+                _POOL_MIN_TELEMETRY,
+                _POOL_MAX_TELEMETRY,
+            )
+            return _telemetry_pool
+        except Exception as exc:
+            _telemetry_retry_at = ahora + _TELEMETRY_RETRY_COOLDOWN_S
+            logger.warning(
+                "Reintento de pool de telemetría falló: %s — siguiente "
+                "intento en %ss.",
+                repr(exc),
+                _TELEMETRY_RETRY_COOLDOWN_S,
+            )
+            raise ConnectionError(
+                f"La BD de telemetría no está disponible: {exc!r}"
+            ) from exc
+
+
 def get_db_telemetry_connection():
     """
     Obtiene una conexión VIVA del pool de telemetría.
-
-    Si la telemetría no está disponible (pool None por fallo al iniciar),
-    lanza un error descriptivo en vez de tumbar la API.
     """
-    if _telemetry_pool is None:
-        raise ConnectionError(
-            "La BD de telemetría no está disponible. "
-            "El servidor remoto no respondió al iniciar la API."
-        )
-    return _get_conn_with_retry(_telemetry_pool)
+    pool = _ensure_telemetry_pool()
+    return _get_conn_with_retry(pool)
 
 
 def release_db_telemetry_connection(conn) -> None:
