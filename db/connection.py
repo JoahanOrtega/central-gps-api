@@ -77,22 +77,14 @@ except Exception as exc:
     logger.critical("No se pudo crear el pool de BD principal: %s", repr(exc))
     raise
 
-try:
-    _telemetry_pool = _make_telemetry_pool()
-    logger.info(
-        "Pool BD telemetría iniciado (min=%s, max=%s, bd=%s)",
-        _POOL_MIN_TELEMETRY,
-        _POOL_MAX_TELEMETRY,
-        Config.TELEMETRY_DB_NAME,
-    )
-except Exception as exc:
-    _telemetry_pool = None
-    logger.warning(
-        "Pool BD telemetría NO disponible: %s — la API arranca sin telemetría. "
-        "Los endpoints de mapa/posiciones devolverán error hasta que el "
-        "servidor remoto sea accesible.",
-        repr(exc),
-    )
+# El pool de telemetría se crea al primer uso, porque es remoto y escaso.
+_telemetry_pool = None
+logger.info(
+    "Pool BD telemetría diferido al primer uso (min=%s, max=%s, bd=%s)",
+    _POOL_MIN_TELEMETRY,
+    _POOL_MAX_TELEMETRY,
+    Config.TELEMETRY_DB_NAME,
+)
 
 
 def _is_connection_alive(conn) -> bool:
@@ -111,6 +103,27 @@ def _is_connection_alive(conn) -> bool:
         return False
 
 
+# Registro de la última vez que una conexión fue usada con éxito. Se usa para
+# evitar pagar un SELECT 1 extra si la conexión se usó hace poco.
+_ULTIMO_USO_OK: dict[int, float] = {}
+_VERIFICACION_TTL_S = int(os.getenv("DB_ALIVE_CHECK_TTL_S", "60"))
+
+
+def _marcar_uso_ok(conn) -> None:
+    """Registra que la conexión acaba de usarse con éxito."""
+    _ULTIMO_USO_OK[id(conn)] = time.monotonic()
+
+
+def _olvidar_conexion(conn) -> None:
+    """Elimina el registro de una conexión que sale del pool (destruida)."""
+    _ULTIMO_USO_OK.pop(id(conn), None)
+
+
+def _requiere_verificacion(conn) -> bool:
+    ultimo = _ULTIMO_USO_OK.get(id(conn))
+    return ultimo is None or (time.monotonic() - ultimo) > _VERIFICACION_TTL_S
+
+
 def _get_conn_with_retry(pool):
     """
     Obtiene una conexión viva del pool indicado, reintentando si es necesario.
@@ -123,11 +136,17 @@ def _get_conn_with_retry(pool):
     for intento in range(1, _GET_CONN_MAX_RETRIES + 1):
         conn = pool.getconn()
 
+        # Si la conexión se usó hace poco, asumimos que sigue viva y la devolvemos
+        if not _requiere_verificacion(conn):
+            return conn
+
         if _is_connection_alive(conn):
+            _marcar_uso_ok(conn)
             return conn
 
         # Conexión muerta: la cerramos y la sacamos del pool (no la
         # reutilizamos). El pool abrirá una nueva la próxima vez que se pida.
+        _olvidar_conexion(conn)
         logger.warning(
             "Conexión muerta descartada del pool (intento %s/%s).",
             intento,
@@ -161,6 +180,12 @@ def get_db_connection():
 def release_db_connection(conn) -> None:
     """Devuelve una conexión al pool de BD principal. Llamar en el finally."""
     if conn:
+        # La conexión regresa tras usarse: renueva el TTL de verificación
+        # sin pagar un SELECT 1 extra.
+        if conn.closed == 0:
+            _marcar_uso_ok(conn)
+        else:
+            _olvidar_conexion(conn)
         _main_pool.putconn(conn)
 
 
@@ -226,4 +251,8 @@ def get_db_telemetry_connection():
 def release_db_telemetry_connection(conn) -> None:
     """Devuelve una conexión al pool de telemetría. Llamar en el finally."""
     if conn and _telemetry_pool is not None:
+        if conn.closed == 0:
+            _marcar_uso_ok(conn)
+        else:
+            _olvidar_conexion(conn)
         _telemetry_pool.putconn(conn)
