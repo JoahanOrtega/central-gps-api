@@ -365,57 +365,111 @@ def get_positions_in_range(
 # Posición más reciente — batch
 # ══════════════════════════════════════════════════════════════════════════════
 
+_LATEST_TELEMETRY_BUNDLE_QUERY = """
+    WITH latest AS (
+        SELECT DISTINCT ON (imei)
+            imei, fecha_hora_gps, latitud, longitud, velocidad,
+            grados, status, voltaje, voltaje_bateria, odometro, tipo_alerta
+        FROM public.t_data
+        WHERE imei = ANY(%(imeis)s::varchar[])
+        ORDER BY imei, fecha_hora_gps DESC
+    ),
+    last_state_change AS (
+        SELECT DISTINCT ON (imei)
+            imei, fecha_hora_gps
+        FROM public.t_data
+        WHERE imei = ANY(%(imeis)s::varchar[])
+          AND tipo_alerta IN (%(on)s, %(off)s)
+          AND fecha_hora_gps IS NOT NULL
+        ORDER BY imei, fecha_hora_gps DESC
+    ),
+    last_ignition AS (
+        SELECT DISTINCT ON (imei)
+            imei, fecha_hora_gps
+        FROM public.t_data
+        WHERE imei = ANY(%(imeis)s::varchar[])
+          AND tipo_alerta = %(on)s
+          AND fecha_hora_gps IS NOT NULL
+        ORDER BY imei, fecha_hora_gps DESC
+    ),
+    last_moving AS (
+        SELECT DISTINCT ON (d.imei)
+            d.imei, d.latitud, d.longitud
+        FROM public.t_data d
+        LEFT JOIN last_ignition li ON li.imei = d.imei
+        WHERE d.imei = ANY(%(imeis)s::varchar[])
+          AND d.velocidad >= 3
+          AND d.latitud IS NOT NULL
+          AND d.longitud IS NOT NULL
+          AND (li.fecha_hora_gps IS NULL OR d.fecha_hora_gps >= li.fecha_hora_gps)
+        ORDER BY d.imei, d.fecha_hora_gps DESC
+    )
+    SELECT
+        l.imei, l.fecha_hora_gps, l.latitud, l.longitud, l.velocidad,
+        l.grados, l.status, l.voltaje, l.voltaje_bateria, l.odometro, l.tipo_alerta,
+        lm.latitud  AS moving_latitud,
+        lm.longitud AS moving_longitud,
+        lsc.fecha_hora_gps AS last_state_change
+    FROM latest l
+    LEFT JOIN last_moving       lm  ON lm.imei  = l.imei
+    LEFT JOIN last_state_change lsc ON lsc.imei = l.imei
+"""
+
 
 def get_latest_positions_by_imeis(imeis: list[str]) -> list[dict[str, Any]]:
     """
     Devuelve la posición más reciente de cada IMEI en la lista, con campos
+    derivados (engine_state, segundos sin reporte, segundos en estado actual).
+
+    Toda la telemetría se resuelve en UNA sola query contra la BD remota.
+    Ver el comentario de _LATEST_TELEMETRY_BUNDLE_QUERY para el porqué.
+
+    Args:
+        imeis: Lista de IMEIs a consultar. Los vacíos se descartan.
+
+    Returns:
+        Lista de dicts de telemetría, uno por IMEI con datos. Los IMEIs sin
+        registros en t_data simplemente no aparecen en el resultado.
     """
     filtered = [i for i in imeis if i]
     if not filtered:
         return []
 
-    # ── Query 1: posición más reciente por IMEI ──────────────────────────
     with telemetry_cursor() as cursor:
         cursor.execute(
-            """
-            SELECT DISTINCT ON (imei)
-                imei, fecha_hora_gps, latitud, longitud, velocidad,
-                grados, status, voltaje, voltaje_bateria, odometro, tipo_alerta
-            FROM public.t_data
-            WHERE imei = ANY(%s::varchar[])
-            ORDER BY imei, fecha_hora_gps DESC
-            """,
-            (filtered,),
+            _LATEST_TELEMETRY_BUNDLE_QUERY,
+            {
+                "imeis": filtered,
+                "on": TIPO_ALERTA_ENCENDIDO,
+                "off": TIPO_ALERTA_APAGADO,
+            },
         )
         rows = cursor.fetchall()
 
-    last_moving_positions = _fetch_last_moving_positions_by_imeis(filtered)
-
-    # ── Query 2: batch de "último cambio de estado" por IMEI ─────────────
-    state_change_map = _fetch_last_state_change_by_imeis(filtered)
     now = now_utc()
-
-    # ── Ensamblado final ─────────────────────────────────────────────────
     result: list[dict[str, Any]] = []
+
     for row in rows:
+        imei = row[0]
         status = (row[6] or "").strip() if row[6] is not None else None
         tipo_alerta = row[10]
-        imei = row[0]
         engine_state = resolve_engine_state(tipo_alerta, status)
 
-        display_position = (
-            last_moving_positions.get(imei) if engine_state == "off" else None
-        )
-        display_latitude = display_position[0] if display_position else row[2]
-        display_longitude = display_position[1] if display_position else row[3]
+        # Con el motor apagado se muestra la última posición en movimiento:
+        # evita que el marcador "salte" con lecturas GPS a la deriva mientras
+        # la unidad está detenida. Si no hay una, se usa la posición actual.
+        use_moving = engine_state == "off" and row[11] is not None
+        display_latitude = row[11] if use_moving else row[2]
+        display_longitude = row[12] if use_moving else row[3]
 
-        # Tiempo acumulado en estado actual (segundos desde el último
-        # evento tipo_alerta ∈ {33, 34}). None si la unidad nunca ha
-        # reportado un cambio de estado explícito.
-        seconds_in_state = _compute_seconds_in_state(
-            imei=imei,
-            now=now,
-            state_change_map=state_change_map,
+        # Tiempo acumulado en el estado actual (segundos desde el último
+        # evento tipo_alerta ∈ {33, 34}). None si la unidad nunca reportó
+        # un cambio de estado explícito.
+        last_change_utc = to_utc(row[13]) if row[13] is not None else None
+        seconds_in_state = (
+            max(0, int((now - last_change_utc).total_seconds()))
+            if last_change_utc is not None
+            else None
         )
 
         # Tiempo transcurrido desde el último reporte de telemetría (segundos).
@@ -448,44 +502,8 @@ def get_latest_positions_by_imeis(imeis: list[str]) -> list[dict[str, Any]]:
                 "segundos_en_estado_actual": seconds_in_state,
             }
         )
+
     return result
-
-
-def _fetch_last_moving_positions_by_imeis(
-    imeis: list[str],
-) -> dict[str, tuple[Any, Any]]:
-    """
-    Devuelve la última posición con movimiento confiable del viaje actual.
-    """
-    if not imeis:
-        return {}
-
-    with telemetry_cursor() as cursor:
-        cursor.execute(
-            """
-            WITH last_ignition AS (
-                SELECT DISTINCT ON (imei)
-                    imei, fecha_hora_gps
-                FROM public.t_data
-                WHERE imei = ANY(%s::varchar[])
-                  AND tipo_alerta = %s
-                  AND fecha_hora_gps IS NOT NULL
-                ORDER BY imei, fecha_hora_gps DESC
-            )
-            SELECT DISTINCT ON (d.imei)
-                d.imei, d.latitud, d.longitud
-            FROM public.t_data d
-            LEFT JOIN last_ignition li ON li.imei = d.imei
-            WHERE d.imei = ANY(%s::varchar[])
-              AND d.velocidad >= 3
-              AND d.latitud IS NOT NULL
-              AND d.longitud IS NOT NULL
-              AND (li.fecha_hora_gps IS NULL OR d.fecha_hora_gps >= li.fecha_hora_gps)
-            ORDER BY d.imei, d.fecha_hora_gps DESC
-            """,
-            (imeis, TIPO_ALERTA_ENCENDIDO, imeis),
-        )
-        return {row[0]: (row[1], row[2]) for row in cursor.fetchall()}
 
 
 def _fetch_last_state_change_by_imeis(imeis: list[str]) -> dict[str, datetime]:
