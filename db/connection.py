@@ -77,22 +77,14 @@ except Exception as exc:
     logger.critical("No se pudo crear el pool de BD principal: %s", repr(exc))
     raise
 
-try:
-    _telemetry_pool = _make_telemetry_pool()
-    logger.info(
-        "Pool BD telemetría iniciado (min=%s, max=%s, bd=%s)",
-        _POOL_MIN_TELEMETRY,
-        _POOL_MAX_TELEMETRY,
-        Config.TELEMETRY_DB_NAME,
-    )
-except Exception as exc:
-    _telemetry_pool = None
-    logger.warning(
-        "Pool BD telemetría NO disponible: %s — la API arranca sin telemetría. "
-        "Los endpoints de mapa/posiciones devolverán error hasta que el "
-        "servidor remoto sea accesible.",
-        repr(exc),
-    )
+# El pool de telemetría se crea al primer uso, para no fallar la inicialización si la BD remota está caída.
+_telemetry_pool = None
+logger.info(
+    "Pool BD telemetría diferido al primer uso (min=%s, max=%s, bd=%s)",
+    _POOL_MIN_TELEMETRY,
+    _POOL_MAX_TELEMETRY,
+    Config.TELEMETRY_DB_NAME,
+)
 
 
 def _is_connection_alive(conn) -> bool:

@@ -1,5 +1,4 @@
 """
-gunicorn.conf.py — Configuracion del servidor gunicorn para CentralGPS
 ================================================================================
 
 Por que este archivo existe:
@@ -49,7 +48,8 @@ def post_fork(server, worker):
     from psycogreen.gevent import patch_psycopg
 
     patch_psycopg()
-    logger.info("psycopg2 parchado para gevent en worker pid=%s", worker.pid)
+    # El patch_psycopg() debe ejecutarse en cada worker hijo, no en el master.
+    server.log.info("psycopg2 parchado para gevent en worker pid=%s", worker.pid)
 
     if worker.age == 1:
         # Inicia el scheduler del POI Worker solo en el primer worker (age=1).
@@ -67,13 +67,13 @@ def post_fork(server, worker):
             if sched:
                 registrar_en_scheduler(sched)
 
-            logger.info(
+            server.log.info(
                 "Scheduler iniciado (jobs: POI + Unit State) en worker pid=%s age=%s",
                 worker.pid,
                 worker.age,
             )
         except Exception as exc:
-            logger.error(
+            server.log.error(
                 "Error al iniciar scheduler en worker pid=%s: %s",
                 worker.pid,
                 repr(exc),
