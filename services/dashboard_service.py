@@ -44,6 +44,7 @@ def _get_unidades_empresa(id_empresa: int) -> list[dict[str, Any]]:
             SELECT id_unidad, imei, numero, marca, modelo, vel_max
             FROM t_unidades
             WHERE id_empresa = %s
+              AND status = 1
               AND imei IS NOT NULL
               AND imei <> ''
             """,
@@ -160,16 +161,20 @@ def get_dashboard_summary(id_empresa: int, periodo: str) -> dict[str, Any]:
 
     imeis_velmax = [(u["imei"], u["vel_max"]) for u in unidades]
 
+    # Agregados por unidad y serie temporal de kilómetros.
+    por_imei: dict[str, dict[str, float]] = {}
+    serie: list[dict[str, Any]] = []
+
     # Una sola conexión de telemetría para las dos consultas.
     with telemetry_cursor() as cursor:
         values_sql = _render_values_unidades(cursor, imeis_velmax)
         cte = _sql_segmentos_cte(values_sql)
 
-        # Consulta 1: agregados por unidad
         cursor.execute(
             cte + f"""
             SELECT
                 imei,
+                time_bucket('{bucket}', fecha_hora_gps) AS bucket,
                 COALESCE(SUM(dist_km) FILTER (WHERE dist_km <= {_MAX_SEGMENTO_KM}), 0),
                 COALESCE(SUM(delta_segs) FILTER (
                     WHERE motor_on AND vel >= {_MIN_MOVING_SPEED}), 0),
@@ -183,37 +188,30 @@ def get_dashboard_summary(id_empresa: int, periodo: str) -> dict[str, Any]:
                     WHERE vel_max IS NOT NULL AND vel_max > 0
                       AND vel > vel_max), 0)
             FROM segmentos
-            GROUP BY imei
+            GROUP BY GROUPING SETS ((imei), (2))
             """,
             (inicio, fin),
         )
-        por_imei = {
-            row[0]: {
-                "km": float(row[1]),
-                "segs_movimiento": float(row[2]),
-                "segs_ralenti": float(row[3]),
-                "eventos_exceso": int(row[4]),
-                "segs_exceso": float(row[5]),
-            }
-            for row in cursor.fetchall()
-        }
 
-        # Consulta 2: serie temporal para la gráfica
-        cursor.execute(
-            cte + f"""
-            SELECT
-                time_bucket('{bucket}', fecha_hora_gps),
-                COALESCE(SUM(dist_km) FILTER (WHERE dist_km <= {_MAX_SEGMENTO_KM}), 0)
-            FROM segmentos
-            GROUP BY 1
-            ORDER BY 1 ASC
-            """,
-            (inicio, fin),
-        )
-        serie = [
-            {"bucket": to_app_iso(row[0]), "km": round(float(row[1]), 1)}
-            for row in cursor.fetchall()
-        ]
+        for imei, bucket_ts, km, s_mov, s_ral, ev_exc, s_exc in cursor.fetchall():
+            if imei is not None:
+                # Fila del set (imei): agregados por unidad
+                por_imei[imei] = {
+                    "km": float(km),
+                    "segs_movimiento": float(s_mov),
+                    "segs_ralenti": float(s_ral),
+                    "eventos_exceso": int(ev_exc),
+                    "segs_exceso": float(s_exc),
+                }
+            elif bucket_ts is not None:
+                # Fila del set (bucket): punto de la serie temporal
+                serie.append(
+                    {"bucket": to_app_iso(bucket_ts), "km": round(float(km), 1)}
+                )
+
+    # GROUPING SETS no garantiza orden — la gráfica necesita la serie
+    # cronológica (el ISO con offset fijo ordena bien como string).
+    serie.sort(key=lambda p: p["bucket"])
 
     return _ensamblar_respuesta(respuesta, unidades, por_imei, serie)
 
@@ -244,19 +242,17 @@ def _ensamblar_respuesta(base, unidades, por_imei, serie):
         if agg["eventos_exceso"] > 0:
             unidades_con_exceso += 1
 
-        detalle.append(
-            {
-                "id": u["id"],
-                "numero": u["numero"],
-                "marca": u["marca"],
-                "modelo": u["modelo"],
-                "km": round(km, 1),
-                "minutos_uso": round(
-                    (agg["segs_movimiento"] + agg["segs_ralenti"]) / 60
-                ),
-                "excesos": agg["eventos_exceso"],
-            }
-        )
+        detalle.append({
+            "id": u["id"],
+            "numero": u["numero"],
+            "marca": u["marca"],
+            "modelo": u["modelo"],
+            "km": round(km, 1),
+            "minutos_uso": round(
+                (agg["segs_movimiento"] + agg["segs_ralenti"]) / 60
+            ),
+            "excesos": agg["eventos_exceso"],
+        })
 
     # Top 5 por km — accionable: el frontend enlaza cada fila al mapa.
     detalle.sort(key=lambda d: d["km"], reverse=True)
