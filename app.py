@@ -43,6 +43,7 @@ from routes.compliance_routes import compliance_bp
 from routes.operator_routes import operator_bp
 from routes.public_track_routes import public_track_bp
 from routes.dashboard_routes import dashboard_bp
+from routes.notification_routes import notifications_bp
 
 logger = logging.getLogger(__name__)
 
@@ -118,6 +119,7 @@ def create_app() -> Flask:
     app.register_blueprint(operator_bp)
     app.register_blueprint(public_track_bp)
     app.register_blueprint(dashboard_bp)
+    app.register_blueprint(notifications_bp)
 
     # ── WebSocket de eventos (coexiste con el SSE /events/stream) ──────────
     init_ws(app)

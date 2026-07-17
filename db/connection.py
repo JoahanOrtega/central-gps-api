@@ -23,7 +23,8 @@ _POOL_MAX_TELEMETRY = int(os.getenv("TELEMETRY_POOL_MAX", "12"))
 _STATEMENT_TIMEOUT_MS = int(os.getenv("DB_STATEMENT_TIMEOUT_MS", "25000"))
 
 _COMMON_KWARGS = {
-    "connect_timeout": 10,
+    # Timeout de conexión en segundos. Se pasa al driver, no al servidor.
+    "connect_timeout": int(os.getenv("DB_CONNECT_TIMEOUT_S", "5")),
     "keepalives": 1,
     "keepalives_idle": 60,
     "keepalives_interval": 10,
