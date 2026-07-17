@@ -17,6 +17,7 @@ from db.connection import (
     get_db_telemetry_connection,
     release_db_telemetry_connection,
 )
+from services.notification_service import crear_para_empresa, limpiar_antiguas
 from services.telemetry_service import to_app_iso
 from utils.engine_state import SIN_REPORTE_PROLONGADO_SEGS
 
@@ -121,6 +122,19 @@ def _publicar_evento(id_empresa: int, payload: dict) -> None:
             payload.get("numero_unidad"),
             payload.get("tipo_evento"),
         )
+
+        # Persistir la notificación para que la campanita del usuario la vea
+        try:
+            crear_para_empresa(
+                id_empresa=id_empresa,
+                tipo=int(payload.get("tipo_evento") or 0),
+                titulo=f"{payload.get('numero_unidad', 'Unidad')}: "
+                       f"{payload.get('descripcion', 'Evento de estado')}",
+                mensaje=payload.get("descripcion"),
+                id_unidad=payload.get("id_unidad"),
+            )
+        except Exception as exc:
+            logger.warning("No se pudo persistir la notificación: %s", repr(exc))
     except redis.RedisError as exc:
         logger.warning(
             "Redis no disponible — alerta de estado NO enviada: %s", repr(exc)
@@ -169,6 +183,22 @@ def _ejecutar_ciclo() -> None:
         )
 
 
+# Hidratación de purga diaria (para no acumular notificaciones antiguas)
+_ultimo_dia_purga: str | None = None
+
+
+def _purga_diaria() -> None:
+    global _ultimo_dia_purga
+    hoy = datetime.now().strftime("%Y-%m-%d")
+    if _ultimo_dia_purga == hoy:
+        return
+    _ultimo_dia_purga = hoy
+    try:
+        limpiar_antiguas()
+    except Exception as exc:
+        logger.warning("Purga de notificaciones falló: %s", repr(exc))
+
+
 def _ciclo_interno() -> None:
     """
     1. Lee todas las unidades activas (BD principal).
@@ -176,6 +206,8 @@ def _ciclo_interno() -> None:
     3. Evalúa transiciones a estado crítico y publica eventos.
     4. Limpia el registro de cooldown cuando una unidad sale del estado.
     """
+    _purga_diaria()
+
     conn_main = conn_telem = None
 
     try:
@@ -227,6 +259,53 @@ def _ciclo_interno() -> None:
             release_db_telemetry_connection(conn_telem)
 
 
+# Hidratación de cooldown (para no alertar de nuevo un episodio ya notificado)
+_max_fecha_notif: dict[tuple[int, int], object] | None = None
+
+
+def _cargar_max_fechas_notificacion() -> dict[tuple[int, int], object]:
+    """Última fecha de notificación por (id_unidad, tipo). Una vez por vida."""
+    from utils.db_cursor import main_cursor
+
+    fechas: dict[tuple[int, int], object] = {}
+    try:
+        with main_cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id_unidad, tipo, MAX(fecha_registro)
+                FROM t_notificaciones_usuario
+                WHERE id_unidad IS NOT NULL
+                GROUP BY id_unidad, tipo
+                """
+            )
+            for id_unidad, tipo, fecha in cursor.fetchall():
+                fechas[(id_unidad, tipo)] = fecha
+    except Exception as exc:
+        # Sin hidratación el worker sigue funcionando (solo pierde la
+        # protección anti-duplicado de este arranque) — nunca tumbar el
+        # ciclo por esto.
+        logger.warning("Hidratación de cooldown falló: %s", repr(exc))
+    return fechas
+
+
+def _ya_notificado_este_episodio(unidad: dict, telem: dict | None, tipo: int) -> bool:
+    """True si existe una notificación de esta unidad/tipo posterior a su último dato."""
+    global _max_fecha_notif
+    if _max_fecha_notif is None:
+        _max_fecha_notif = _cargar_max_fechas_notificacion()
+
+    fecha_notif = _max_fecha_notif.get((unidad.get("id_unidad"), tipo))
+    if fecha_notif is None:
+        return False
+
+    ultima_fecha_dato = telem.get("fecha_hora_gps") if telem else None
+    # Sin dato de referencia, la existencia de una notificación previa
+    # basta como evidencia del episodio ya avisado.
+    if ultima_fecha_dato is None:
+        return True
+    return fecha_notif > ultima_fecha_dato
+
+
 def _evaluar_transicion(
     unidad: dict,
     telem: dict | None,
@@ -244,6 +323,11 @@ def _evaluar_transicion(
 
     if en_estado_critico:
         if clave not in _alertado:
+            # ¿Este episodio ya fue notificado antes del reinicio? La BD
+            # lo recuerda aunque la memoria del proceso no.
+            if _ya_notificado_este_episodio(unidad, telem, tipo):
+                _alertado.add(clave)
+                return
             _alertado.add(clave)
             _publicar_evento(
                 unidad["id_empresa"],
