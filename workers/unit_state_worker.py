@@ -1,36 +1,6 @@
 # ══════════════════════════════════════════════════════════════════════════════
 # unit_state_worker.py — Detección de estados críticos de unidades
 # ══════════════════════════════════════════════════════════════════════════════
-#
-# Responsabilidad única: detectar cuándo una unidad ENTRA a un estado crítico
-# y publicar un evento en tiempo real por el mismo canal Redis → SSE que
-# usan los eventos de geocercas.
-#
-# Estados críticos detectados (TRANSICIONES, no estados sostenidos):
-#   20 → Apagado prolongado: motor apagado por más de APAGADO_PROLONGADO_SEC.
-#        Vehículo posiblemente abandonado, en taller, o batería desconectada.
-#   21 → Sin transmisión: el equipo GPS no reporta hace más de
-#        SIN_TRANSMISION_SEC. Problema de dispositivo, red o sabotaje.
-#
-# ── Por qué un worker SEPARADO de poi_worker ──────────────────────────────────
-# El ciclo de poi_worker:
-#   a) Solo procesa empresas CON alertas POI activas — una empresa sin
-#      geocercas configuradas jamás recibiría alertas de estado.
-#   b) Solo evalúa unidades con GPS reciente (< 10 min) — excluiría justo
-#      a las unidades sin transmisión, que son las que queremos detectar.
-# Un worker propio evalúa TODAS las unidades activas sin esos filtros y
-# mantiene cada responsabilidad en su archivo (Single Responsibility).
-#
-# ── Cooldown ──────────────────────────────────────────────────────────────────
-# Sin cooldown, una unidad apagada 5 horas dispararía la alerta en CADA
-# ciclo (cada 60s). El registro en memoria `_alertado` guarda qué par
-# (imei, tipo) ya fue notificado; se limpia cuando la unidad SALE del
-# estado crítico, de modo que una recaída futura vuelve a alertar.
-#
-# ⚠️ NOTA: los umbrales deben mantenerse alineados con el frontend
-# (telemetry-status.ts::APAGADO_PROLONGADO_SEGS = 4h). A futuro, mover
-# ambos a configuración por empresa en BD.
-# ══════════════════════════════════════════════════════════════════════════════
 
 from __future__ import annotations
 
@@ -47,8 +17,8 @@ from db.connection import (
     get_db_telemetry_connection,
     release_db_telemetry_connection,
 )
-from services.telemetry_service import get_seconds_in_state_for_imei, to_app_iso
-from utils.engine_state import resolve_engine_state
+from services.telemetry_service import to_app_iso
+from utils.engine_state import SIN_REPORTE_PROLONGADO_SEGS
 
 logger = logging.getLogger(__name__)
 
@@ -57,25 +27,26 @@ logger = logging.getLogger(__name__)
 # Cada cuántos segundos corre el ciclo de detección.
 POLL_INTERVAL: int = int(os.getenv("UNIT_STATE_POLL_INTERVAL_SEC", "60"))
 
-# Umbral de apagado prolongado — ALINEAR con telemetry-status.ts del front.
-APAGADO_PROLONGADO_SEC: int = int(
-    os.getenv("UNIT_STATE_APAGADO_PROLONGADO_SEC", str(4 * 60 * 60))  # 4 horas
+# Umbral de sin reportar — mismo criterio que el marcador rojo del mapa.
+# El default anterior (6 min) generaba ruido: cualquier hueco de cobertura
+# disparaba la alerta. 4h = problema real de equipo, no un túnel.
+SIN_TRANSMISION_SEC: int = int(
+    os.getenv("UNIT_STATE_SIN_TRANSMISION_SEC", str(SIN_REPORTE_PROLONGADO_SEGS))
 )
-
-# Umbral de sin transmisión — alineado con el stroke rojo del marcador (6 min).
-SIN_TRANSMISION_SEC: int = int(os.getenv("UNIT_STATE_SIN_TRANSMISION_SEC", "360"))
 
 REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 # Mismo canal base que poi_worker — el SSE ya está suscrito a este canal.
 REDIS_CHANNEL_BASE = "eventos_poi"
 
 # ── Tipos de evento de estado ─────────────────────────────────────────────────
+# El 20 (Apagado prolongado) está RETIRADO de la emisión; se conserva el ID
+# y su descripción solo para interpretar eventos históricos ya almacenados.
 TIPO_APAGADO_PROLONGADO = 20
 TIPO_SIN_TRANSMISION = 21
 
 _DESCRIPCION_POR_TIPO = {
     TIPO_APAGADO_PROLONGADO: "Apagado prolongado",
-    TIPO_SIN_TRANSMISION: "Sin transmisión del equipo GPS",
+    TIPO_SIN_TRANSMISION: "Sin reportar (más de 4 horas sin datos)",
 }
 
 # ── SQL ───────────────────────────────────────────────────────────────────────
@@ -248,33 +219,6 @@ def _ciclo_interno() -> None:
                     en_estado_critico=segundos_sistema > SIN_TRANSMISION_SEC,
                 )
 
-            # ── 3b. Apagado prolongado ─────────────────────────────────
-            # Solo si el motor está apagado según el último dato.
-            if telem is not None:
-                status_raw = (
-                    str(telem["status"]).strip()
-                    if telem.get("status") is not None
-                    else None
-                )
-                engine_state = resolve_engine_state(
-                    telem.get("tipo_alerta"), status_raw
-                )
-
-                if engine_state == "off":
-                    segundos_apagada = get_seconds_in_state_for_imei(imei)
-                    _evaluar_transicion(
-                        unidad=unidad,
-                        telem=telem,
-                        tipo=TIPO_APAGADO_PROLONGADO,
-                        en_estado_critico=(
-                            segundos_apagada is not None
-                            and segundos_apagada > APAGADO_PROLONGADO_SEC
-                        ),
-                    )
-                else:
-                    # Motor encendido → si estaba marcada, salió del estado:
-                    # limpiar para que una futura recaída vuelva a alertar.
-                    _alertado.discard((imei, TIPO_APAGADO_PROLONGADO))
 
     finally:
         if conn_main:
@@ -332,8 +276,7 @@ def registrar_en_scheduler(scheduler) -> None:
         next_run_time=datetime.now(timezone.utc) + timedelta(seconds=7),
     )
     logger.info(
-        "Unit State Worker registrado — ciclo cada %ds, umbrales: off=%ds, tx=%ds",
+        "Unit State Worker registrado — ciclo cada %ds, umbral sin-reporte=%ds",
         POLL_INTERVAL,
-        APAGADO_PROLONGADO_SEC,
         SIN_TRANSMISION_SEC,
     )

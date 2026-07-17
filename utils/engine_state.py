@@ -176,3 +176,7 @@ def is_engine_off_point(
         return True
 
     return False
+
+
+# Constantes de tiempo para el frontend
+SIN_REPORTE_PROLONGADO_SEGS: int = 4 * 60 * 60
