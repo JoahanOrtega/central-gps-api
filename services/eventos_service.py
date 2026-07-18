@@ -256,8 +256,10 @@ def get_eventos(filtros: dict) -> tuple[dict | None, dict | None]:
         if conn_telem:
             try:
                 conn_telem.rollback()
-            except Exception:
-                pass
+            except Exception as rb_exc:
+                # Rollback puede fallar si la conexion se cierra por timeout o error de red.
+                # Loggear para que el caller sepa que hubo un fallo de BD y no solo
+                logger.debug("Rollback telemetría falló tras error en get_eventos: %s", repr(rb_exc))
         return None, {"code": "DATABASE_ERROR", "message": "Error interno del servidor"}
     finally:
         if conn_main:

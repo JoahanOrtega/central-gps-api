@@ -531,8 +531,14 @@ def _ciclo_interno() -> None:
             except Exception as exc:
                 try:
                     conn_telem.rollback()
-                except Exception:
-                    pass
+                except Exception as rb_exc:
+                    # Rollback fallido indica conexión de telemetría rota (típico tras
+                    # timeout de NAT con el VM de GCP). El pool lazy reconectará en el
+                    # siguiente ciclo. Loggear en debug para no generar ruido en cada ciclo.
+                    logger.debug(
+                        "Rollback telemetría falló leyendo GPS empresa=%s: %s",
+                        id_empresa, repr(rb_exc)
+                    )
                 logger.error("Error leyendo GPS empresa=%s: %s", id_empresa, repr(exc))
                 continue
 
@@ -1013,8 +1019,14 @@ def _insertar_evento_bd(cur_telem, conn_telem, evento: dict) -> None:
     except Exception as exc:
         try:
             conn_telem.rollback()
-        except Exception:
-            pass
+        except Exception as rb_exc:
+            # Si el rollback también falla, la conexión de telemetría se perdió.
+            # El pool lazy la reemplazará en el siguiente acceso. Loggear en debug
+            # para correlacionar con el error principal sin duplicar alertas.
+            logger.debug(
+                "Rollback telemetría falló al insertar t_eventos tipo=%s: %s",
+                evento.get("evento"), repr(rb_exc)
+            )
         logger.error(
             "Error insertando en t_eventos tipo=%s id_unidad=%s: %s",
             evento.get("evento"),
