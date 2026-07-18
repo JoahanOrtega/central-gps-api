@@ -3,9 +3,10 @@ import logging
 import sys
 from flask import Flask, jsonify
 from flask_cors import CORS
-from flask_limiter.util import get_remote_address
+from werkzeug.middleware.proxy_fix import ProxyFix
 from routes.events_ws import init_ws
 from utils.limiter import limiter
+from utils.real_ip import get_real_ip
 
 # ─── Configuracion de logging ─────────────────────────────────────────────────
 # Configuramos ANTES de importar los blueprints porque db/connection.py se
@@ -79,6 +80,10 @@ def create_app() -> Flask:
     """
     app = Flask(__name__)
 
+    # ── ProxyFix ───────────────────────────────────────────────────────────────
+    # ProxyFix de Werkzeug reescribe request.remote_addr y request.scheme
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=0)
+
     # ── CORS ──────────────────────────────────────────────────────────────────
     # supports_credentials=True es REQUERIDO para que el navegador envie y
     # reciba cookies HttpOnly en peticiones cross-origin.
@@ -90,11 +95,22 @@ def create_app() -> Flask:
         supports_credentials=True,
     )
 
-    # ── Rate Limiting ─────────────────────────────────────────────────────────
+    # ── Rate Limiter ─────────────────────────────────────────────────────────────
+    # El storage_uri se asigna desde la variable de entorno LIMITER_STORAGE_URI
     limiter.storage_uri = os.getenv("LIMITER_STORAGE_URI", "memory://")
     limiter.enabled = os.getenv("FLASK_TESTING", "false").lower() != "true"
     limiter.init_app(app)
     app.extensions["limiter"] = limiter
+
+    # Log de arranque para confirmar el backend del limiter activo.
+    _storage = os.getenv("LIMITER_STORAGE_URI", "memory://")
+    if _storage.startswith("redis"):
+        logger.info("Rate limiter: backend Redis (%s)", _storage.split("@")[-1])
+    else:
+        logger.warning(
+            "Rate limiter: backend en MEMORIA — solo apto para desarrollo. "
+            "Definir LIMITER_STORAGE_URI=redis://redis:6379/1 en producción."
+        )
 
     # ── Blueprints ────────────────────────────────────────────────────────────
     app.register_blueprint(auth_bp, url_prefix="/auth")
@@ -127,7 +143,9 @@ def create_app() -> Flask:
     # ── Manejador global de rate limit ────────────────────────────────────────
     @app.errorhandler(429)
     def handle_rate_limit(exc):
-        logger.warning("Rate limit excedido desde IP: %s", get_remote_address())
+        # get_real_ip() lee CF-Connecting-IP → X-Forwarded-For → remote_addr,
+        # así el log siempre refleja la IP real del cliente, no la del proxy.
+        logger.warning("Rate limit excedido desde IP: %s", get_real_ip())
         return (
             jsonify(
                 {"error": "Demasiados intentos. Espera un momento e intenta de nuevo."}
