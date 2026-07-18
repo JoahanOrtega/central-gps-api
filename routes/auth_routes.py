@@ -1,5 +1,6 @@
 import logging
 from flask import Blueprint, jsonify, request
+from utils.real_ip import get_real_ip
 from services.auth_service import authenticate_user
 from services.erp_service import _registrar_auditoria
 from db.connection import get_db_connection, release_db_connection
@@ -122,7 +123,7 @@ def login():
         save_refresh_token(
             id_usuario=user["id"],
             token_crudo=refresh_token_crudo,
-            ip_origen=request.remote_addr,
+            ip_origen=get_real_ip(),
             user_agent=request.headers.get("User-Agent"),
         )
 
@@ -299,7 +300,7 @@ def refresh():
         save_refresh_token(
             id_usuario=user_id,
             token_crudo=new_refresh_crudo,
-            ip_origen=request.remote_addr,
+            ip_origen=get_real_ip(),
             user_agent=request.headers.get("User-Agent"),
         )
 
@@ -514,7 +515,7 @@ def change_password_endpoint():
             user_id=user_id,
             current_password=data["current_password"],
             new_password=data["new_password"],
-            ip_origen=request.remote_addr,
+            ip_origen=get_real_ip(),
         )
 
         if not success:

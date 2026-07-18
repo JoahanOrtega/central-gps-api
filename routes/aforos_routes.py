@@ -78,7 +78,7 @@ def _serialize_dates(obj, *keys):
 
 
 def get_aforo(id_aforo):
-    """Devuelve un aforo por ID, o None si no existe."""
+    """Devuelve un aforo por ID, o None si no existe o si falla la BD."""
     try:
         with _main_cursor() as cur:
             cur.execute(
@@ -100,12 +100,15 @@ def get_aforo(id_aforo):
                 obj, "fecha_asignacion", "blacklist_date", "fecha_registro"
             )
             return obj
-    except Exception:
+    except Exception as exc:
+        # Mismo razonamiento que get_group: None puede significar "no existe"
+        # o "error de BD". Sin log, ambos casos son indistinguibles.
+        logger.error("Error leyendo aforo id=%s: %s", id_aforo, repr(exc))
         return None
 
 
 def get_group(id_grupo):
-    """Devuelve un grupo de aforos por ID, o None si no existe."""
+    """Devuelve un grupo de aforos por ID, o None si no existe o si falla la BD."""
     try:
         with _main_cursor() as cur:
             cur.execute(
@@ -118,7 +121,10 @@ def get_group(id_grupo):
             obj = dict(zip(columns, row))
             _serialize_dates(obj, "fecha_registro")
             return obj
-    except Exception:
+    except Exception as exc:
+        # Mismo razonamiento que get_aforo: None puede significar "no existe"
+        # o "error de BD". Sin log, ambos casos son indistinguibles.
+        logger.error("Error leyendo grupo id=%s: %s", id_grupo, repr(exc))
         return None
 
 
