@@ -7,6 +7,7 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 from routes.events_ws import init_ws
 from utils.limiter import limiter
 from utils.real_ip import get_real_ip
+from utils.json_guard import registrar_guard_json
 
 # ─── Configuracion de logging ─────────────────────────────────────────────────
 # Configuramos ANTES de importar los blueprints porque db/connection.py se
@@ -100,6 +101,7 @@ def create_app() -> Flask:
     # El storage_uri se asigna desde la variable de entorno LIMITER_STORAGE_URI
     limiter.storage_uri = os.getenv("LIMITER_STORAGE_URI", "memory://")
     limiter.enabled = os.getenv("FLASK_TESTING", "false").lower() != "true"
+    registrar_guard_json(app)  # Registra el guard antes de inicializar el rate limiter
     limiter.init_app(app)
     app.extensions["limiter"] = limiter
 

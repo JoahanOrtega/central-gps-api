@@ -231,7 +231,7 @@ def list_aforos():
 @aforos_bp.route("/<int:id_aforo>/blacklist", methods=["PATCH"])
 def toggle_blacklist(id_aforo):
     try:
-        data = request.get_json() or {}
+        data = request.get_json(silent=True) or {}
         is_blacklist = data.get("is_blacklist", False)
         blacklist_date = clean_val(data, "blacklist_date")
 
@@ -260,7 +260,7 @@ def toggle_blacklist(id_aforo):
 @aforos_bp.route("", methods=["POST"])
 def create_aforo():
     try:
-        data = request.get_json()
+        data = request.get_json(silent=True)
         if not data or "nombre" not in data or "id_empresa" not in data:
             return jsonify({"error": "Nombre e id_empresa son requeridos"}), 400
 
@@ -329,7 +329,7 @@ def create_aforo():
 @aforos_bp.route("/<int:id_aforo>", methods=["PUT"])
 def update_aforo(id_aforo):
     try:
-        data = request.get_json()
+        data = request.get_json(silent=True)
         if not data:
             return jsonify({"error": "No se enviaron datos para actualizar"}), 400
 
@@ -443,7 +443,7 @@ def list_groups():
 @aforos_bp.route("/groups", methods=["POST"])
 def create_group():
     try:
-        data = request.get_json()
+        data = request.get_json(silent=True)
         nombre = clean_val(data, "nombre")
         clave = clean_val(data, "clave")
         id_cliente = data.get("id_cliente")
@@ -487,7 +487,7 @@ def create_group():
 @aforos_bp.route("/groups/<int:id_grupo_aforos>", methods=["PUT"])
 def update_group(id_grupo_aforos):
     try:
-        data = request.get_json()
+        data = request.get_json(silent=True)
         if not data:
             return jsonify({"error": "No se enviaron datos"}), 400
 
