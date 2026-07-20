@@ -35,6 +35,9 @@ SIN_TRANSMISION_SEC: int = int(
     os.getenv("UNIT_STATE_SIN_TRANSMISION_SEC", str(SIN_REPORTE_PROLONGADO_SEGS))
 )
 
+# Cinturón anti-flapping: no repetir la misma alerta antes de este tiempo.
+REALERT_MIN_SEC: int = int(os.getenv("UNIT_STATE_REALERT_MIN_SEC", "3600"))
+
 REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 # Mismo canal base que poi_worker — el SSE ya está suscrito a este canal.
 REDIS_CHANNEL_BASE = "eventos_poi"
@@ -59,8 +62,7 @@ _SQL_UNIDADES_ACTIVAS = """
     WHERE status = 1 AND imei IS NOT NULL AND TRIM(imei) <> ''
 """
 
-# Última posición por IMEI (DISTINCT ON es eficiente con el índice de t_data).
-# fecha_hora_sistema = cuándo llegó el dato al sistema (vida del dispositivo).
+# Última telemetría por IMEI (batch, un solo query). TimescaleDB.
 _SQL_ULTIMA_TELEMETRIA = """
     SELECT DISTINCT ON (imei)
         imei,
@@ -71,7 +73,7 @@ _SQL_ULTIMA_TELEMETRIA = """
         longitud
     FROM t_data
     WHERE imei = ANY(%(imeis)s)
-    ORDER BY imei, fecha_hora_gps DESC
+    ORDER BY imei, fecha_hora_sistema DESC, fecha_hora_gps DESC
 """
 
 # ── Estado en memoria: qué alertas ya se notificaron ──────────────────────────
@@ -129,7 +131,7 @@ def _publicar_evento(id_empresa: int, payload: dict) -> None:
                 id_empresa=id_empresa,
                 tipo=int(payload.get("tipo_evento") or 0),
                 titulo=f"{payload.get('numero_unidad', 'Unidad')}: "
-                       f"{payload.get('descripcion', 'Evento de estado')}",
+                f"{payload.get('descripcion', 'Evento de estado')}",
                 mensaje=payload.get("descripcion"),
                 id_unidad=payload.get("id_unidad"),
             )
@@ -251,7 +253,6 @@ def _ciclo_interno() -> None:
                     en_estado_critico=segundos_sistema > SIN_TRANSMISION_SEC,
                 )
 
-
     finally:
         if conn_main:
             release_db_connection(conn_main)
@@ -270,14 +271,12 @@ def _cargar_max_fechas_notificacion() -> dict[tuple[int, int], object]:
     fechas: dict[tuple[int, int], object] = {}
     try:
         with main_cursor() as cursor:
-            cursor.execute(
-                """
+            cursor.execute("""
                 SELECT id_unidad, tipo, MAX(fecha_registro)
                 FROM t_notificaciones_usuario
                 WHERE id_unidad IS NOT NULL
                 GROUP BY id_unidad, tipo
-                """
-            )
+                """)
             for id_unidad, tipo, fecha in cursor.fetchall():
                 fechas[(id_unidad, tipo)] = fecha
     except Exception as exc:
@@ -288,22 +287,45 @@ def _cargar_max_fechas_notificacion() -> dict[tuple[int, int], object]:
     return fechas
 
 
+def _naive(dt):
+    """
+    Convierte un datetime con tzinfo a naive (sin tzinfo) en UTC-6.
+    1. Si dt es None, devuelve None.
+    """
+    if dt is None:
+        return None
+    return dt.replace(tzinfo=None) if getattr(dt, "tzinfo", None) else dt
+
+
 def _ya_notificado_este_episodio(unidad: dict, telem: dict | None, tipo: int) -> bool:
-    """True si existe una notificación de esta unidad/tipo posterior a su último dato."""
+    """
+    True si ya se notificó este episodio de estado crítico (cooldown).
+    """
     global _max_fecha_notif
     if _max_fecha_notif is None:
         _max_fecha_notif = _cargar_max_fechas_notificacion()
 
-    fecha_notif = _max_fecha_notif.get((unidad.get("id_unidad"), tipo))
+    fecha_notif = _naive(_max_fecha_notif.get((unidad.get("id_unidad"), tipo)))
     if fecha_notif is None:
         return False
 
-    ultima_fecha_dato = telem.get("fecha_hora_gps") if telem else None
+    ultima_llegada = _naive(telem.get("fecha_hora_sistema")) if telem else None
     # Sin dato de referencia, la existencia de una notificación previa
     # basta como evidencia del episodio ya avisado.
-    if ultima_fecha_dato is None:
+    if ultima_llegada is None:
         return True
-    return fecha_notif > ultima_fecha_dato
+    return fecha_notif > ultima_llegada
+
+
+def _en_ventana_de_rearme(unidad: dict, tipo: int) -> bool:
+    """True si la última alerta de esta unidad+tipo es demasiado reciente."""
+    if _max_fecha_notif is None:
+        return False
+    fecha_notif = _naive(_max_fecha_notif.get((unidad.get("id_unidad"), tipo)))
+    if fecha_notif is None:
+        return False
+    transcurrido = (_ahora_naive_utc6() - fecha_notif).total_seconds()
+    return transcurrido < REALERT_MIN_SEC
 
 
 def _evaluar_transicion(
@@ -323,9 +345,12 @@ def _evaluar_transicion(
 
     if en_estado_critico:
         if clave not in _alertado:
-            # ¿Este episodio ya fue notificado antes del reinicio? La BD
-            # lo recuerda aunque la memoria del proceso no.
+            # ¿Ya notificamos este episodio? Si es así, no alertamos de nuevo
             if _ya_notificado_este_episodio(unidad, telem, tipo):
+                _alertado.add(clave)
+                return
+            # ¿La última notificación fue demasiado reciente? Si es así, no alertamos
+            if _en_ventana_de_rearme(unidad, tipo):
                 _alertado.add(clave)
                 return
             _alertado.add(clave)
@@ -333,6 +358,9 @@ def _evaluar_transicion(
                 unidad["id_empresa"],
                 _construir_payload(unidad, tipo, telem),
             )
+            # Actualizar la fecha de notificación para el cooldown y la persistencia
+            if _max_fecha_notif is not None:
+                _max_fecha_notif[(unidad.get("id_unidad"), tipo)] = _ahora_naive_utc6()
     else:
         _alertado.discard(clave)
 
