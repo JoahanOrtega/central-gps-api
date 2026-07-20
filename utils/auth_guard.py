@@ -93,37 +93,50 @@ def admin_empresa_required(f):
     return decorated
 
 
-def permiso_required(clave_permiso: str):
+def _permisos_efectivos(user: dict) -> list[str] | str:
     """
-    Decorador de fábrica: verifica que el usuario tenga un permiso específico
-    antes de permitir el acceso al endpoint.
+    Normaliza el campo 'permisos' del JWT a una lista limpia.
 
-    Jerarquía de acceso:
-      1. sudo_erp       → acceso total, sin revisar permisos (único bypass).
-      2. cualquier rol  → debe tener la clave en su lista `permisos` del JWT.
-                          Incluye admin_empresa, usuario común y cualquier
-                          rol futuro. La lista se calcula al login como la
-                          UNIÓN de permisos heredados del rol (r_rol_permisos)
-                          más permisos específicos (r_usuario_permisos).
+    El campo puede venir en tres formatos por compatibilidad histórica:
+      - Lista:    ["on", "unidades.ver"]    ← formato actual
+      - Wildcard: "*"                        ← acceso total por configuración
+      - String:   "on,cund1,cpoi1"           ← legacy PHP separado por comas
 
-    Nota sobre admin_empresa:
-      El admin_empresa NO tiene bypass automático. Sus capacidades se
-      definen en r_rol_permisos — si le asignan todos los permisos del
-      catálogo, se comporta como antes; si le quitan uno (ej: unidades.crear =
-      crear unidades), ese endpoint queda bloqueado sin tocar código.
-      Esto mantiene la lógica de autorización 100% en datos.
+    Retorna la lista normalizada, o el string "*" intacto para que el
+    llamador lo trate como wildcard. Centralizar esta normalización evita
+    que cada decorador re-implemente el parseo (y diverja en el futuro).
+    """
+    permisos_raw = user.get("permisos")
 
-    El campo 'permisos' del JWT puede venir como:
-      - Lista:    ["on", "cund1", "cpoi1"]   ← formato actual
-      - Wildcard: "*"                         ← compatibilidad legacy
-      - String:   "on,cund1,cpoi1"            ← compatibilidad legacy PHP
+    if permisos_raw == "*":
+        return "*"
+    if isinstance(permisos_raw, list):
+        return permisos_raw
+    if isinstance(permisos_raw, str):
+        return [p.strip() for p in permisos_raw.split(",") if p.strip()]
+    # None u otro tipo inesperado — tratarlo como sin permisos
+    return []
+
+
+def permiso_required_any(*claves_permiso: str):
+    """
+    Decorador de fábrica: permite el acceso si el usuario tiene AL MENOS UNO
+    de los permisos indicados.
+
+    ¿Por qué existe? Hay endpoints que sirven a más de un módulo: el listado
+    de programaciones alimenta tanto la pantalla de Cumplimiento
+    (cumplimiento.ver) como el Historial de Cumplimiento (hist_cumplim.ver).
+    Exigir un único permiso obligaría a duplicar el endpoint o a regalar
+    permisos de un módulo para usar el otro.
+
+    Misma jerarquía que permiso_required:
+      1. sudo_erp   → acceso total, sin revisar permisos (único bypass).
+      2. wildcard * → acceso total por configuración (legacy).
+      3. resto      → debe tener alguna de las claves en sus permisos.
 
     Uso:
-        @permiso_required("cund1")
+        @permiso_required_any("cumplimiento.ver", "hist_cumplim.ver")
         def mi_endpoint(): ...
-
-    Args:
-        clave_permiso: Clave del permiso requerido (ej: "cund1", "cpoi1", "on").
     """
 
     def decorator(f):
@@ -131,42 +144,26 @@ def permiso_required(clave_permiso: str):
         @jwt_required
         def decorated(*args, **kwargs):
             user = request.user
-            rol = user.get("rol")
 
             # Nivel 1: sudo_erp tiene acceso total al sistema.
             # Es el único bypass — refleja que es operador interno, no cliente.
-            if rol == "sudo_erp":
+            if user.get("rol") == "sudo_erp":
                 return f(*args, **kwargs)
 
-            # Nivel 2: cualquier otro rol (incluido admin_empresa) se valida
-            # contra su lista de permisos efectivos. Esto elimina privilegios
-            # hardcodeados y centraliza la autorización en datos.
-            permisos_raw = user.get("permisos")
+            permisos = _permisos_efectivos(user)
 
             # Wildcard legacy: acceso total por configuración
-            if permisos_raw == "*":
+            if permisos == "*":
                 return f(*args, **kwargs)
 
-            # Normalizar a lista: el campo puede venir como list[str] (formato
-            # nuevo desde authenticate_user) o como string legacy separado por
-            # comas ("on,cund1,cpoi1"). Ambos casos producen una lista limpia.
-            if isinstance(permisos_raw, list):
-                permisos_lista = permisos_raw
-            elif isinstance(permisos_raw, str):
-                permisos_lista = [
-                    p.strip() for p in permisos_raw.split(",") if p.strip()
-                ]
-            else:
-                # None u otro tipo inesperado — tratarlo como sin permisos
-                permisos_lista = []
-
-            if clave_permiso not in permisos_lista:
+            if not any(clave in permisos for clave in claves_permiso):
+                listado = ", ".join(f"'{c}'" for c in claves_permiso)
                 return (
                     jsonify(
                         {
                             "error": (
                                 f"Acceso denegado. "
-                                f"Se requiere el permiso '{clave_permiso}'."
+                                f"Se requiere alguno de los permisos: {listado}."
                             )
                         }
                     ),
@@ -178,6 +175,34 @@ def permiso_required(clave_permiso: str):
         return decorated
 
     return decorator
+
+
+def permiso_required(clave_permiso: str):
+    """
+    Decorador de fábrica: verifica que el usuario tenga un permiso específico
+    antes de permitir el acceso al endpoint.
+
+    Es el caso particular de permiso_required_any con una sola clave —
+    delegar evita dos copias de la misma jerarquía de autorización que
+    podrían divergir con el tiempo (código limpio: una sola fuente de
+    verdad para la lógica de permisos).
+
+    Jerarquía de acceso:
+      1. sudo_erp       → acceso total, sin revisar permisos (único bypass).
+      2. cualquier rol  → debe tener la clave en su lista `permisos` del JWT.
+                          Incluye admin_empresa, usuario común y cualquier
+                          rol futuro. La lista se calcula al login como la
+                          UNIÓN de permisos heredados del rol (r_rol_permisos)
+                          más permisos específicos (r_usuario_permisos).
+
+    Uso:
+        @permiso_required("unidades.ver")
+        def mi_endpoint(): ...
+
+    Args:
+        clave_permiso: Clave del permiso requerido (ej: "unidades.ver").
+    """
+    return permiso_required_any(clave_permiso)
 
 
 def validate_empresa_access(id_empresa_solicitada: int, user_payload: dict) -> bool:
