@@ -30,7 +30,7 @@ from validators.compliance_validators import (
     AsignarUnidadSchema,
     FiltrosProgramacionSchema,
 )
-from utils.auth_guard import jwt_required, permiso_required, permiso_required_any
+from utils.auth_guard import jwt_required, permiso_required
 from utils.validation import validate_payload
 
 compliance_bp = Blueprint("compliance", __name__)
@@ -53,7 +53,7 @@ def _empresa_or_400():
 
 @compliance_bp.route("/operation/compliance", methods=["GET"])
 @jwt_required
-@permiso_required_any("cumplimiento.ver", "hist_cumplim.ver")
+@permiso_required("cumplimiento.ver")
 def list_programacion():
     """
     Lista la programación de itinerarios para un rango de fechas.
@@ -95,7 +95,7 @@ def list_programacion():
 
 @compliance_bp.route("/operation/compliance/<int:id_itinerario_fecha>", methods=["GET"])
 @jwt_required
-@permiso_required_any("cumplimiento.ver", "hist_cumplim.ver")
+@permiso_required("cumplimiento.ver")
 def get_programacion_endpoint(id_itinerario_fecha: int):
     """Detalle completo de una programación con paradas y unidad asignada."""
     try:
