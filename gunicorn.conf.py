@@ -66,9 +66,15 @@ def post_fork(server, worker):
             sched = get_scheduler()
             if sched:
                 registrar_en_scheduler(sched)
+            # 3. Limpieza diaria de refresh tokens — mismo scheduler compartido
+            from workers.refresh_token_cleanup import (
+                registrar_en_scheduler as registrar_limpieza_tokens,
+            )
+            if sched:
+                registrar_limpieza_tokens(sched)
 
             server.log.info(
-                "Scheduler iniciado (jobs: POI + Unit State) en worker pid=%s age=%s",
+                "Scheduler iniciado (jobs: POI + Unit State + Limpieza de Tokens) en worker pid=%s age=%s",
                 worker.pid,
                 worker.age,
             )
