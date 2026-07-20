@@ -1,5 +1,5 @@
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from contextlib import contextmanager
 from flask import Blueprint, request, jsonify
 from psycopg2 import errors
@@ -278,26 +278,44 @@ def create_aforo():
         id_empresa = data["id_empresa"]
         clave = clean_val(data, "clave")
         fecha_asig = parse_date_safely(clean_val(data, "fecha_asignacion"))
-
+ 
         with _main_connection() as (conn, cur):
+            cur.execute(
+                "SELECT id_aforo FROM t_aforos WHERE rfid = %s",
+                (rfid_str,),
+            )
+            if cur.fetchone():
+                return (
+                    jsonify(
+                        {
+                            "error": f"El código RFID '{rfid_str}' ya se encuentra registrado."
+                        }
+                    ),
+                    400,
+                )
+ 
+            # La clave sí es por empresa (a diferencia del RFID global).
+            if clave:
+                cur.execute(
+                    "SELECT id_aforo FROM t_aforos WHERE clave = %s AND id_empresa = %s",
+                    (clave, id_empresa),
+                )
+                if cur.fetchone():
+                    return (
+                        jsonify(
+                            {
+                                "error": f"La clave '{clave}' ya está en uso por otro aforo en esta empresa."
+                            }
+                        ),
+                        400,
+                    )
+ 
             cur.execute(
                 """
                 INSERT INTO t_aforos (
                     id_empresa, id_grupo_aforos, rfid, clave, nombre, departamento,
                     direccion, id_ruta, referencia, fecha_asignacion, is_blacklist
                 ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (rfid)
-                DO UPDATE SET
-                    id_empresa = EXCLUDED.id_empresa,
-                    id_grupo_aforos = EXCLUDED.id_grupo_aforos,
-                    clave = EXCLUDED.clave,
-                    nombre = EXCLUDED.nombre,
-                    departamento = EXCLUDED.departamento,
-                    direccion = EXCLUDED.direccion,
-                    id_ruta = EXCLUDED.id_ruta,
-                    referencia = EXCLUDED.referencia,
-                    fecha_asignacion = EXCLUDED.fecha_asignacion,
-                    is_blacklist = EXCLUDED.is_blacklist
                 RETURNING id_aforo;
             """,
                 (
@@ -316,14 +334,14 @@ def create_aforo():
             )
             id_aforo = cur.fetchone()[0]
             conn.commit()
-
+ 
         return jsonify(get_aforo(id_aforo)), 201
     except errors.UniqueViolation as ue:
         logger.warning("Conflicto de duplicado capturado en la BD: %s", ue)
         return jsonify({"error": "La clave o RFID ya se encuentra registrado"}), 400
     except Exception as e:
         logger.error("Error en create_aforo: %s", repr(e), exc_info=True)
-        return jsonify({"error": "Error al crear/actualizar aforo"}), 500
+        return jsonify({"error": "Error al crear aforo"}), 500
 
 
 @aforos_bp.route("/<int:id_aforo>", methods=["PUT"])
@@ -340,10 +358,55 @@ def update_aforo(id_aforo):
         rfid_str = str(rfid).strip()
         if not rfid_str.isdigit():
             return jsonify({"error": "El RFID debe ser estrictamente numérico"}), 400
-
+        clave = clean_val(data, "clave")
         fecha_asig = parse_date_safely(clean_val(data, "fecha_asignacion"))
-
+ 
         with _main_connection() as (conn, cur):
+            # Existencia primero: un 404 temprano evita validar contra un
+            # registro fantasma y da el error correcto al frontend.
+            cur.execute(
+                "SELECT id_empresa FROM t_aforos WHERE id_aforo = %s",
+                (id_aforo,),
+            )
+            aforo_row = cur.fetchone()
+            if not aforo_row:
+                return jsonify({"error": "Aforo no encontrado"}), 404
+            id_empresa = aforo_row[0]
+ 
+            # Unicidad excluyendo el propio registro (si no, editar sin
+            # cambiar el RFID chocaría consigo mismo).
+            cur.execute(
+                "SELECT id_aforo FROM t_aforos WHERE rfid = %s AND id_aforo != %s",
+                (rfid_str, id_aforo),
+            )
+            if cur.fetchone():
+                return (
+                    jsonify(
+                        {
+                            "error": f"El código RFID '{rfid_str}' ya está en uso por otro aforo."
+                        }
+                    ),
+                    400,
+                )
+ 
+            if clave:
+                cur.execute(
+                    """
+                    SELECT id_aforo FROM t_aforos
+                    WHERE clave = %s AND id_empresa = %s AND id_aforo != %s
+                """,
+                    (clave, id_empresa, id_aforo),
+                )
+                if cur.fetchone():
+                    return (
+                        jsonify(
+                            {
+                                "error": f"La clave '{clave}' ya está en uso por otro aforo en esta empresa."
+                            }
+                        ),
+                        400,
+                    )
+ 
             cur.execute(
                 """
                 UPDATE t_aforos SET
@@ -356,7 +419,7 @@ def update_aforo(id_aforo):
                 (
                     clean_val(data, "id_grupo_aforos"),
                     rfid_str,
-                    clean_val(data, "clave"),
+                    clave,
                     data.get("nombre"),
                     clean_val(data, "departamento"),
                     clean_val(data, "direccion"),
@@ -369,6 +432,7 @@ def update_aforo(id_aforo):
             )
             row = cur.fetchone()
             conn.commit()
+
 
         if not row:
             return jsonify({"error": "Aforo no encontrado"}), 404
@@ -443,12 +507,12 @@ def list_groups():
 @aforos_bp.route("/groups", methods=["POST"])
 def create_group():
     try:
-        data = request.get_json(silent=True)
+        data = request.get_json(silent=True) or {}
         nombre = clean_val(data, "nombre")
         clave = clean_val(data, "clave")
         id_cliente = data.get("id_cliente")
         id_empresa = data.get("id_empresa")
-
+ 
         if not nombre or not clave or id_cliente is None or id_empresa is None:
             return (
                 jsonify(
@@ -458,8 +522,27 @@ def create_group():
                 ),
                 400,
             )
-
+ 
         with _main_connection() as (conn, cur):
+            # Clave de grupo única por empresa — mensaje específico (UX);
+            # el except UniqueViolation cubre la carrera.
+            cur.execute(
+                """
+                SELECT id_grupo_aforos FROM t_grupos_aforos
+                WHERE clave = %s AND id_empresa = %s
+            """,
+                (clave, id_empresa),
+            )
+            if cur.fetchone():
+                return (
+                    jsonify(
+                        {
+                            "error": f"La clave de grupo '{clave}' ya se encuentra registrada en esta empresa."
+                        }
+                    ),
+                    400,
+                )
+ 
             cur.execute(
                 """
                 INSERT INTO t_grupos_aforos (id_empresa, id_cliente, clave, nombre, observaciones, id_ruta)
@@ -467,18 +550,20 @@ def create_group():
                 RETURNING id_grupo_aforos
             """,
                 (
-                    data["id_empresa"],
+                    id_empresa,
                     clean_val(data, "id_cliente"),
-                    clean_val(data, "clave"),
-                    data["nombre"],
+                    clave,
+                    nombre,
                     clean_val(data, "observaciones"),
                     clean_val(data, "id_ruta"),
                 ),
             )
             id_grupo = cur.fetchone()[0]
             conn.commit()
-
+ 
         return jsonify(get_group(id_grupo)), 201
+    except errors.UniqueViolation:
+        return jsonify({"error": "La clave de grupo ya está en uso"}), 400
     except Exception as e:
         logger.exception("Error en create_group")
         return jsonify({"error": "Error al crear grupo"}), 500
@@ -490,8 +575,39 @@ def update_group(id_grupo_aforos):
         data = request.get_json(silent=True)
         if not data:
             return jsonify({"error": "No se enviaron datos"}), 400
-
+ 
+        clave = clean_val(data, "clave")
+ 
         with _main_connection() as (conn, cur):
+            # Existencia primero (404 temprano) y de paso la empresa para
+            # validar la clave en su ámbito correcto.
+            cur.execute(
+                "SELECT id_empresa FROM t_grupos_aforos WHERE id_grupo_aforos = %s",
+                (id_grupo_aforos,),
+            )
+            grupo_row = cur.fetchone()
+            if not grupo_row:
+                return jsonify({"error": "Grupo no encontrado"}), 404
+            id_empresa = grupo_row[0]
+ 
+            if clave:
+                cur.execute(
+                    """
+                    SELECT id_grupo_aforos FROM t_grupos_aforos
+                    WHERE clave = %s AND id_empresa = %s AND id_grupo_aforos != %s
+                """,
+                    (clave, id_empresa, id_grupo_aforos),
+                )
+                if cur.fetchone():
+                    return (
+                        jsonify(
+                            {
+                                "error": f"La clave de grupo '{clave}' ya está en uso por otro grupo."
+                            }
+                        ),
+                        400,
+                    )
+ 
             cur.execute(
                 """
                 UPDATE t_grupos_aforos SET
@@ -501,7 +617,7 @@ def update_group(id_grupo_aforos):
             """,
                 (
                     clean_val(data, "id_cliente"),
-                    clean_val(data, "clave"),
+                    clave,
                     data.get("nombre"),
                     clean_val(data, "observaciones"),
                     clean_val(data, "id_ruta"),
@@ -510,11 +626,13 @@ def update_group(id_grupo_aforos):
             )
             row = cur.fetchone()
             conn.commit()
-
+ 
         if not row:
             return jsonify({"error": "Grupo no encontrado"}), 404
-
+ 
         return jsonify(get_group(id_grupo_aforos)), 200
+    except errors.UniqueViolation:
+        return jsonify({"error": "La clave de grupo ya está en uso"}), 400
     except Exception as e:
         logger.exception("Error en update_group")
         return jsonify({"error": "Error al actualizar grupo"}), 500
