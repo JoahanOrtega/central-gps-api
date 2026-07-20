@@ -1,5 +1,5 @@
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from flask import Blueprint, request, jsonify
 from db.connection import (
     get_db_connection,
@@ -55,9 +55,14 @@ def calculate_kms_gps_telemetry(id_unidad, fecha_carga, ext_conn=None, ext_telem
             conn = get_db_connection()
             close_conn = True
         cur = conn.cursor()
-        cur.execute("SELECT imei FROM t_unidades WHERE id_unidad = %s", (id_unidad,))
+        cur.execute("""
+            SELECT imei, TO_CHAR(fecha_registro, 'YYYY-MM-DD HH24:MI:SS') 
+            FROM t_unidades 
+            WHERE id_unidad = %s
+        """, (id_unidad,))
         row_u = cur.fetchone()
         imei = row_u[0].strip() if row_u and row_u[0] else None
+        fecha_registro = row_u[1] if row_u and row_u[1] else None
         
         if not imei:
             cur.close()
@@ -73,13 +78,15 @@ def calculate_kms_gps_telemetry(id_unidad, fecha_carga, ext_conn=None, ext_telem
             LIMIT 1
         """, (id_unidad, fecha_carga))
         row = cur.fetchone()
-        str_anterior = row[0] if row and row[0] else '1970-01-01 00:00:00'
+        fecha_anterior_carga = row[0] if row and row[0] else None
         cur.close()
+        
         if close_conn:
             release_db_connection(conn)
             conn = None
 
         str_actual = str(fecha_carga).replace('T', ' ').split('.')[0]
+        target_fecha_anterior = fecha_anterior_carga if fecha_anterior_carga else fecha_registro
 
         if not conn_telem:
             conn_telem = get_db_telemetry_connection()
@@ -89,20 +96,22 @@ def calculate_kms_gps_telemetry(id_unidad, fecha_carga, ext_conn=None, ext_telem
         cur_telem.execute("""
             SELECT odometro 
             FROM t_data 
-            WHERE imei = %s AND fecha_hora_gps <= %s::timestamp
+            WHERE imei = %s AND fecha_hora_gps <= %s::timestamp AND odometro > 0
             ORDER BY fecha_hora_gps DESC 
             LIMIT 1
         """, (imei, str_actual))
         row_act = cur_telem.fetchone()
         
-        cur_telem.execute("""
-            SELECT odometro 
-            FROM t_data 
-            WHERE imei = %s AND fecha_hora_gps <= %s::timestamp
-            ORDER BY fecha_hora_gps DESC 
-            LIMIT 1
-        """, (imei, str_anterior))
-        row_ant = cur_telem.fetchone()
+        row_ant = None
+        if target_fecha_anterior:
+            cur_telem.execute("""
+                SELECT odometro 
+                FROM t_data 
+                WHERE imei = %s AND fecha_hora_gps <= %s::timestamp AND odometro > 0
+                ORDER BY fecha_hora_gps DESC 
+                LIMIT 1
+            """, (imei, target_fecha_anterior))
+            row_ant = cur_telem.fetchone()
         
         cur_telem.close()
         if close_telem:
@@ -112,14 +121,15 @@ def calculate_kms_gps_telemetry(id_unidad, fecha_carga, ext_conn=None, ext_telem
         if row_act and row_ant:
             odo_act = float(row_act[0] or 0.0)
             odo_ant = float(row_ant[0] or 0.0)
-            kms_gps = max(0.0, odo_act - odo_ant)
+            kms_gps = max(0.0, (odo_act - odo_ant) / 1000.0)
+            
     except Exception:
-        logger.exception("Error al calcular kms gps")
         if close_conn and conn:
             release_db_connection(conn)
         if close_telem and conn_telem:
             release_db_telemetry_connection(conn_telem)
-    return kms_gps
+            
+    return round(kms_gps, 2)
 
 def run_business_calculations(id_unidad, liters, cost_per_liter, kms_odo_input, is_update=False, old_kms_odo=0.0, kms_gps=0.0, kms_vacio=None, ext_conn=None):
     litros = float(liters or 0.0)
@@ -161,6 +171,7 @@ def run_business_calculations(id_unidad, liters, cost_per_liter, kms_odo_input, 
     else:
         if k_odo_input < ultimo_odo:
             raise ValueError(f"El odometro fisico ({k_odo_input}) no puede ser menor al actual registrado ({ultimo_odo})")
+            
         kms_recorridos = max(0.0, k_odo_input - ultimo_odo)
     if k_vacio > kms_recorridos:
         raise ValueError(f"Los kilometros vacios ({k_vacio}) no pueden ser mayores a los kilometros recorridos reales ({kms_recorridos})")
@@ -376,7 +387,7 @@ def create_fuel_carga():
             data.get('kms_vacio'),
             calcs['porc_vacio'],
             calcs['rend_gps'],
-            kms_odo,
+            calcs['kms_recorridos'],
             calcs['rend_odo'],
             calcs['rend_establecido']
         ))
@@ -399,89 +410,80 @@ def create_fuel_carga():
 
 @fuel_cargas_bp.route('/<int:id_combustible>', methods=['PUT'])
 def update_fuel_carga(id_combustible):
-    try:
-        data = request.get_json()
-        if not data:
-            return jsonify({"error": "No se recibieron datos para actualizar"}), 400
-        if 'kms_odo' not in data or data.get('kms_odo') is None:
-            return jsonify({"error": "El campo odometro fisico es obligatorio"}), 400
-        folio = str(data.get('folio', '')).strip()
-        fecha_carga = parse_date_safely(clean_val(data, 'fecha_carga'))
-        id_unidad = data.get('id_unidad')
-        kms_odo = float(data.get('kms_odo'))
-        if not folio:
-            return jsonify({"error": "El campo folio es obligatorio"}), 400
-        if not fecha_carga:
-            return jsonify({"error": "La fecha de carga es obligatoria"}), 400
-            
-        kms_gps_calc = calculate_kms_gps_telemetry(id_unidad, fecha_carga)
-        
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT id_unidad, kms_odo FROM t_cargas_combustible WHERE id_combustible = %s", (id_combustible,))
-        row_old = cur.fetchone()
-        cur.close()
-        release_db_connection(conn)
-        if not row_old:
-            return jsonify({"error": "Registro de combustible no encontrado"}), 404
-        old_id_unidad = row_old[0]
-        old_kms_odo = float(row_old[1]) if row_old[1] is not None else 0.0
         try:
-            calcs = run_business_calculations(
-                id_unidad=id_unidad,
-                liters=data.get('litros', 0.0),
-                cost_per_liter=data.get('costo_litro', 0.0),
-                kms_odo_input=kms_odo,
-                is_update=True,
-                old_kms_odo=old_kms_odo,
-                kms_gps=kms_gps_calc,  
-                kms_vacio=data.get('kms_vacio')
-            )
-        except ValueError as ve:
-            return jsonify({"error": str(ve)}), 400
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("""
-            UPDATE t_cargas_combustible SET
-                id_unidad = %s, fecha_carga = %s, gasolinera = %s, grupo_unidades = %s, folio = %s,
-                litros = %s, costo_litro = %s, importe = %s, referencia = %s, kms_gps = %s, 
-                kms_vacio = %s, porc_vacio = %s, rend_gps = %s, kms_odo = %s, rend_odo = %s, 
-                rendimiento_establecido = %s
-            WHERE id_combustible = %s
-            RETURNING id_combustible
-        """, (
-            id_unidad,
-            fecha_carga,
-            clean_val(data, 'gasolinera'),
-            clean_val(data, 'grupo_unidades'),
-            folio,
-            data.get('litros', 0.0),
-            data.get('costo_litro', 0.0),
-            calcs['importe'],
-            clean_val(data, 'referencia'),
-            kms_gps_calc,
-            data.get('kms_vacio'),
-            calcs['porc_vacio'],
-            calcs['rend_gps'],
-            calcs['kms_recorridos'],
-            calcs['rend_odo'],
-            calcs['rend_establecido'],
-            id_combustible
-        ))
-        row = cur.fetchone()
-        if not row:
+            data = request.get_json()
+            if not data:
+                return jsonify({"error": "No se recibieron datos para actualizar"}), 400
+            if 'kms_odo' not in data or data.get('kms_odo') is None:
+                return jsonify({"error": "El campo odometro fisico es obligatorio"}), 400
+            folio = str(data.get('folio', '')).strip()
+            fecha_carga = parse_date_safely(clean_val(data, 'fecha_carga'))
+            id_unidad = data.get('id_unidad')
+            kms_odo = float(data.get('kms_odo'))
+            if not folio:
+                return jsonify({"error": "El campo folio es obligatorio"}), 400
+            if not fecha_carga:
+                return jsonify({"error": "La fecha de carga es obligatoria"}), 400
+                
+            kms_gps_calc = calculate_kms_gps_telemetry(id_unidad, fecha_carga)
+            
+            conn = get_db_connection()
+            cur = conn.cursor()
+            cur.execute("SELECT id_unidad, kms_odo FROM t_cargas_combustible WHERE id_combustible = %s", (id_combustible,))
+            row_old = cur.fetchone()
             cur.close()
             release_db_connection(conn)
-            return jsonify({"error": "Registro de combustible no encontrado"}), 404
-        cur.execute("""
-            UPDATE t_unidades 
-            SET odometro_fisico = COALESCE(
-                (SELECT SUM(kms_odo) FROM t_cargas_combustible WHERE id_unidad = %s),
-                0.0
-            ) + COALESCE(NULLIF(odometro_inicial, 0.0), 0.0)
-            WHERE id_unidad = %s
-        """, (id_unidad, id_unidad))
-        if old_id_unidad != id_unidad:
+            if not row_old:
+                return jsonify({"error": "Registro de combustible no encontrado"}), 404
+            old_id_unidad = row_old[0]
+            old_kms_odo = float(row_old[1]) if row_old[1] is not None else 0.0
+            try:
+                calcs = run_business_calculations(
+                    id_unidad=id_unidad,
+                    liters=data.get('litros', 0.0),
+                    cost_per_liter=data.get('costo_litro', 0.0),
+                    kms_odo_input=kms_odo,
+                    is_update=True,
+                    old_kms_odo=old_kms_odo,
+                    kms_gps=kms_gps_calc,  
+                    kms_vacio=data.get('kms_vacio')
+                )
+            except ValueError as ve:
+                return jsonify({"error": str(ve)}), 400
+            conn = get_db_connection()
+            cur = conn.cursor()
+            cur.execute("""
+                UPDATE t_cargas_combustible SET
+                    id_unidad = %s, fecha_carga = %s, gasolinera = %s, grupo_unidades = %s, folio = %s,
+                    litros = %s, costo_litro = %s, importe = %s, referencia = %s, kms_gps = %s, 
+                    kms_vacio = %s, porc_vacio = %s, rend_gps = %s, kms_odo = %s, rend_odo = %s, 
+                    rendimiento_establecido = %s
+                WHERE id_combustible = %s
+                RETURNING id_combustible
+            """, (
+                id_unidad,
+                fecha_carga,
+                clean_val(data, 'gasolinera'),
+                clean_val(data, 'grupo_unidades'),
+                folio,
+                data.get('litros', 0.0),
+                data.get('costo_litro', 0.0),
+                calcs['importe'],
+                clean_val(data, 'referencia'),
+                kms_gps_calc,
+                data.get('kms_vacio'),
+                calcs['porc_vacio'],
+                calcs['rend_gps'],
+                calcs['kms_recorridos'],
+                calcs['rend_odo'],
+                calcs['rend_establecido'],
+                id_combustible
+            ))
+            row = cur.fetchone()
+            if not row:
+                cur.close()
+                release_db_connection(conn)
+                return jsonify({"error": "Registro de combustible no encontrado"}), 404
             cur.execute("""
                 UPDATE t_unidades 
                 SET odometro_fisico = COALESCE(
@@ -489,14 +491,23 @@ def update_fuel_carga(id_combustible):
                     0.0
                 ) + COALESCE(NULLIF(odometro_inicial, 0.0), 0.0)
                 WHERE id_unidad = %s
-            """, (old_id_unidad, old_id_unidad))
-        conn.commit()
-        cur.close()
-        release_db_connection(conn)
-        return jsonify(get_fuel_carga(id_combustible)), 200
-    except Exception as e:
-        logger.exception("Error en update_fuel_carga")
-        return jsonify({"error": "Error al actualizar la carga de combustible"}), 500
+            """, (id_unidad, id_unidad))
+            if old_id_unidad != id_unidad:
+                cur.execute("""
+                    UPDATE t_unidades 
+                    SET odometro_fisico = COALESCE(
+                        (SELECT SUM(kms_odo) FROM t_cargas_combustible WHERE id_unidad = %s),
+                        0.0
+                    ) + COALESCE(NULLIF(odometro_inicial, 0.0), 0.0)
+                    WHERE id_unidad = %s
+                """, (old_id_unidad, old_id_unidad))
+            conn.commit()
+            cur.close()
+            release_db_connection(conn)
+            return jsonify(get_fuel_carga(id_combustible)), 200
+        except Exception as e:
+            logger.exception("Error en update_fuel_carga")
+            return jsonify({"error": "Error al actualizar la carga de combustible"}), 500
 
 @fuel_cargas_bp.route('/<int:id_combustible>', methods=['DELETE'])
 def delete_fuel_carga(id_combustible):
@@ -624,14 +635,11 @@ def bulk_import_fuel_cargas():
                 it.get('kms_vacio'),     
                 calcs['porc_vacio'],
                 calcs['rend_gps'],
-                kms_odo,
+                calcs['kms_recorridos'],
                 calcs['rend_odo'],
                 calcs['rend_establecido']
             ))
-            success_count += 1
-            affected_units.add(id_unidad)
             
-        for unit_id in affected_units:
             cur.execute("""
                 UPDATE t_unidades 
                 SET odometro_fisico = COALESCE(
@@ -639,7 +647,10 @@ def bulk_import_fuel_cargas():
                     0.0
                 ) + COALESCE(NULLIF(odometro_inicial, 0.0), 0.0)
                 WHERE id_unidad = %s
-            """, (unit_id, unit_id))
+            """, (id_unidad, id_unidad))
+            
+            success_count += 1
+            affected_units.add(id_unidad)
             
         conn.commit()
         cur.close()
