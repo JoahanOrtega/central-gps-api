@@ -32,7 +32,7 @@ from services.telemetry_service import (
     to_app_iso,
 )
 from utils.db_cursor import main_cursor, telemetry_cursor
-from utils.engine_state import EngineState, resolve_engine_state
+from utils.engine_state import SIN_REPORTE_PROLONGADO_SEGS, EngineState, resolve_engine_state
 
 logger = logging.getLogger(__name__)
 
@@ -214,7 +214,15 @@ def get_units_with_latest_telemetry(
                 telemetry["segundos_en_estado_actual"] if telemetry else None
             )
 
-            counts[f"engine_{engine_state}"] += 1  # type: ignore[literal-required]
+            # Si la unidad está muda (sin telemetría reciente), se considera
+            # "silenciada" si lleva más de SIN_REPORTE_PROLONGADO_SEGS
+            segundos_sin_reporte = telemetry.get("segundos") if telemetry else None
+            silenciada = (
+                segundos_sin_reporte is not None
+                and segundos_sin_reporte > SIN_REPORTE_PROLONGADO_SEGS
+            )
+            bucket = "unknown" if silenciada else engine_state
+            counts[f"engine_{bucket}"] += 1  # type: ignore[literal-required]
 
             enriched_units.append(
                 {

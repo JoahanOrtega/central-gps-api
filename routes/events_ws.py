@@ -73,7 +73,14 @@ def events_ws(ws):
     # ── 1. Autenticación: primer mensaje debe ser {type:"auth", token:...} ────
     try:
         raw = ws.receive(timeout=_AUTH_TIMEOUT)
-    except Exception:
+    except TimeoutError:
+        # El cliente abrió el socket pero no envió el mensaje de auth en el
+        # tiempo permitido. Comportamiento esperado (bots, conexiones colgadas).
+        raw = None
+    except Exception as exc:
+        # Cualquier otro error (socket roto, error de protocolo) merece visibilidad
+        # para distinguirlo del timeout normal y detectar patrones anómalos.
+        logger.debug("Error recibiendo mensaje auth en WS: %s", repr(exc))
         raw = None
 
     if not raw:

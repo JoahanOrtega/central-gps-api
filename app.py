@@ -3,9 +3,11 @@ import logging
 import sys
 from flask import Flask, jsonify
 from flask_cors import CORS
-from flask_limiter.util import get_remote_address
+from werkzeug.middleware.proxy_fix import ProxyFix
 from routes.events_ws import init_ws
 from utils.limiter import limiter
+from utils.real_ip import get_real_ip
+from utils.json_guard import registrar_guard_json
 
 # ─── Configuracion de logging ─────────────────────────────────────────────────
 # Configuramos ANTES de importar los blueprints porque db/connection.py se
@@ -23,6 +25,7 @@ logging.basicConfig(
 logging.getLogger("werkzeug").setLevel(logging.WARNING)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 
+from routes.health_routes import health_bp
 from routes import auth_bp, users_bp, units_bp
 from routes.poi_routes import poi_bp
 from routes.telemetry_routes import telemetry_bp
@@ -43,6 +46,8 @@ from routes.cargas_routes import fuel_cargas_bp
 from routes.compliance_routes import compliance_bp
 from routes.operator_routes import operator_bp
 from routes.public_track_routes import public_track_bp
+from routes.dashboard_routes import dashboard_bp
+from routes.notification_routes import notifications_bp
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +83,10 @@ def create_app() -> Flask:
     """
     app = Flask(__name__)
 
+    # ── ProxyFix ───────────────────────────────────────────────────────────────
+    # ProxyFix de Werkzeug reescribe request.remote_addr y request.scheme
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=0)
+
     # ── CORS ──────────────────────────────────────────────────────────────────
     # supports_credentials=True es REQUERIDO para que el navegador envie y
     # reciba cookies HttpOnly en peticiones cross-origin.
@@ -89,13 +98,26 @@ def create_app() -> Flask:
         supports_credentials=True,
     )
 
-    # ── Rate Limiting ─────────────────────────────────────────────────────────
+    # ── Rate Limiter ─────────────────────────────────────────────────────────────
+    # El storage_uri se asigna desde la variable de entorno LIMITER_STORAGE_URI
     limiter.storage_uri = os.getenv("LIMITER_STORAGE_URI", "memory://")
     limiter.enabled = os.getenv("FLASK_TESTING", "false").lower() != "true"
+    registrar_guard_json(app)  # Registra el guard antes de inicializar el rate limiter
     limiter.init_app(app)
     app.extensions["limiter"] = limiter
 
+    # Log de arranque para confirmar el backend del limiter activo.
+    _storage = os.getenv("LIMITER_STORAGE_URI", "memory://")
+    if _storage.startswith("redis"):
+        logger.info("Rate limiter: backend Redis (%s)", _storage.split("@")[-1])
+    else:
+        logger.warning(
+            "Rate limiter: backend en MEMORIA — solo apto para desarrollo. "
+            "Definir LIMITER_STORAGE_URI=redis://redis:6379/1 en producción."
+        )
+
     # ── Blueprints ────────────────────────────────────────────────────────────
+    app.register_blueprint(health_bp)
     app.register_blueprint(auth_bp, url_prefix="/auth")
     app.register_blueprint(users_bp, url_prefix="/users")
     app.register_blueprint(catalogs_bp)
@@ -118,13 +140,18 @@ def create_app() -> Flask:
     app.register_blueprint(compliance_bp)
     app.register_blueprint(operator_bp)
     app.register_blueprint(public_track_bp)
+    app.register_blueprint(dashboard_bp)
+    app.register_blueprint(notifications_bp)
+
     # ── WebSocket de eventos (coexiste con el SSE /events/stream) ──────────
     init_ws(app)
 
     # ── Manejador global de rate limit ────────────────────────────────────────
     @app.errorhandler(429)
     def handle_rate_limit(exc):
-        logger.warning("Rate limit excedido desde IP: %s", get_remote_address())
+        # get_real_ip() lee CF-Connecting-IP → X-Forwarded-For → remote_addr,
+        # así el log siempre refleja la IP real del cliente, no la del proxy.
+        logger.warning("Rate limit excedido desde IP: %s", get_real_ip())
         return (
             jsonify(
                 {"error": "Demasiados intentos. Espera un momento e intenta de nuevo."}
@@ -153,6 +180,9 @@ if __name__ == "__main__":
     import atexit
     from workers.poi_worker import iniciar_worker, detener_worker, get_scheduler
     from workers.unit_state_worker import registrar_en_scheduler
+    from workers.refresh_token_cleanup import (
+            registrar_en_scheduler as registrar_limpieza_tokens,
+        )
 
     app = create_app()
 
@@ -161,6 +191,8 @@ if __name__ == "__main__":
         sched = get_scheduler()
         if sched:
             registrar_en_scheduler(sched)
+        if sched:
+            registrar_limpieza_tokens(sched)
         atexit.register(detener_worker)  # apaga el scheduler compartido al salir
 
     debug_mode = os.getenv("FLASK_DEBUG", "false").lower() == "true"
