@@ -24,6 +24,7 @@ logging.basicConfig(
 logging.getLogger("werkzeug").setLevel(logging.WARNING)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 
+from routes.health_routes import health_bp
 from routes import auth_bp, users_bp, units_bp
 from routes.poi_routes import poi_bp
 from routes.telemetry_routes import telemetry_bp
@@ -113,6 +114,7 @@ def create_app() -> Flask:
         )
 
     # ── Blueprints ────────────────────────────────────────────────────────────
+    app.register_blueprint(health_bp)
     app.register_blueprint(auth_bp, url_prefix="/auth")
     app.register_blueprint(users_bp, url_prefix="/users")
     app.register_blueprint(catalogs_bp)
