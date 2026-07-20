@@ -178,6 +178,9 @@ if __name__ == "__main__":
     import atexit
     from workers.poi_worker import iniciar_worker, detener_worker, get_scheduler
     from workers.unit_state_worker import registrar_en_scheduler
+    from workers.refresh_token_cleanup import (
+            registrar_en_scheduler as registrar_limpieza_tokens,
+        )
 
     app = create_app()
 
@@ -186,6 +189,8 @@ if __name__ == "__main__":
         sched = get_scheduler()
         if sched:
             registrar_en_scheduler(sched)
+        if sched:
+            registrar_limpieza_tokens(sched)
         atexit.register(detener_worker)  # apaga el scheduler compartido al salir
 
     debug_mode = os.getenv("FLASK_DEBUG", "false").lower() == "true"
