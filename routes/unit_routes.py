@@ -6,6 +6,12 @@ from services.unit_service import (
     get_unit_detail,
     update_unit,
     delete_unit,
+    get_groups,
+    create_group,
+    update_group,
+    delete_group,
+    get_clients_list,
+    get_pois_list
 )
 from services.unit_token_service import (
     get_unit_token_config,
@@ -359,3 +365,111 @@ def delete_unit_token(id_unidad: int):
             exc_info=True,
         )
         return jsonify({"error": "Error interno del servidor"}), 500
+
+
+# ─── Grupos de unidades ──────────────────────────────────────────────────────
+
+@units_bp.route("/units/groups", methods=["GET"])
+@jwt_required
+def list_groups():
+    try:
+        id_empresa = request.args.get("id_empresa", type=int) or request.user.get("id_empresa")
+        if not id_empresa:
+            return jsonify({"error": "Empresa no definida"}), 400
+        search = request.args.get("search", "").strip()
+        groups = get_groups(id_empresa, search if search else None)
+        return jsonify(groups), 200
+    except Exception as error:
+        logger.error("Error en GET /units/groups: %s", repr(error), exc_info=True)
+        return jsonify({"error": "Error interno del servidor"}), 500
+
+
+@units_bp.route("/units/groups", methods=["POST"])
+@permiso_required("unidades.editar")
+def add_group():
+    data = request.get_json(silent=True)
+    try:
+        id_usuario = request.user.get("sub")
+        id_empresa = data.get("id_empresa") or request.user.get("id_empresa")
+        
+        if not id_usuario or not id_empresa:
+            return jsonify({"error": "Datos de autenticación incompletos"}), 400
+        if not validate_empresa_access(id_empresa, request.user):
+            return jsonify({"error": "Acceso no autorizado a esta empresa"}), 403
+            
+        result = create_group(data, id_usuario, id_empresa)
+        return jsonify(result), 201
+    except Exception as error:
+        logger.error("Error en POST /units/groups: %s", repr(error), exc_info=True)
+        return jsonify({"error": "Error interno del servidor"}), 500
+
+
+@units_bp.route("/units/groups/<int:id_grupo>", methods=["PATCH"])
+@permiso_required("unidades.editar")
+def edit_group(id_grupo: int):
+    data = request.get_json(silent=True)
+    try:
+        id_empresa = request.args.get("id_empresa", type=int) or data.get("id_empresa") or request.user.get("id_empresa")
+        id_usuario = request.user.get("sub")
+        
+        if not id_empresa or not id_usuario:
+            return jsonify({"error": "Datos de autenticación incompletos"}), 400
+        if not validate_empresa_access(id_empresa, request.user):
+            return jsonify({"error": "Acceso no autorizado a esta empresa"}), 403
+            
+        result, error = update_group(id_grupo, id_empresa, data, id_usuario)
+        if error:
+            return jsonify(error), 404
+        return jsonify(result), 200
+    except Exception as error:
+        logger.error("Error en PATCH /units/groups/%s: %s", id_grupo, repr(error), exc_info=True)
+        return jsonify({"error": "Error interno del servidor"}), 500
+
+
+@units_bp.route("/units/groups/<int:id_grupo>", methods=["DELETE"])
+@permiso_required("unidades.editar")
+def remove_group(id_grupo: int):
+    try:
+        id_empresa = request.args.get("id_empresa", type=int) or request.user.get("id_empresa")
+        id_usuario = request.user.get("sub")
+        
+        if not id_empresa or not id_usuario:
+            return jsonify({"error": "Datos de autenticación incompletos"}), 400
+        if not validate_empresa_access(id_empresa, request.user):
+            return jsonify({"error": "Acceso no autorizado a esta empresa"}), 403
+            
+        result, error = delete_group(id_grupo, id_empresa)
+        if error:
+            return jsonify(error), 404
+        return jsonify(result), 200
+    except Exception as error:
+        logger.error("Error en DELETE /units/groups/%s: %s", id_grupo, repr(error), exc_info=True)
+        return jsonify({"error": "Error interno del servidor"}), 500
+
+@units_bp.route("/units/clients", methods=["GET"])
+@jwt_required
+def list_clients_dropdown():
+    try:
+        id_empresa = request.args.get("id_empresa", type=int) or request.user.get("id_empresa")
+        if not id_empresa:
+            return jsonify({"error": "Empresa no definida"}), 400
+        
+        clients = get_clients_list(id_empresa)
+        return jsonify(clients), 200
+    except Exception as error:
+        logger.error("Error en GET /units/clients: %s", repr(error))
+        return jsonify({"error": "Error interno"}), 500
+
+@units_bp.route("/units/pois", methods=["GET"])
+@jwt_required
+def list_pois_dropdown():
+    try:
+        id_empresa = request.args.get("id_empresa", type=int) or request.user.get("id_empresa")
+        if not id_empresa:
+            return jsonify({"error": "Empresa no definida"}), 400
+        
+        pois = get_pois_list(id_empresa)
+        return jsonify(pois), 200
+    except Exception as error:
+        logger.error("Error en GET /units/pois: %s", repr(error))
+        return jsonify({"error": "Error interno"}), 500

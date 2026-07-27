@@ -13,26 +13,28 @@ def get_units(id_empresa, search=None):
 
         query = """
             SELECT
-                id_unidad,
-                numero,
-                marca,
-                modelo,
-                anio,
-                matricula,
-                tipo,
-                imagen,
-                imei,
-                chip,
-                id_operador,
-                status
-            FROM t_unidades
-            WHERE id_empresa = %s AND status = 1
+                u.id_unidad,
+                u.numero,
+                u.marca,
+                u.modelo,
+                u.anio,
+                u.matricula,
+                u.tipo,
+                u.imagen,
+                u.imei,
+                u.chip,
+                u.id_operador,
+                u.status,
+                STRING_AGG(rg.id_grupo_unidades::text, ',') AS id_grupo_unidades
+            FROM t_unidades u
+            LEFT JOIN r_grupo_unidades_unidades rg ON u.id_unidad = rg.id_unidad
+            WHERE u.id_empresa = %s AND u.status = 1
         """
         params = [id_empresa]
         if search:
-            query += " AND LOWER(numero) LIKE LOWER(%s)"
+            query += " AND LOWER(u.numero) LIKE LOWER(%s)"
             params.append(f"%{search}%")
-        query += " ORDER BY id_unidad ASC"
+        query += " GROUP BY u.id_unidad ORDER BY u.id_unidad ASC"
 
         cursor.execute(query, tuple(params))
         rows = cursor.fetchall()
@@ -52,6 +54,7 @@ def get_units(id_empresa, search=None):
                     "chip": row[9],
                     "id_operador": row[10],
                     "status": row[11],
+                    "id_grupo_unidades": [int(x) for x in row[12].split(',')] if row[12] else [],
                 }
             )
         return units
@@ -211,6 +214,7 @@ def create_unit(payload, id_usuario_registro, id_empresa):
 _SUDO_ONLY_FIELDS = frozenset(
     {
         "id_modelo_avl",
+        "modelo_avl",
         "imei",
         "chip",
         "fecha_instalacion",
@@ -267,6 +271,7 @@ def get_unit_detail(id_unidad: int, id_empresa: int, rol: str | None):
                 u.odometro_inicial,
                 u.imagen,
                 u.id_modelo_avl,
+                m.modelo AS modelo_avl,
                 u.imei,
                 u.chip,
                 u.fecha_instalacion,
@@ -285,6 +290,7 @@ def get_unit_detail(id_unidad: int, id_empresa: int, rol: str | None):
                 u.vel_max,
                 u.status
               FROM t_unidades u
+              LEFT JOIN t_modelos_avl m ON u.id_modelo_avl = m.id_modelo_avl
              WHERE u.id_unidad  = %s
                AND u.id_empresa = %s
                AND u.status     = 1
@@ -587,6 +593,215 @@ def delete_unit(id_unidad, id_empresa, id_usuario_cambio):
             "code": "DATABASE_ERROR",
             "message": "No fue posible eliminar la unidad",
         }
+    finally:
+        if cursor:
+            cursor.close()
+        if connection:
+            release_db_connection(connection)
+
+
+# ─── Funciones para gestionar grupos de unidades ─────────────────────────────
+
+def get_groups(id_empresa, search=None):
+    connection = None
+    cursor = None
+    try:
+        connection = get_db_connection()
+        cursor = connection.cursor()
+
+        query = """
+            SELECT 
+                id_grupo_unidades, id_empresa, id_cliente, id_grupo_pois, 
+                nombre, observaciones, fecha_registro 
+            FROM t_grupos_unidades 
+            WHERE id_empresa = %s
+        """
+        params = [id_empresa]
+        
+        if search:
+            query += " AND LOWER(nombre) LIKE LOWER(%s)"
+            params.append(f"%{search}%")
+            
+        query += " ORDER BY id_grupo_unidades DESC"
+
+        cursor.execute(query, tuple(params))
+        rows = cursor.fetchall()
+        
+        groups = []
+        for row in rows:
+            groups.append({
+                "id_grupo_unidades": row[0],
+                "id_empresa": row[1],
+                "id_cliente": row[2],
+                "id_grupo_interes": row[3],
+                "nombre": row[4],
+                "observaciones": row[5],
+                "fecha_registro": row[6]
+            })
+            
+        return groups
+    finally:
+        if cursor:
+            cursor.close()
+        if connection:
+            release_db_connection(connection)
+
+
+def create_group(payload, id_usuario_registro, id_empresa):
+    connection = None
+    cursor = None
+    try:
+        connection = get_db_connection()
+        cursor = connection.cursor()
+        
+        query = """
+            INSERT INTO t_grupos_unidades (
+                id_empresa, id_cliente, id_grupo_pois, nombre, observaciones, 
+                id_usuario_registro, fecha_registro
+            ) VALUES (%s, %s, %s, %s, %s, %s, NOW())
+            RETURNING id_grupo_unidades
+        """
+        values = (
+            id_empresa,
+            payload.get("id_cliente"),
+            payload.get("id_grupo_interes") or payload.get("id_grupo_pois"),
+            payload["nombre"],
+            payload.get("observaciones"),
+            id_usuario_registro
+        )
+        
+        cursor.execute(query, values)
+        new_id = cursor.fetchone()[0]
+        connection.commit()
+        
+        return {
+            "id_grupo_unidades": new_id,
+            "id_empresa": id_empresa,
+            "id_cliente": payload.get("id_cliente"),
+            "id_grupo_interes": payload.get("id_grupo_interes"),
+            "nombre": payload["nombre"],
+            "observaciones": payload.get("observaciones")
+        }
+    except Exception as e:
+        if connection:
+            connection.rollback()
+        raise
+    finally:
+        if cursor:
+            cursor.close()
+        if connection:
+            release_db_connection(connection)
+
+
+def update_group(id_grupo, id_empresa, payload, id_usuario_cambio):
+    connection = None
+    cursor = None
+    try:
+        connection = get_db_connection()
+        cursor = connection.cursor()
+        
+        query = """
+            UPDATE t_grupos_unidades 
+            SET nombre = %s, id_cliente = %s, id_grupo_pois = %s, observaciones = %s, 
+                id_usuario_cambio = %s, fecha_cambio = NOW()
+            WHERE id_grupo_unidades = %s AND id_empresa = %s
+            RETURNING id_grupo_unidades
+        """
+        values = (
+            payload.get("nombre"),
+            payload.get("id_cliente"),
+            payload.get("id_grupo_interes") or payload.get("id_grupo_pois"),
+            payload.get("observaciones"),
+            id_usuario_cambio,
+            id_grupo,
+            id_empresa
+        )
+        
+        cursor.execute(query, values)
+        if not cursor.fetchone():
+            return None, {"code": "GROUP_NOT_FOUND", "message": "Grupo no encontrado"}
+            
+        connection.commit()
+        
+        return {
+            "id_grupo_unidades": id_grupo,
+            "id_empresa": id_empresa,
+            "id_cliente": payload.get("id_cliente"),
+            "id_grupo_interes": payload.get("id_grupo_interes"),
+            "nombre": payload.get("nombre"),
+            "observaciones": payload.get("observaciones")
+        }, None
+    except Exception as e:
+        if connection:
+            connection.rollback()
+        raise
+    finally:
+        if cursor:
+            cursor.close()
+        if connection:
+            release_db_connection(connection)
+
+
+def delete_group(id_grupo, id_empresa):
+    connection = None
+    cursor = None
+    try:
+        connection = get_db_connection()
+        cursor = connection.cursor()
+        
+        cursor.execute(
+            "DELETE FROM r_grupo_unidades_unidades WHERE id_grupo_unidades = %s",
+            (id_grupo,)
+        )
+        
+        cursor.execute(
+            "DELETE FROM t_grupos_unidades WHERE id_grupo_unidades = %s AND id_empresa = %s RETURNING id_grupo_unidades",
+            (id_grupo, id_empresa)
+        )
+        
+        if not cursor.fetchone():
+            return None, {"code": "GROUP_NOT_FOUND", "message": "Grupo no encontrado"}
+            
+        connection.commit()
+        return {"eliminado": True}, None
+    except Exception as e:
+        if connection:
+            connection.rollback()
+        raise
+    finally:
+        if cursor:
+            cursor.close()
+        if connection:
+            release_db_connection(connection)
+
+def get_clients_list(id_empresa):
+    connection = None
+    cursor = None
+    try:
+        connection = get_db_connection()
+        cursor = connection.cursor()
+        cursor.execute("SELECT id_cliente, nombre FROM t_clientes WHERE id_empresa = %s", (id_empresa,))
+        return [{"id_cliente": row[0], "nombre": row[1]} for row in cursor.fetchall()]
+    except Exception as e:
+        logger.error("Error al obtener clientes: %s", repr(e))
+        return []
+    finally:
+        if cursor:
+            cursor.close()
+        if connection:
+            release_db_connection(connection)
+
+def get_pois_list(id_empresa):
+    connection = None
+    cursor = None
+    try:
+        connection = get_db_connection()
+        cursor = connection.cursor()
+        cursor.execute("SELECT id_poi, nombre FROM t_pois WHERE id_empresa = %s", (id_empresa,))
+        return [{"id_poi": row[0], "nombre": row[1]} for row in cursor.fetchall()]
+    except Exception as e:
+        logger.error("Error al obtener POIs: %s", repr(e))
+        return []
     finally:
         if cursor:
             cursor.close()

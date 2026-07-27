@@ -304,28 +304,37 @@ def list_unidades():
         id_empresa = request.args.get('id_empresa', type=int)
         if not id_empresa:
             return jsonify({"error": "id_empresa es requerido"}), 400
+        
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute("""
-            SELECT id_unidad, 
-                   CONCAT_WS(' ', numero, marca, modelo) as nombre, 
-                   rendimiento_establecido, 
-                   COALESCE(NULLIF(odometro_fisico, 0.0), odometro_inicial, 0.0) as odometro_fisico
-            FROM t_unidades
-            WHERE id_empresa = %s
-            ORDER BY numero
+            SELECT u.id_unidad, 
+                   CONCAT_WS(' ', u.numero, u.marca, u.modelo) as nombre_unidad, 
+                   u.rendimiento_establecido, 
+                   COALESCE(NULLIF(u.odometro_fisico, 0.0), u.odometro_inicial, 0.0) as odometro_fisico,
+                   STRING_AGG(g.nombre, ', ') as grupo_unidades 
+            FROM t_unidades u
+            LEFT JOIN r_grupo_unidades_unidades r ON u.id_unidad = r.id_unidad
+            LEFT JOIN t_grupos_unidades g ON r.id_grupo_unidades = g.id_grupo_unidades
+            WHERE u.id_empresa = %s
+            GROUP BY u.id_unidad, u.numero, u.marca, u.modelo, u.rendimiento_establecido, u.odometro_fisico, u.odometro_inicial
+            ORDER BY u.numero
         """, (id_empresa,))
+        
         rows = cur.fetchall()
         cur.close()
         release_db_connection(conn)
+        
         result = []
         for r in rows:
             result.append({
                 'id_unidad': r[0],
                 'nombre': r[1],
                 'rendimiento_establecido': float(r[2]) if r[2] is not None else 0.0,
-                'odometro_fisico': float(r[3]) if r[3] is not None else 0.0
+                'odometro_fisico': float(r[3]) if r[3] is not None else 0.0,
+                'grupo_unidades': r[4] if r[4] else "" 
             })
+            
         return jsonify(result), 200
     except Exception as e:
         logger.exception("Error en list_unidades")
