@@ -886,11 +886,15 @@ def _registrar_auditoria(
     para que todo quede en la misma transacción.
     """
     import json
-    from flask import request as flask_request
+    from utils.real_ip import get_real_ip
 
-    # Obtener IP del request actual si existe
+    # Obtener IP real del cliente (Cloudflare-aware).
+    # get_real_ip() lee CF-Connecting-IP → X-Forwarded-For → remote_addr,
+    # por lo que funciona tanto en producción (detrás de Cloudflare Tunnel)
+    # como en desarrollo local. El try/except cubre el caso donde se llama
+    # fuera de un contexto de request (workers, scripts, tests).
     try:
-        ip = flask_request.remote_addr
+        ip = get_real_ip()
     except Exception:
         ip = None
 

@@ -365,80 +365,131 @@ def get_positions_in_range(
 # Posición más reciente — batch
 # ══════════════════════════════════════════════════════════════════════════════
 
+_LATEST_TELEMETRY_BUNDLE_QUERY = """
+    WITH latest AS (
+        SELECT DISTINCT ON (imei)
+            imei, fecha_hora_gps, latitud, longitud, velocidad,
+            grados, status, voltaje, voltaje_bateria, odometro, tipo_alerta
+        FROM public.t_data
+        WHERE imei = ANY(%(imeis)s::varchar[])
+        ORDER BY imei, fecha_hora_gps DESC
+    ),
+    last_state_change AS (
+        SELECT DISTINCT ON (imei)
+            imei, fecha_hora_gps
+        FROM public.t_data
+        WHERE imei = ANY(%(imeis)s::varchar[])
+          AND tipo_alerta IN (%(on)s, %(off)s)
+          AND fecha_hora_gps IS NOT NULL
+        ORDER BY imei, fecha_hora_gps DESC
+    ),
+    last_ignition AS (
+        SELECT DISTINCT ON (imei)
+            imei, fecha_hora_gps
+        FROM public.t_data
+        WHERE imei = ANY(%(imeis)s::varchar[])
+          AND tipo_alerta = %(on)s
+          AND fecha_hora_gps IS NOT NULL
+        ORDER BY imei, fecha_hora_gps DESC
+    ),
+    last_moving AS (
+        SELECT DISTINCT ON (d.imei)
+            d.imei, d.latitud, d.longitud
+        FROM public.t_data d
+        LEFT JOIN last_ignition li ON li.imei = d.imei
+        WHERE d.imei = ANY(%(imeis)s::varchar[])
+          AND d.velocidad >= 3
+          AND d.latitud IS NOT NULL
+          AND d.longitud IS NOT NULL
+          AND (li.fecha_hora_gps IS NULL OR d.fecha_hora_gps >= li.fecha_hora_gps)
+        ORDER BY d.imei, d.fecha_hora_gps DESC
+    )
+    SELECT
+        l.imei, l.fecha_hora_gps, l.latitud, l.longitud, l.velocidad,
+        l.grados, l.status, l.voltaje, l.voltaje_bateria, l.odometro, l.tipo_alerta,
+        lm.latitud  AS moving_latitud,
+        lm.longitud AS moving_longitud,
+        lsc.fecha_hora_gps AS last_state_change
+    FROM latest l
+    LEFT JOIN last_moving       lm  ON lm.imei  = l.imei
+    LEFT JOIN last_state_change lsc ON lsc.imei = l.imei
+"""
+
 
 def get_latest_positions_by_imeis(imeis: list[str]) -> list[dict[str, Any]]:
     """
-    Posición más reciente de una lista de IMEIs en una sola query.
+    Devuelve la posición más reciente de cada IMEI en la lista, con campos
+    derivados (engine_state, segundos sin reporte, segundos en estado actual).
 
-    Versión liviana: solo los campos que el mapa en vivo necesita para pintar.
-    Incluye:
-      - `engine_state` derivado (no reinterpretar bits en frontend).
-      - `segundos_en_estado_actual`: tiempo acumulado en el estado actual
-        calculado desde el último evento tipo_alerta ∈ {33, 34}.
+    Toda la telemetría se resuelve en UNA sola query contra la BD remota.
+    Ver el comentario de _LATEST_TELEMETRY_BUNDLE_QUERY para el porqué.
 
-    Total de queries: 2 (una para posiciones, una para últimos cambios de
-    estado). Ambas usan DISTINCT ON para procesar N imeis en tiempo
-    constante en vez de N+1.
+    Args:
+        imeis: Lista de IMEIs a consultar. Los vacíos se descartan.
+
+    Returns:
+        Lista de dicts de telemetría, uno por IMEI con datos. Los IMEIs sin
+        registros en t_data simplemente no aparecen en el resultado.
     """
     filtered = [i for i in imeis if i]
     if not filtered:
         return []
 
-    # ── Query 1: posición más reciente por IMEI ──────────────────────────
     with telemetry_cursor() as cursor:
         cursor.execute(
-            """
-            SELECT DISTINCT ON (imei)
-                imei, fecha_hora_gps, latitud, longitud, velocidad,
-                grados, status, voltaje, voltaje_bateria, odometro, tipo_alerta
-            FROM public.t_data
-            WHERE imei = ANY(%s::varchar[])
-            ORDER BY imei, fecha_hora_gps DESC
-            """,
-            (filtered,),
+            _LATEST_TELEMETRY_BUNDLE_QUERY,
+            {
+                "imeis": filtered,
+                "on": TIPO_ALERTA_ENCENDIDO,
+                "off": TIPO_ALERTA_APAGADO,
+            },
         )
         rows = cursor.fetchall()
 
-    last_moving_positions = _fetch_last_moving_positions_by_imeis(filtered)
-
-    # ── Query 2: batch de "último cambio de estado" por IMEI ─────────────
-    state_change_map = _fetch_last_state_change_by_imeis(filtered)
     now = now_utc()
-
-    # ── Ensamblado final ─────────────────────────────────────────────────
     result: list[dict[str, Any]] = []
+
     for row in rows:
+        imei = row[0]
         status = (row[6] or "").strip() if row[6] is not None else None
         tipo_alerta = row[10]
-        imei = row[0]
         engine_state = resolve_engine_state(tipo_alerta, status)
 
-        display_position = (
-            last_moving_positions.get(imei) if engine_state == "off" else None
-        )
-        display_latitude = display_position[0] if display_position else row[2]
-        display_longitude = display_position[1] if display_position else row[3]
+        # Con el motor apagado se muestra la última posición en movimiento:
+        # evita que el marcador "salte" con lecturas GPS a la deriva mientras
+        # la unidad está detenida. Si no hay una, se usa la posición actual.
+        use_moving = engine_state == "off" and row[11] is not None
+        display_latitude = row[11] if use_moving else row[2]
+        display_longitude = row[12] if use_moving else row[3]
 
-        # Tiempo acumulado en estado actual (segundos desde el último
-        # evento tipo_alerta ∈ {33, 34}). None si la unidad nunca ha
-        # reportado un cambio de estado explícito.
-        seconds_in_state = _compute_seconds_in_state(
-            imei=imei,
-            now=now,
-            state_change_map=state_change_map,
+        # Tiempo acumulado en el estado actual (segundos desde el último
+        # evento tipo_alerta ∈ {33, 34}). None si la unidad nunca reportó
+        # un cambio de estado explícito.
+        last_change_utc = to_utc(row[13]) if row[13] is not None else None
+        seconds_in_state = (
+            max(0, int((now - last_change_utc).total_seconds()))
+            if last_change_utc is not None
+            else None
+        )
+
+        # Tiempo transcurrido desde el último reporte de telemetría (segundos).
+        fecha_utc = to_utc(row[1]) if row[1] is not None else None
+        segundos_sin_reporte = (
+            max(0, int((now - fecha_utc).total_seconds()))
+            if fecha_utc is not None
+            else None
         )
 
         result.append(
             {
                 "imei": imei,
                 "fecha_hora_gps": to_app_iso(row[1]),
+                "segundos": segundos_sin_reporte,
                 "latitud": (
                     float(display_latitude) if display_latitude is not None else None
                 ),
                 "longitud": (
-                    float(display_longitude)
-                    if display_longitude is not None
-                    else None
+                    float(display_longitude) if display_longitude is not None else None
                 ),
                 "velocidad": float(row[4]) if row[4] is not None else None,
                 "grados": float(row[5]) if row[5] is not None else None,
@@ -451,62 +502,13 @@ def get_latest_positions_by_imeis(imeis: list[str]) -> list[dict[str, Any]]:
                 "segundos_en_estado_actual": seconds_in_state,
             }
         )
+
     return result
-
-
-def _fetch_last_moving_positions_by_imeis(
-    imeis: list[str],
-) -> dict[str, tuple[Any, Any]]:
-    """
-    Devuelve la última posición con movimiento confiable del viaje actual.
-    """
-    if not imeis:
-        return {}
-
-    with telemetry_cursor() as cursor:
-        cursor.execute(
-            """
-            WITH last_ignition AS (
-                SELECT DISTINCT ON (imei)
-                    imei, fecha_hora_gps
-                FROM public.t_data
-                WHERE imei = ANY(%s::varchar[])
-                  AND tipo_alerta = %s
-                  AND fecha_hora_gps IS NOT NULL
-                ORDER BY imei, fecha_hora_gps DESC
-            )
-            SELECT DISTINCT ON (d.imei)
-                d.imei, d.latitud, d.longitud
-            FROM public.t_data d
-            LEFT JOIN last_ignition li ON li.imei = d.imei
-            WHERE d.imei = ANY(%s::varchar[])
-              AND d.velocidad >= 3
-              AND d.latitud IS NOT NULL
-              AND d.longitud IS NOT NULL
-              AND (li.fecha_hora_gps IS NULL OR d.fecha_hora_gps >= li.fecha_hora_gps)
-            ORDER BY d.imei, d.fecha_hora_gps DESC
-            """,
-            (imeis, TIPO_ALERTA_ENCENDIDO, imeis),
-        )
-        return {row[0]: (row[1], row[2]) for row in cursor.fetchall()}
 
 
 def _fetch_last_state_change_by_imeis(imeis: list[str]) -> dict[str, datetime]:
     """
-    Devuelve un mapa {imei → fecha_hora_gps del último evento de cambio de
-    estado del motor}.
-
-    Un "cambio de estado" es un registro con tipo_alerta ∈ {33, 34}.
-    La query usa DISTINCT ON para procesar todos los IMEIs en una sola
-    pasada al índice (fiel al patrón N+1 evitado en esta codebase).
-
-    Args:
-        imeis: lista de IMEIs ya filtrada (sin vacíos).
-
-    Returns:
-        Diccionario imei → datetime naive UTC del último cambio.
-        Los IMEIs que nunca han reportado tipo_alerta ∈ {33, 34} están
-        ausentes del diccionario (el caller debe manejar el None).
+    Devuelve un mapa {imei: fecha_hora_gps} con el último cambio de estado
     """
     if not imeis:
         return {}
@@ -533,17 +535,7 @@ def _compute_seconds_in_state(
     state_change_map: dict[str, datetime],
 ) -> int | None:
     """
-    Calcula los segundos transcurridos desde el último cambio de estado
-    del motor para un IMEI.
-
-    Args:
-        imei:             IMEI de la unidad.
-        now:              Instante de referencia (UTC aware).
-        state_change_map: Mapa producido por _fetch_last_state_change_by_imeis.
-
-    Returns:
-        Entero no negativo de segundos, o None si la unidad nunca ha
-        registrado un evento tipo_alerta ∈ {33, 34}.
+    Calcula los segundos transcurridos desde el último cambio de estado del motor para un IMEI dado, usando un mapa prefetch de cambios de estado.
     """
     last_change = state_change_map.get(imei)
     if last_change is None:
@@ -560,18 +552,7 @@ def _compute_seconds_in_state(
 
 def get_seconds_in_state_for_imei(imei: str) -> int | None:
     """
-    Versión para un solo IMEI — usada por el endpoint de summary individual
-    donde no tiene sentido pagar el costo de una query batch.
-
-    Reutiliza la lógica interna de _fetch_last_state_change_by_imeis para
-    garantizar que el cálculo sea idéntico al del endpoint de units-live.
-
-    Args:
-        imei: IMEI de la unidad (string no vacío).
-
-    Returns:
-        Segundos transcurridos desde el último cambio de estado del motor,
-        o None si la unidad no ha reportado eventos tipo_alerta ∈ {33, 34}.
+    Devuelve los segundos transcurridos desde el último cambio de estado del motor para un IMEI dado.
     """
     if not imei:
         return None
@@ -627,15 +608,7 @@ def get_route_by_mode(
 
 def _get_latest_trip(imei: str, vel_max: float = 0.0) -> list[dict[str, Any]]:
     """
-    Recorrido más reciente delimitado por tipo_alerta=34 (apagado motor).
-
-    Lógica fiel al legacy PHP:
-      1. Busca los 2 últimos eventos tipo_alerta=34 (apagado real del motor)
-      2. El recorrido son los puntos ENTRE prev_off y latest_off (excl/incl)
-      3. Si solo hay un apagado, retorna desde ese punto hasta ahora
-
-    Usar tipo_alerta=34 (apagado) es más preciso que STATUS_OFF porque
-    filtra falsos positivos de puntos con status=0 por falta de señal.
+    Recorrido más reciente (cerrado) — entre los dos últimos apagados de motor.
     """
     with telemetry_cursor() as cursor:
         # Buscar los 2 últimos apagados reales de motor
@@ -698,24 +671,7 @@ def _get_latest_trip(imei: str, vel_max: float = 0.0) -> list[dict[str, Any]]:
 
 def _get_current_trip(imei: str, vel_max: float = 0.0) -> list[dict[str, Any]]:
     """
-    Recorrido EN CURSO — desde el último encendido hasta el momento actual.
-
-    Diferencia con _get_latest_trip:
-      - latest:  desde apagado anterior HASTA último apagado (cerrado)
-      - current: desde último encendido HASTA ahora (abierto)
-
-    Lógica:
-      1. Buscar el evento más reciente con tipo_alerta=33 (encendido motor).
-      2. Si NO existe encendido posterior al último apagado → la unidad
-         está apagada → devolver lista vacía (no hay viaje en curso).
-      3. Si SÍ existe → traer todos los puntos desde ese encendido
-         hasta ahora.
-
-    Casos cubiertos:
-      - Unidad nueva sin telemetría: []
-      - Unidad apagada hace tiempo: []
-      - Unidad encendida ahora mismo: puntos desde el encendido hasta now()
-      - Unidad encendida y luego apagada: [] (cae a "latest" mejor)
+    Recorrido en curso — desde el último encendido hasta ahora.
     """
     with telemetry_cursor() as cursor:
         # 1. Buscar el último encendido del motor.
@@ -732,8 +688,7 @@ def _get_current_trip(imei: str, vel_max: float = 0.0) -> list[dict[str, Any]]:
         )
         last_on_row = cursor.fetchone()
 
-        # Fallback: si no hay tipo_alerta=33, usar STATUS_ON.
-        # Algunos dispositivos viejos no emiten tipo_alerta y solo cambian status.
+        # Fallback: si no hay tipo_alerta=33, usar STATUS_ON
         if not last_on_row:
             cursor.execute(
                 """
@@ -754,9 +709,7 @@ def _get_current_trip(imei: str, vel_max: float = 0.0) -> list[dict[str, Any]]:
 
         last_on_at = last_on_row[0]
 
-        # 2. Verificar que NO haya un apagado POSTERIOR al último encendido.
-        # Si hay apagado posterior → la unidad ya no está en viaje. Devolver
-        # vacío para que el frontend muestre el mensaje "Sin viaje en curso".
+        # 2. Verificar si hay un apagado más reciente que el último encendido.
         cursor.execute(
             """
             SELECT 1 FROM public.t_data
@@ -769,13 +722,10 @@ def _get_current_trip(imei: str, vel_max: float = 0.0) -> list[dict[str, Any]]:
             (imei, TIPO_ALERTA_APAGADO, last_on_at),
         )
         if cursor.fetchone():
-            # Hay un apagado más reciente que el último encendido → ya no
-            # está en viaje. El usuario debería usar "Último" en su lugar.
+            # El último encendido ya fue apagado -> no hay viaje en curso.
             return []
 
-    # 3. Hay viaje en curso — devolver los puntos desde el encendido hasta ahora.
-    # NOTA: usamos datetime.utcnow() en lugar de NOW() en SQL para que el
-    # rango sea coherente con el resto de las funciones (que usan UTC).
+    # 3. Consultar todos los puntos desde el último encendido hasta ahora.
     end_local = now_local_naive()
     return get_positions_in_range(imei, last_on_at, end_local, 5000, vel_max)
 
@@ -831,14 +781,7 @@ def get_route_by_custom_range(
 
 def _build_trip_id(start_row: tuple) -> str:
     """
-    Construye un ID estable para un recorrido basado en el timestamp del
-    punto de inicio. El formato es epoch en segundos prefijado con "t_".
-
-    ¿Por qué no f"trip_{idx}"?
-    El índice posicional NO es estable: si entre dos llamadas llega un
-    recorrido nuevo, "trip_1" pasaría a apuntar a un recorrido distinto.
-    Usar el timestamp del inicio garantiza que el ID apunte al MISMO
-    recorrido mientras ese timestamp exista en la BD.
+    Construye un ID estable para un recorrido a partir de su primer punto.
     """
     start_dt = start_row[0]
     start_utc = to_utc(start_dt)
@@ -852,9 +795,8 @@ def _fetch_trips_for_window(
     max_points: int = 50000,
 ) -> list[list[tuple]]:
     """
-    Helper privado: consulta puntos de los últimos `days_back` días y los
-    segmenta en recorridos. Evita duplicación entre get_recent_trips_by_imei
-    y get_trip_by_id.
+    Devuelve una lista de recorridos (cada uno es una lista de filas crudas)
+    de los últimos `days_back` días, hasta un máximo de `max_points` puntos
     """
     end_local = now_local_naive()
     start_local = end_local - timedelta(days=days_back)
@@ -868,10 +810,10 @@ def get_recent_trips_by_imei(
     id_empresa: int | None = None,
 ) -> list[dict[str, Any]]:
     """
-    Últimos `limit` recorridos de los últimos RECENT_TRIPS_DAYS días.
-
-    Un recorrido se delimita preferentemente por tipo_alerta=34 (apagado motor).
-    Fallback a STATUS_OFF si no hay eventos tipo_alerta en el rango.
+    Devuelve los recorridos recientes de la unidad, con métricas calculadas
+    y ordenados más reciente primero. Cada recorrido incluye:
+    - Puntos GPS
+    - Métricas de rendimiento
     """
     if id_empresa is not None and not check_unit_belongs_to_company(imei, id_empresa):
         return []
@@ -887,11 +829,7 @@ def get_trip_by_id(
     id_empresa: int | None = None,
 ) -> list[dict[str, Any]] | None:
     """
-    Devuelve los puntos del recorrido identificado por `trip_id`.
-
-    El ID es estable (timestamp epoch del inicio con prefijo "t_"), así que
-    puede llegar de una llamada previa a /recent-trips y seguir siendo válido
-    mientras el recorrido exista en la ventana de RECENT_TRIPS_DAYS días.
+    Devuelve un recorrido específico por su ID, o None si no se encuentra.
     """
     if id_empresa is not None and not check_unit_belongs_to_company(imei, id_empresa):
         return None
@@ -918,16 +856,8 @@ def get_trip_by_id(
 
 def _split_trips(rows: list[tuple]) -> list[list[tuple]]:
     """
-    Divide una secuencia de puntos en recorridos.
-
-    El criterio de corte se delega a utils.engine_state.is_engine_off_point()
-    para garantizar consistencia con el resto del sistema. Resumen:
-      1. tipo_alerta == 34 → apagado real del motor (corte duro).
-      2. tipo_alerta == 33 → nunca corta (encendido explícito gana).
-      3. status OFF + velocidad < 1 → fallback para AVLs sin tipo_alerta.
-
-    El punto de corte se INCLUYE al final del recorrido actual
-    (representa el punto de apagado).
+    Divide una lista de filas crudas en recorridos separados por apagados de motor.
+    Cada recorrido es una lista de filas consecutivas.
     """
     trips: list[list[tuple]] = []
     current: list[tuple] = []
@@ -965,15 +895,8 @@ def _format_trip_list(
     vel_max: float = 0.0,
 ) -> list[dict[str, Any]]:
     """
-    Convierte segmentos de filas brutas al formato de respuesta.
-    Ordena más reciente primero. Descarta viajes sin movimiento real
-    o con distancia < MIN_TRIP_DISTANCE_KM.
-
-    Métricas calculadas por punto (fiel al legacy SQL con variables):
-      moving_seconds  → segundos con motor ON y velocidad ≥ 1
-      idle_seconds    → segundos con motor ON y velocidad < 1 (relentí)
-      off_seconds     → segundos con motor OFF
-      speeding_count  → número de puntos con exceso de velocidad
+    Formatea una lista de recorridos crudos en la estructura que espera el frontend,
+    calculando métricas y descartando recorridos sin movimiento o muy cortos.
     """
     today_local = now_local().date()
     yesterday_local = today_local - timedelta(days=1)
@@ -999,11 +922,8 @@ def _compute_trip_metrics(
     vel_max: float,
 ) -> dict[str, Any] | None:
     """
-    Calcula las métricas de un recorrido individual.
-    Retorna None si el recorrido se descarta (sin movimiento o muy corto).
-
-    Extraído de _format_trip_list para mejorar legibilidad y permitir
-    reutilización futura (p. ej. endpoints de estadísticas).
+    Calcula métricas de un recorrido a partir de sus filas crudas.
+    Retorna None si el recorrido no tiene movimiento real o es demasiado corto.
     """
     start_row = trip_rows[0]
     end_row = trip_rows[-1]

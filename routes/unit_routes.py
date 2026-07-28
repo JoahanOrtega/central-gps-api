@@ -17,6 +17,8 @@ from services.unit_token_service import (
     get_unit_token_config,
     regenerate_tracking_token,
     revoke_tracking_token,
+    regenerate_temporal_token,
+    revoke_temporal_token,
 )
 from services.unit_image_service import save_unit_image, get_unit_image_path
 from utils.auth_guard import jwt_required, permiso_required, validate_empresa_access
@@ -287,6 +289,7 @@ def serve_unit_image(nombre):
         )
         return jsonify({"error": "Error interno del servidor"}), 500
 
+
 # ─── Token de rastreo de unidad ──────────────────────────────────────────────
 # Mismo patrón que el token de cliente (client_routes.py). El enlace público
 # generado aquí lo consume el blueprint público_track_routes SIN autenticación.
@@ -320,20 +323,15 @@ def get_unit_token(id_unidad: int):
 @units_bp.route("/units/<int:id_unidad>/token/regenerar", methods=["POST"])
 @permiso_required("unidades.editar")
 def regenerate_unit_token(id_unidad: int):
-    """Genera (o regenera) el token de rastreo y activa el acceso público."""
+    """Genera (o regenera) el token PERMANENTE (sin expiración)."""
     try:
         id_empresa = _resolve_empresa_token()
         if not id_empresa:
             return jsonify({"error": "Empresa no definida"}), 400
-
-        data = request.get_json(silent=True) or {}
-        minutos_expiracion = data.get("minutos_expiracion")
-
-        result = regenerate_tracking_token(id_unidad, id_empresa, minutos_expiracion)
-
+        result = regenerate_tracking_token(id_unidad, id_empresa)
         if result is None:
             return jsonify({"error": "Unidad no encontrada"}), 404
-        return jsonify({"message": "Token generado", **result}), 200
+        return jsonify({"message": "Token permanente generado", **result}), 200
     except Exception as exc:
         logger.error(
             "Error en POST /units/%s/token/regenerar: %s",
@@ -473,3 +471,50 @@ def list_pois_dropdown():
     except Exception as error:
         logger.error("Error en GET /units/pois: %s", repr(error))
         return jsonify({"error": "Error interno"}), 500
+      
+@units_bp.route("/units/<int:id_unidad>/token/temporal/regenerar", methods=["POST"])
+@permiso_required("unidades.editar")
+def regenerate_unit_temporal_token(id_unidad: int):
+    """Genera (o regenera) el token TEMPORAL con expiración."""
+    try:
+        id_empresa = _resolve_empresa_token()
+        if not id_empresa:
+            return jsonify({"error": "Empresa no definida"}), 400
+        data = request.get_json(silent=True) or {}
+        minutos = data.get("minutos_expiracion")
+        if not minutos or int(minutos) <= 0:
+            return jsonify({"error": "Se requiere una duración positiva"}), 400
+        result = regenerate_temporal_token(id_unidad, id_empresa, int(minutos))
+        if result is None:
+            return jsonify({"error": "Unidad no encontrada"}), 404
+        return jsonify({"message": "Token temporal generado", **result}), 200
+    except Exception as exc:
+        logger.error(
+            "Error en POST /units/%s/token/temporal/regenerar: %s",
+            id_unidad,
+            repr(exc),
+            exc_info=True,
+        )
+        return jsonify({"error": "Error interno del servidor"}), 500
+
+
+@units_bp.route("/units/<int:id_unidad>/token/temporal", methods=["DELETE"])
+@permiso_required("unidades.editar")
+def delete_unit_temporal_token(id_unidad: int):
+    """Revoca SOLO el token temporal."""
+    try:
+        id_empresa = _resolve_empresa_token()
+        if not id_empresa:
+            return jsonify({"error": "Empresa no definida"}), 400
+        ok = revoke_temporal_token(id_unidad, id_empresa)
+        if not ok:
+            return jsonify({"error": "Unidad no encontrada"}), 404
+        return jsonify({"message": "Token temporal revocado"}), 200
+    except Exception as exc:
+        logger.error(
+            "Error en DELETE /units/%s/token/temporal: %s",
+            id_unidad,
+            repr(exc),
+            exc_info=True,
+        )
+        return jsonify({"error": "Error interno del servidor"}), 500

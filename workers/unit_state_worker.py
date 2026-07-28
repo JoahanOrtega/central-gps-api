@@ -1,36 +1,6 @@
 # ══════════════════════════════════════════════════════════════════════════════
 # unit_state_worker.py — Detección de estados críticos de unidades
 # ══════════════════════════════════════════════════════════════════════════════
-#
-# Responsabilidad única: detectar cuándo una unidad ENTRA a un estado crítico
-# y publicar un evento en tiempo real por el mismo canal Redis → SSE que
-# usan los eventos de geocercas.
-#
-# Estados críticos detectados (TRANSICIONES, no estados sostenidos):
-#   20 → Apagado prolongado: motor apagado por más de APAGADO_PROLONGADO_SEC.
-#        Vehículo posiblemente abandonado, en taller, o batería desconectada.
-#   21 → Sin transmisión: el equipo GPS no reporta hace más de
-#        SIN_TRANSMISION_SEC. Problema de dispositivo, red o sabotaje.
-#
-# ── Por qué un worker SEPARADO de poi_worker ──────────────────────────────────
-# El ciclo de poi_worker:
-#   a) Solo procesa empresas CON alertas POI activas — una empresa sin
-#      geocercas configuradas jamás recibiría alertas de estado.
-#   b) Solo evalúa unidades con GPS reciente (< 10 min) — excluiría justo
-#      a las unidades sin transmisión, que son las que queremos detectar.
-# Un worker propio evalúa TODAS las unidades activas sin esos filtros y
-# mantiene cada responsabilidad en su archivo (Single Responsibility).
-#
-# ── Cooldown ──────────────────────────────────────────────────────────────────
-# Sin cooldown, una unidad apagada 5 horas dispararía la alerta en CADA
-# ciclo (cada 60s). El registro en memoria `_alertado` guarda qué par
-# (imei, tipo) ya fue notificado; se limpia cuando la unidad SALE del
-# estado crítico, de modo que una recaída futura vuelve a alertar.
-#
-# ⚠️ NOTA: los umbrales deben mantenerse alineados con el frontend
-# (telemetry-status.ts::APAGADO_PROLONGADO_SEGS = 4h). A futuro, mover
-# ambos a configuración por empresa en BD.
-# ══════════════════════════════════════════════════════════════════════════════
 
 from __future__ import annotations
 
@@ -47,8 +17,9 @@ from db.connection import (
     get_db_telemetry_connection,
     release_db_telemetry_connection,
 )
-from services.telemetry_service import get_seconds_in_state_for_imei, to_app_iso
-from utils.engine_state import resolve_engine_state
+from services.notification_service import crear_para_empresa, limpiar_antiguas
+from services.telemetry_service import to_app_iso
+from utils.engine_state import SIN_REPORTE_PROLONGADO_SEGS
 
 logger = logging.getLogger(__name__)
 
@@ -57,25 +28,29 @@ logger = logging.getLogger(__name__)
 # Cada cuántos segundos corre el ciclo de detección.
 POLL_INTERVAL: int = int(os.getenv("UNIT_STATE_POLL_INTERVAL_SEC", "60"))
 
-# Umbral de apagado prolongado — ALINEAR con telemetry-status.ts del front.
-APAGADO_PROLONGADO_SEC: int = int(
-    os.getenv("UNIT_STATE_APAGADO_PROLONGADO_SEC", str(4 * 60 * 60))  # 4 horas
+# Umbral de sin reportar — mismo criterio que el marcador rojo del mapa.
+# El default anterior (6 min) generaba ruido: cualquier hueco de cobertura
+# disparaba la alerta. 4h = problema real de equipo, no un túnel.
+SIN_TRANSMISION_SEC: int = int(
+    os.getenv("UNIT_STATE_SIN_TRANSMISION_SEC", str(SIN_REPORTE_PROLONGADO_SEGS))
 )
 
-# Umbral de sin transmisión — alineado con el stroke rojo del marcador (6 min).
-SIN_TRANSMISION_SEC: int = int(os.getenv("UNIT_STATE_SIN_TRANSMISION_SEC", "360"))
+# Cinturón anti-flapping: no repetir la misma alerta antes de este tiempo.
+REALERT_MIN_SEC: int = int(os.getenv("UNIT_STATE_REALERT_MIN_SEC", "3600"))
 
 REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 # Mismo canal base que poi_worker — el SSE ya está suscrito a este canal.
 REDIS_CHANNEL_BASE = "eventos_poi"
 
 # ── Tipos de evento de estado ─────────────────────────────────────────────────
+# El 20 (Apagado prolongado) está RETIRADO de la emisión; se conserva el ID
+# y su descripción solo para interpretar eventos históricos ya almacenados.
 TIPO_APAGADO_PROLONGADO = 20
 TIPO_SIN_TRANSMISION = 21
 
 _DESCRIPCION_POR_TIPO = {
     TIPO_APAGADO_PROLONGADO: "Apagado prolongado",
-    TIPO_SIN_TRANSMISION: "Sin transmisión del equipo GPS",
+    TIPO_SIN_TRANSMISION: "Sin reportar (más de 4 horas sin datos)",
 }
 
 # ── SQL ───────────────────────────────────────────────────────────────────────
@@ -87,8 +62,7 @@ _SQL_UNIDADES_ACTIVAS = """
     WHERE status = 1 AND imei IS NOT NULL AND TRIM(imei) <> ''
 """
 
-# Última posición por IMEI (DISTINCT ON es eficiente con el índice de t_data).
-# fecha_hora_sistema = cuándo llegó el dato al sistema (vida del dispositivo).
+# Última telemetría por IMEI (batch, un solo query). TimescaleDB.
 _SQL_ULTIMA_TELEMETRIA = """
     SELECT DISTINCT ON (imei)
         imei,
@@ -99,7 +73,7 @@ _SQL_ULTIMA_TELEMETRIA = """
         longitud
     FROM t_data
     WHERE imei = ANY(%(imeis)s)
-    ORDER BY imei, fecha_hora_gps DESC
+    ORDER BY imei, fecha_hora_sistema DESC, fecha_hora_gps DESC
 """
 
 # ── Estado en memoria: qué alertas ya se notificaron ──────────────────────────
@@ -150,6 +124,19 @@ def _publicar_evento(id_empresa: int, payload: dict) -> None:
             payload.get("numero_unidad"),
             payload.get("tipo_evento"),
         )
+
+        # Persistir la notificación para que la campanita del usuario la vea
+        try:
+            crear_para_empresa(
+                id_empresa=id_empresa,
+                tipo=int(payload.get("tipo_evento") or 0),
+                titulo=f"{payload.get('numero_unidad', 'Unidad')}: "
+                f"{payload.get('descripcion', 'Evento de estado')}",
+                mensaje=payload.get("descripcion"),
+                id_unidad=payload.get("id_unidad"),
+            )
+        except Exception as exc:
+            logger.warning("No se pudo persistir la notificación: %s", repr(exc))
     except redis.RedisError as exc:
         logger.warning(
             "Redis no disponible — alerta de estado NO enviada: %s", repr(exc)
@@ -198,6 +185,22 @@ def _ejecutar_ciclo() -> None:
         )
 
 
+# Hidratación de purga diaria (para no acumular notificaciones antiguas)
+_ultimo_dia_purga: str | None = None
+
+
+def _purga_diaria() -> None:
+    global _ultimo_dia_purga
+    hoy = datetime.now().strftime("%Y-%m-%d")
+    if _ultimo_dia_purga == hoy:
+        return
+    _ultimo_dia_purga = hoy
+    try:
+        limpiar_antiguas()
+    except Exception as exc:
+        logger.warning("Purga de notificaciones falló: %s", repr(exc))
+
+
 def _ciclo_interno() -> None:
     """
     1. Lee todas las unidades activas (BD principal).
@@ -205,6 +208,8 @@ def _ciclo_interno() -> None:
     3. Evalúa transiciones a estado crítico y publica eventos.
     4. Limpia el registro de cooldown cuando una unidad sale del estado.
     """
+    _purga_diaria()
+
     conn_main = conn_telem = None
 
     try:
@@ -248,39 +253,79 @@ def _ciclo_interno() -> None:
                     en_estado_critico=segundos_sistema > SIN_TRANSMISION_SEC,
                 )
 
-            # ── 3b. Apagado prolongado ─────────────────────────────────
-            # Solo si el motor está apagado según el último dato.
-            if telem is not None:
-                status_raw = (
-                    str(telem["status"]).strip()
-                    if telem.get("status") is not None
-                    else None
-                )
-                engine_state = resolve_engine_state(
-                    telem.get("tipo_alerta"), status_raw
-                )
-
-                if engine_state == "off":
-                    segundos_apagada = get_seconds_in_state_for_imei(imei)
-                    _evaluar_transicion(
-                        unidad=unidad,
-                        telem=telem,
-                        tipo=TIPO_APAGADO_PROLONGADO,
-                        en_estado_critico=(
-                            segundos_apagada is not None
-                            and segundos_apagada > APAGADO_PROLONGADO_SEC
-                        ),
-                    )
-                else:
-                    # Motor encendido → si estaba marcada, salió del estado:
-                    # limpiar para que una futura recaída vuelva a alertar.
-                    _alertado.discard((imei, TIPO_APAGADO_PROLONGADO))
-
     finally:
         if conn_main:
             release_db_connection(conn_main)
         if conn_telem:
             release_db_telemetry_connection(conn_telem)
+
+
+# Hidratación de cooldown (para no alertar de nuevo un episodio ya notificado)
+_max_fecha_notif: dict[tuple[int, int], object] | None = None
+
+
+def _cargar_max_fechas_notificacion() -> dict[tuple[int, int], object]:
+    """Última fecha de notificación por (id_unidad, tipo). Una vez por vida."""
+    from utils.db_cursor import main_cursor
+
+    fechas: dict[tuple[int, int], object] = {}
+    try:
+        with main_cursor() as cursor:
+            cursor.execute("""
+                SELECT id_unidad, tipo, MAX(fecha_registro)
+                FROM t_notificaciones_usuario
+                WHERE id_unidad IS NOT NULL
+                GROUP BY id_unidad, tipo
+                """)
+            for id_unidad, tipo, fecha in cursor.fetchall():
+                fechas[(id_unidad, tipo)] = fecha
+    except Exception as exc:
+        # Sin hidratación el worker sigue funcionando (solo pierde la
+        # protección anti-duplicado de este arranque) — nunca tumbar el
+        # ciclo por esto.
+        logger.warning("Hidratación de cooldown falló: %s", repr(exc))
+    return fechas
+
+
+def _naive(dt):
+    """
+    Convierte un datetime con tzinfo a naive (sin tzinfo) en UTC-6.
+    1. Si dt es None, devuelve None.
+    """
+    if dt is None:
+        return None
+    return dt.replace(tzinfo=None) if getattr(dt, "tzinfo", None) else dt
+
+
+def _ya_notificado_este_episodio(unidad: dict, telem: dict | None, tipo: int) -> bool:
+    """
+    True si ya se notificó este episodio de estado crítico (cooldown).
+    """
+    global _max_fecha_notif
+    if _max_fecha_notif is None:
+        _max_fecha_notif = _cargar_max_fechas_notificacion()
+
+    fecha_notif = _naive(_max_fecha_notif.get((unidad.get("id_unidad"), tipo)))
+    if fecha_notif is None:
+        return False
+
+    ultima_llegada = _naive(telem.get("fecha_hora_sistema")) if telem else None
+    # Sin dato de referencia, la existencia de una notificación previa
+    # basta como evidencia del episodio ya avisado.
+    if ultima_llegada is None:
+        return True
+    return fecha_notif > ultima_llegada
+
+
+def _en_ventana_de_rearme(unidad: dict, tipo: int) -> bool:
+    """True si la última alerta de esta unidad+tipo es demasiado reciente."""
+    if _max_fecha_notif is None:
+        return False
+    fecha_notif = _naive(_max_fecha_notif.get((unidad.get("id_unidad"), tipo)))
+    if fecha_notif is None:
+        return False
+    transcurrido = (_ahora_naive_utc6() - fecha_notif).total_seconds()
+    return transcurrido < REALERT_MIN_SEC
 
 
 def _evaluar_transicion(
@@ -300,11 +345,22 @@ def _evaluar_transicion(
 
     if en_estado_critico:
         if clave not in _alertado:
+            # ¿Ya notificamos este episodio? Si es así, no alertamos de nuevo
+            if _ya_notificado_este_episodio(unidad, telem, tipo):
+                _alertado.add(clave)
+                return
+            # ¿La última notificación fue demasiado reciente? Si es así, no alertamos
+            if _en_ventana_de_rearme(unidad, tipo):
+                _alertado.add(clave)
+                return
             _alertado.add(clave)
             _publicar_evento(
                 unidad["id_empresa"],
                 _construir_payload(unidad, tipo, telem),
             )
+            # Actualizar la fecha de notificación para el cooldown y la persistencia
+            if _max_fecha_notif is not None:
+                _max_fecha_notif[(unidad.get("id_unidad"), tipo)] = _ahora_naive_utc6()
     else:
         _alertado.discard(clave)
 
@@ -332,8 +388,7 @@ def registrar_en_scheduler(scheduler) -> None:
         next_run_time=datetime.now(timezone.utc) + timedelta(seconds=7),
     )
     logger.info(
-        "Unit State Worker registrado — ciclo cada %ds, umbrales: off=%ds, tx=%ds",
+        "Unit State Worker registrado — ciclo cada %ds, umbral sin-reporte=%ds",
         POLL_INTERVAL,
-        APAGADO_PROLONGADO_SEC,
         SIN_TRANSMISION_SEC,
     )

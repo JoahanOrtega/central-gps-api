@@ -3,25 +3,27 @@ from flask import Blueprint, jsonify
 
 from services.unit_token_service import get_unit_by_token
 from services.telemetry_service import get_latest_positions_by_imeis
+from utils.limiter import limiter
 
 logger = logging.getLogger(__name__)
 
-# Blueprint SEPARADO a propósito: estas rutas son públicas por diseño (sin JWT).
-# Mantenerlas fuera de units_bp deja explícito que aquí no hay guard de auth y
-# evita que un @jwt_required global las cubra por accidente. El token ES la
-# credencial.
+# Blueprint para endpoints públicos de rastreo de unidades. No requiere
+# autenticación, pero sí un token secreto que se genera para cada unidad.
 public_track_bp = Blueprint("public_track", __name__)
 
 
 @public_track_bp.route("/public/track/unit/<token>", methods=["GET"])
+# Limitamos a 30 requests/minuto por IP para evitar que un bot haga scraping de
+# tokens y descubra unidades. El token es secreto, pero no es un password: si
+@limiter.limit("30 per minute")
 def track_unit_by_token(token: str):
     """
-    Devuelve la posición actual de una unidad a partir de su token de rastreo.
+    Endpoint público para obtener la última posición de una unidad a partir de un
+    token secreto. No requiere autenticación, pero sí un token que se genera para
+    cada unidad. El token se puede revocar o expirar, y no se distingue entre
+    "no existe", "revocado" o "expirado" para no filtrar información a quien sondea tokens. 
+    La respuesta incluye información de la unidad y su última posición conocida.
 
-    SIN autenticación: cualquiera con el enlace puede ver la unidad — ese es el
-    propósito del token. Solo expone datos no sensibles (número, marca, modelo)
-    más la última posición. Revocar el token o desactivar el acceso invalida
-    este endpoint al instante (lo maneja get_unit_by_token).
     """
     try:
         unidad = get_unit_by_token(token)
