@@ -171,6 +171,13 @@ def _load_user_permissions(
     return [row[0] for row in cursor.fetchall()]
 
 
+# Mensaje para empresas suspendidas
+ERROR_EMPRESA_SUSPENDIDA = (
+    "Tu cuenta está temporalmente suspendida."
+    "Para reactivar el servicio, contacta a el administrador."
+)
+
+
 def authenticate_user(username: str, password: str):
     """
     Autentica a un usuario y genera su JWT.
@@ -227,11 +234,11 @@ def authenticate_user(username: str, password: str):
                 u.id_rol,
                 r.clave      AS rol,
                 u.id_empresa,
-                e.nombre     AS nombre_empresa
+                e.nombre     AS nombre_empresa,
+                e.status     AS empresa_status
             FROM t_usuarios u
             LEFT JOIN t_roles   r ON r.id_rol     = u.id_rol
             LEFT JOIN t_empresas e ON e.id_empresa = u.id_empresa
-                                   AND e.status    = 1
             WHERE u.usuario = %s
               AND u.status  = 1
             """,
@@ -254,11 +261,16 @@ def authenticate_user(username: str, password: str):
             rol,
             id_empresa,
             nombre_empresa,
+            empresa_status,
         ) = row
 
         # 2. Verificar contraseña — soporta bcrypt (nuevo) y MD5 (legacy PHP)
         if not _verificar_password(password, stored_hash):
             return None, None, ERROR_CREDENCIALES
+
+        # Empresa suspendida (status=0)
+        if empresa_status == 0 and rol != "sudo_erp":
+            return None, None, ERROR_EMPRESA_SUSPENDIDA
 
         # 3. Migración silenciosa: si el hash es MD5, actualizarlo a bcrypt ahora.
         #    La contraseña ya fue verificada como correcta, así que es seguro hacerlo.
