@@ -76,6 +76,35 @@ _SQL_ULTIMA_TELEMETRIA = """
     ORDER BY imei, fecha_hora_sistema DESC, fecha_hora_gps DESC
 """
 
+# Inserta en t_alertas_grupo_whatsapp para todos los grupos activos de la empresa (BD principal).
+# Si no existen grupos activos para la empresa, inserta un registro con id_grupo_whatsapp = NULL.
+_SQL_INSERT_ALERTA_WHATSAPP = """
+    WITH grupos AS (
+        SELECT id_grupo_whatsapp
+        FROM public.t_grupos_whatsapp
+        WHERE id_empresa = %(id_empresa)s
+          AND status = 1
+    )
+    INSERT INTO public.t_alertas_grupo_whatsapp (
+        id_empresa,
+        id_grupo_whatsapp,
+        tipo_alerta,
+        mensaje,
+        fecha_evento,
+        status
+    )
+    SELECT
+        %(id_empresa)s,
+        g.id_grupo_whatsapp,
+        %(tipo_alerta)s,
+        %(mensaje)s,
+        %(fecha_evento)s,
+        0
+    FROM (SELECT 1) dummy
+    LEFT JOIN grupos g ON TRUE
+    ON CONFLICT DO NOTHING
+"""
+
 # ── Estado en memoria: qué alertas ya se notificaron ──────────────────────────
 # Clave: (imei, tipo_evento). Se limpia cuando la unidad sale del estado.
 _alertado: set[tuple[str, int]] = set()
@@ -112,6 +141,45 @@ def _ahora_naive_utc6() -> datetime:
     return now_local_naive()
 
 
+def _insertar_alerta_whatsapp(id_empresa: int, payload: dict) -> None:
+    """
+    Inserta registros de alerta para WhatsApp en t_alertas_grupo_whatsapp para
+    todos los grupos activos de la empresa.
+    """
+    from utils.db_cursor import main_cursor
+
+    num_unidad = payload.get("numero_unidad", "Unidad")
+    desc = payload.get("descripcion", "Evento de estado")
+    mensaje = f"Unidad {num_unidad} - {desc}"
+
+    # Para cumplir con CHECK (tipo_alerta IN ('geocerca', 'velocidad'))
+    tipo_alerta = "velocidad"
+
+    fecha_str = payload.get("fecha_hora_evento")
+    try:
+        fecha_evento = (
+            datetime.fromisoformat(fecha_str)
+            if isinstance(fecha_str, str)
+            else _ahora_naive_utc6()
+        )
+    except Exception:
+        fecha_evento = _ahora_naive_utc6()
+
+    try:
+        with main_cursor() as cursor:
+            cursor.execute(
+                _SQL_INSERT_ALERTA_WHATSAPP,
+                {
+                    "id_empresa": id_empresa,
+                    "tipo_alerta": tipo_alerta,
+                    "mensaje": mensaje,
+                    "fecha_evento": fecha_evento,
+                },
+            )
+    except Exception as exc:
+        logger.warning("No se pudo insertar alerta WhatsApp: %s", repr(exc))
+
+
 def _publicar_evento(id_empresa: int, payload: dict) -> None:
     """Publica un evento de estado en el canal Redis de la empresa."""
     try:
@@ -137,6 +205,13 @@ def _publicar_evento(id_empresa: int, payload: dict) -> None:
             )
         except Exception as exc:
             logger.warning("No se pudo persistir la notificación: %s", repr(exc))
+
+        # Persistir la alerta de WhatsApp para todos los grupos activos de la empresa
+        try:
+            _insertar_alerta_whatsapp(id_empresa, payload)
+        except Exception as exc:
+            logger.warning("No se pudo persistir la alerta de WhatsApp: %s", repr(exc))
+
     except redis.RedisError as exc:
         logger.warning(
             "Redis no disponible — alerta de estado NO enviada: %s", repr(exc)
