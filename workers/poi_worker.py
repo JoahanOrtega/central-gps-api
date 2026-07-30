@@ -6,7 +6,7 @@ Flujo por ciclo (cada WORKER_POLL_INTERVAL segundos):
   4. Combinar unidades + GPS en Python.
   5. Para cada par (unidad, POI): evaluar entrada/salida/paso/permanencia/vel.
   6. Para cada unidad con vel_max: evaluar exceso de velocidad global (ev. 3/4).
-  7. Insertar eventos en t_eventos (BD telemetria).
+  7. Insertar eventos en t_eventos (BD telemetria) y t_alertas_grupo_whatsapp (BD principal).
   8. Actualizar estado geográfico en r_poi_unidades (BD principal).
   9. Publicar eventos en Redis → SSE → frontend.
 
@@ -439,6 +439,35 @@ _SQL_INSERT_EVENTO = """
     RETURNING id_evento
 """
 
+# Inserta en t_alertas_grupo_whatsapp para todos los grupos activos de la empresa (BD principal).
+# Si no existen grupos activos para la empresa, inserta un registro con id_grupo_whatsapp = NULL.
+_SQL_INSERT_ALERTA_WHATSAPP = """
+    WITH grupos AS (
+        SELECT id_grupo_whatsapp
+        FROM public.t_grupos_whatsapp
+        WHERE id_empresa = %(id_empresa)s
+          AND status = 1
+    )
+    INSERT INTO public.t_alertas_grupo_whatsapp (
+        id_empresa,
+        id_grupo_whatsapp,
+        tipo_alerta,
+        mensaje,
+        fecha_evento,
+        status
+    )
+    SELECT
+        %(id_empresa)s,
+        g.id_grupo_whatsapp,
+        %(tipo_alerta)s,
+        %(mensaje)s,
+        %(fecha_evento)s,
+        0
+    FROM (SELECT 1) dummy
+    LEFT JOIN grupos g ON TRUE
+    ON CONFLICT DO NOTHING
+"""
+
 
 # ── Lógica principal del ciclo ────────────────────────────────────────────────
 
@@ -460,7 +489,7 @@ def _ciclo_interno() -> None:
     Implementación del ciclo de detección.
 
     Usa DOS conexiones separadas:
-      conn_main  → BD principal (t_unidades, t_alertas_poi, r_poi_unidades)
+      conn_main  → BD principal (t_unidades, t_alertas_poi, r_poi_unidades, t_alertas_grupo_whatsapp)
       conn_telem → BD telemetría (t_data GPS, t_eventos INSERT)
 
     El cache in-memory (_cache) reduce las consultas a BD per-par.
@@ -580,6 +609,8 @@ def _ciclo_interno() -> None:
                         unidad=unidad,
                         vel_max=vel_max_global,
                         estado_unidad=estado_unidad,
+                        cur_main=cur_main,
+                        conn_main=conn_main,
                         cur_telem=cur_telem,
                         conn_telem=conn_telem,
                     )
@@ -687,6 +718,14 @@ def _evaluar_unidad_poi(
             evento = _construir_evento(tipo_evento, unidad, alerta, detalles=None)
             eventos.append(evento)
             _insertar_evento_bd(cur_telem, conn_telem, evento)
+            _insertar_alerta_whatsapp_bd(
+                cur_main,
+                conn_main,
+                id_empresa,
+                "geocerca",
+                _construir_mensaje_whatsapp(evento),
+                fecha_hora_gps,
+            )
             _marcar_cooldown(ep, tipo_evento, fecha_hora_gps)
             estado_persistir = True
 
@@ -714,6 +753,14 @@ def _evaluar_unidad_poi(
             evento = _construir_evento(19, unidad, alerta, detalles=None)
             eventos.append(evento)
             _insertar_evento_bd(cur_telem, conn_telem, evento)
+            _insertar_alerta_whatsapp_bd(
+                cur_main,
+                conn_main,
+                id_empresa,
+                "geocerca",
+                _construir_mensaje_whatsapp(evento),
+                fecha_hora_gps,
+            )
             _marcar_cooldown(ep, 19, fecha_hora_gps)
 
     # ── Detección de permanencia excedida (ev. 12) ────────────────────────
@@ -737,6 +784,14 @@ def _evaluar_unidad_poi(
                 evento = _construir_evento(12, unidad, alerta, detalles)
                 eventos.append(evento)
                 _insertar_evento_bd(cur_telem, conn_telem, evento)
+                _insertar_alerta_whatsapp_bd(
+                    cur_main,
+                    conn_main,
+                    id_empresa,
+                    "geocerca",
+                    _construir_mensaje_whatsapp(evento),
+                    fecha_hora_gps,
+                )
                 _marcar_cooldown(ep, 12, fecha_hora_gps)
                 ep.alerta_permanencia_ok = True
                 estado_persistir = True
@@ -764,6 +819,14 @@ def _evaluar_unidad_poi(
                 evento = _construir_evento(13, unidad, alerta, detalles)
                 eventos.append(evento)
                 _insertar_evento_bd(cur_telem, conn_telem, evento)
+                _insertar_alerta_whatsapp_bd(
+                    cur_main,
+                    conn_main,
+                    id_empresa,
+                    "geocerca",
+                    _construir_mensaje_whatsapp(evento),
+                    fecha_hora_gps,
+                )
                 _marcar_cooldown(ep, 13, fecha_hora_gps)
                 ep.alerta_permanencia_ok = True
                 estado_persistir = True
@@ -781,6 +844,14 @@ def _evaluar_unidad_poi(
                 evento = _construir_evento(14, unidad, alerta, detalles=None)
                 eventos.append(evento)
                 _insertar_evento_bd(cur_telem, conn_telem, evento)
+                _insertar_alerta_whatsapp_bd(
+                    cur_main,
+                    conn_main,
+                    id_empresa,
+                    "velocidad",
+                    _construir_mensaje_whatsapp(evento),
+                    fecha_hora_gps,
+                )
                 _marcar_cooldown(ep, 14, fecha_hora_gps)
                 estado_persistir = True
 
@@ -807,6 +878,14 @@ def _evaluar_unidad_poi(
                 evento = _construir_evento(15, unidad, alerta, detalles)
                 eventos.append(evento)
                 _insertar_evento_bd(cur_telem, conn_telem, evento)
+                _insertar_alerta_whatsapp_bd(
+                    cur_main,
+                    conn_main,
+                    id_empresa,
+                    "velocidad",
+                    _construir_mensaje_whatsapp(evento),
+                    fecha_hora_gps,
+                )
                 _marcar_cooldown(ep, 15, fecha_hora_gps)
                 estado_persistir = True
 
@@ -832,6 +911,8 @@ def _evaluar_velocidad_global(
     unidad: dict,
     vel_max: float,
     estado_unidad: EstadoUnidad,
+    cur_main,
+    conn_main,
     cur_telem,
     conn_telem,
 ) -> list[dict]:
@@ -851,6 +932,7 @@ def _evaluar_velocidad_global(
         unidad:        Dict con la posición GPS actual.
         vel_max:       Velocidad máxima configurada para la unidad (km/h).
         estado_unidad: Estado global en memoria de la unidad.
+        cur_main, conn_main: Cursor y conexión BD principal para t_alertas_grupo_whatsapp.
         cur_telem, conn_telem: Cursor y conexión para insertar en t_eventos.
 
     Returns:
@@ -859,6 +941,7 @@ def _evaluar_velocidad_global(
     eventos: list[dict] = []
     vel_actual = float(unidad.get("velocidad") or 0)
     fecha_gps = unidad["fecha_hora_gps"]
+    id_empresa = unidad.get("id_empresa")
 
     en_exceso = estado_unidad.fecha_hora_ini_exceso_vel is not None
 
@@ -888,6 +971,15 @@ def _evaluar_velocidad_global(
                 )
                 eventos.append(evento)
                 _insertar_evento_bd(cur_telem, conn_telem, evento)
+                if id_empresa:
+                    _insertar_alerta_whatsapp_bd(
+                        cur_main,
+                        conn_main,
+                        id_empresa,
+                        "velocidad",
+                        _construir_mensaje_whatsapp(evento),
+                        fecha_gps,
+                    )
                 _marcar_cooldown_unidad(estado_unidad, "ev_3", fecha_gps)
 
     # ── DURANTE EL EXCESO: actualizar vel_max_alcanzada ───────────────────
@@ -917,6 +1009,15 @@ def _evaluar_velocidad_global(
             )
             eventos.append(evento)
             _insertar_evento_bd(cur_telem, conn_telem, evento)
+            if id_empresa:
+                _insertar_alerta_whatsapp_bd(
+                    cur_main,
+                    conn_main,
+                    id_empresa,
+                    "velocidad",
+                    _construir_mensaje_whatsapp(evento),
+                    fecha_gps,
+                )
             _marcar_cooldown_unidad(estado_unidad, "ev_4", fecha_gps)
 
         # Limpiar estado de exceso independientemente de si se emitió el evento
@@ -1031,6 +1132,54 @@ def _insertar_evento_bd(cur_telem, conn_telem, evento: dict) -> None:
             "Error insertando en t_eventos tipo=%s id_unidad=%s: %s",
             evento.get("evento"),
             evento.get("id_unidad"),
+            repr(exc),
+        )
+
+
+def _construir_mensaje_whatsapp(evento: dict) -> str:
+    """Construye un mensaje descriptivo para la alerta de WhatsApp."""
+    num_unidad = evento.get("_numero_unidad") or evento.get("id_unidad")
+    desc = evento.get("_descripcion") or f"Evento {evento.get('evento')}"
+    nombre_poi = evento.get("_nombre_poi")
+
+    if nombre_poi:
+        return f"Unidad {num_unidad} - {desc}: {nombre_poi}"
+    return f"Unidad {num_unidad} - {desc}"
+
+
+def _insertar_alerta_whatsapp_bd(
+    cur_main,
+    conn_main,
+    id_empresa: int,
+    tipo_alerta: str,
+    mensaje: str,
+    fecha_evento: datetime,
+) -> None:
+    """
+    Inserta el registro de alerta en t_alertas_grupo_whatsapp para todos los
+    grupos de WhatsApp activos de la empresa.
+    """
+    if not id_empresa:
+        return
+    try:
+        cur_main.execute(
+            _SQL_INSERT_ALERTA_WHATSAPP,
+            {
+                "id_empresa": id_empresa,
+                "tipo_alerta": tipo_alerta,
+                "mensaje": mensaje,
+                "fecha_evento": fecha_evento,
+            },
+        )
+        conn_main.commit()
+    except Exception as exc:
+        try:
+            conn_main.rollback()
+        except Exception:
+            pass
+        logger.error(
+            "Error insertando alerta WhatsApp empresa=%s: %s",
+            id_empresa,
             repr(exc),
         )
 
