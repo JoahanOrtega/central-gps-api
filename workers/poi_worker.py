@@ -6,7 +6,7 @@ Flujo por ciclo (cada WORKER_POLL_INTERVAL segundos):
   4. Combinar unidades + GPS en Python.
   5. Para cada par (unidad, POI): evaluar entrada/salida/paso/permanencia/vel.
   6. Para cada unidad con vel_max: evaluar exceso de velocidad global (ev. 3/4).
-  7. Insertar eventos en t_eventos (BD telemetria) y t_alertas_grupo_whatsapp (BD principal).
+  7. Insertar eventos en t_eventos (BD telemetria) y t_alertas_whatsapp (BD principal).
   8. Actualizar estado geográfico en r_poi_unidades (BD principal).
   9. Publicar eventos en Redis → SSE → frontend.
 
@@ -439,18 +439,18 @@ _SQL_INSERT_EVENTO = """
     RETURNING id_evento
 """
 
-# Inserta en t_alertas_grupo_whatsapp para todos los grupos activos de la empresa (BD principal).
-# Si no existen grupos activos para la empresa, inserta un registro con id_grupo_whatsapp = NULL.
+# Inserta en t_alertas_whatsapp para todos los destinos activos de la empresa (BD principal).
+# Si no existen destinos activos para la empresa, inserta un registro con id_destino_whatsapp = NULL.
 _SQL_INSERT_ALERTA_WHATSAPP = """
-    WITH grupos AS (
-        SELECT id_grupo_whatsapp
-        FROM public.t_grupos_whatsapp
+    WITH destinos AS (
+        SELECT id_destino_whatsapp
+        FROM public.t_destinos_whatsapp
         WHERE id_empresa = %(id_empresa)s
           AND status = 1
     )
-    INSERT INTO public.t_alertas_grupo_whatsapp (
+    INSERT INTO public.t_alertas_whatsapp (
         id_empresa,
-        id_grupo_whatsapp,
+        id_destino_whatsapp,
         tipo_alerta,
         mensaje,
         fecha_evento,
@@ -458,13 +458,13 @@ _SQL_INSERT_ALERTA_WHATSAPP = """
     )
     SELECT
         %(id_empresa)s,
-        g.id_grupo_whatsapp,
+        d.id_destino_whatsapp,
         %(tipo_alerta)s,
         %(mensaje)s,
         %(fecha_evento)s,
         0
     FROM (SELECT 1) dummy
-    LEFT JOIN grupos g ON TRUE
+    LEFT JOIN destinos d ON TRUE
     ON CONFLICT DO NOTHING
 """
 
@@ -489,7 +489,7 @@ def _ciclo_interno() -> None:
     Implementación del ciclo de detección.
 
     Usa DOS conexiones separadas:
-      conn_main  → BD principal (t_unidades, t_alertas_poi, r_poi_unidades, t_alertas_grupo_whatsapp)
+      conn_main  → BD principal (t_unidades, t_alertas_poi, r_poi_unidades, t_alertas_whatsapp)
       conn_telem → BD telemetría (t_data GPS, t_eventos INSERT)
 
     El cache in-memory (_cache) reduce las consultas a BD per-par.
@@ -932,7 +932,7 @@ def _evaluar_velocidad_global(
         unidad:        Dict con la posición GPS actual.
         vel_max:       Velocidad máxima configurada para la unidad (km/h).
         estado_unidad: Estado global en memoria de la unidad.
-        cur_main, conn_main: Cursor y conexión BD principal para t_alertas_grupo_whatsapp.
+        cur_main, conn_main: Cursor y conexión BD principal para t_alertas_whatsapp.
         cur_telem, conn_telem: Cursor y conexión para insertar en t_eventos.
 
     Returns:
@@ -1156,8 +1156,8 @@ def _insertar_alerta_whatsapp_bd(
     fecha_evento: datetime,
 ) -> None:
     """
-    Inserta el registro de alerta en t_alertas_grupo_whatsapp para todos los
-    grupos de WhatsApp activos de la empresa.
+    Inserta el registro de alerta en t_alertas_whatsapp para todos los
+    destinos de WhatsApp activos de la empresa.
     """
     if not id_empresa:
         return

@@ -76,18 +76,18 @@ _SQL_ULTIMA_TELEMETRIA = """
     ORDER BY imei, fecha_hora_sistema DESC, fecha_hora_gps DESC
 """
 
-# Inserta en t_alertas_grupo_whatsapp para todos los grupos activos de la empresa (BD principal).
-# Si no existen grupos activos para la empresa, inserta un registro con id_grupo_whatsapp = NULL.
+# Inserta en t_alertas_whatsapp para todos los destinos activos de la empresa (BD principal).
+# Si no existen destinos activos para la empresa, inserta un registro con id_destino_whatsapp = NULL.
 _SQL_INSERT_ALERTA_WHATSAPP = """
-    WITH grupos AS (
-        SELECT id_grupo_whatsapp
-        FROM public.t_grupos_whatsapp
+    WITH destinos AS (
+        SELECT id_destino_whatsapp
+        FROM public.t_destinos_whatsapp
         WHERE id_empresa = %(id_empresa)s
           AND status = 1
     )
-    INSERT INTO public.t_alertas_grupo_whatsapp (
+    INSERT INTO public.t_alertas_whatsapp (
         id_empresa,
-        id_grupo_whatsapp,
+        id_destino_whatsapp,
         tipo_alerta,
         mensaje,
         fecha_evento,
@@ -95,13 +95,13 @@ _SQL_INSERT_ALERTA_WHATSAPP = """
     )
     SELECT
         %(id_empresa)s,
-        g.id_grupo_whatsapp,
+        d.id_destino_whatsapp,
         %(tipo_alerta)s,
         %(mensaje)s,
         %(fecha_evento)s,
         0
     FROM (SELECT 1) dummy
-    LEFT JOIN grupos g ON TRUE
+    LEFT JOIN destinos d ON TRUE
     ON CONFLICT DO NOTHING
 """
 
@@ -143,8 +143,8 @@ def _ahora_naive_utc6() -> datetime:
 
 def _insertar_alerta_whatsapp(id_empresa: int, payload: dict) -> None:
     """
-    Inserta registros de alerta para WhatsApp en t_alertas_grupo_whatsapp para
-    todos los grupos activos de la empresa.
+    Inserta registros de alerta para WhatsApp en t_alertas_whatsapp para
+    todos los destinos activos de la empresa.
     """
     from utils.db_cursor import main_cursor
 
@@ -206,7 +206,7 @@ def _publicar_evento(id_empresa: int, payload: dict) -> None:
         except Exception as exc:
             logger.warning("No se pudo persistir la notificación: %s", repr(exc))
 
-        # Persistir la alerta de WhatsApp para todos los grupos activos de la empresa
+        # Persistir la alerta de WhatsApp para todos los destinos activos de la empresa
         try:
             _insertar_alerta_whatsapp(id_empresa, payload)
         except Exception as exc:
