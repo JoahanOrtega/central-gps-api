@@ -1137,7 +1137,7 @@ def _insertar_alerta_whatsapp_bd(
 ) -> None:
     """
     Inserta el registro de alerta en t_alertas_whatsapp para todos los
-    grupos de WhatsApp activos de la empresa.
+    destinos de WhatsApp activos de la empresa.
     """
     if not id_empresa:
         return

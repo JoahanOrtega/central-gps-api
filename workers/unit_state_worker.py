@@ -197,7 +197,7 @@ def _publicar_evento(id_empresa: int, payload: dict) -> None:
         except Exception as exc:
             logger.warning("No se pudo persistir la notificación: %s", repr(exc))
 
-        # Persistir la alerta de WhatsApp para todos los grupos activos de la empresa
+        # Persistir la alerta de WhatsApp para todos los destinos activos de la empresa
         try:
             _insertar_alerta_whatsapp(id_empresa, payload)
         except Exception as exc:
