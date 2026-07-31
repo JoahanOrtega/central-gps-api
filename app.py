@@ -48,6 +48,7 @@ from routes.operator_routes import operator_bp
 from routes.public_track_routes import public_track_bp
 from routes.dashboard_routes import dashboard_bp
 from routes.notification_routes import notifications_bp
+from routes.whatsapp_destino_routes import whatsapp_destino_bp
 
 logger = logging.getLogger(__name__)
 
@@ -142,6 +143,7 @@ def create_app() -> Flask:
     app.register_blueprint(public_track_bp)
     app.register_blueprint(dashboard_bp)
     app.register_blueprint(notifications_bp)
+    app.register_blueprint(whatsapp_destino_bp, url_prefix="/whatsapp")
 
     # ── WebSocket de eventos (coexiste con el SSE /events/stream) ──────────
     init_ws(app)
@@ -181,8 +183,9 @@ if __name__ == "__main__":
     from workers.poi_worker import iniciar_worker, detener_worker, get_scheduler
     from workers.unit_state_worker import registrar_en_scheduler
     from workers.refresh_token_cleanup import (
-            registrar_en_scheduler as registrar_limpieza_tokens,
-        )
+        registrar_en_scheduler as registrar_limpieza_tokens,
+    )
+    from workers.whatsapp_worker import registrar_en_scheduler as registrar_whatsapp
 
     app = create_app()
 
@@ -193,6 +196,8 @@ if __name__ == "__main__":
             registrar_en_scheduler(sched)
         if sched:
             registrar_limpieza_tokens(sched)
+        if sched:
+            registrar_whatsapp(sched)
         atexit.register(detener_worker)  # apaga el scheduler compartido al salir
 
     debug_mode = os.getenv("FLASK_DEBUG", "false").lower() == "true"
