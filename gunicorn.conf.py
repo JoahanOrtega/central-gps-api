@@ -56,6 +56,9 @@ def post_fork(server, worker):
         try:
             from workers.poi_worker import iniciar_worker, get_scheduler
             from workers.unit_state_worker import registrar_en_scheduler
+            from workers.whatsapp_worker import (
+                registrar_en_scheduler as registrar_whatsapp,
+            )
 
             # 1. El POI worker crea el scheduler único del proceso
             iniciar_worker()
@@ -66,15 +69,17 @@ def post_fork(server, worker):
             sched = get_scheduler()
             if sched:
                 registrar_en_scheduler(sched)
+                registrar_whatsapp(sched)
             # 3. Limpieza diaria de refresh tokens — mismo scheduler compartido
             from workers.refresh_token_cleanup import (
                 registrar_en_scheduler as registrar_limpieza_tokens,
             )
+
             if sched:
                 registrar_limpieza_tokens(sched)
 
             server.log.info(
-                "Scheduler iniciado (jobs: POI + Unit State + Limpieza de Tokens) en worker pid=%s age=%s",
+                "Scheduler iniciado (jobs: POI + Unit State + Limpieza de Tokens + WhatsApp) en worker pid=%s age=%s",
                 worker.pid,
                 worker.age,
             )
