@@ -8,20 +8,8 @@ Flujo por ciclo (cada WORKER_POLL_INTERVAL segundos):
   6. Para cada unidad con vel_max: evaluar exceso de velocidad global (ev. 3/4).
   7. Insertar eventos en t_eventos (BD telemetria) y t_alertas_whatsapp (BD principal).
   8. Actualizar estado geográfico en r_poi_unidades (BD principal).
-  9. Publicar eventos en Redis → SSE → frontend.
+  9. Publicar eventos en Redis
 
-Cache in-memory (UnitStateCache):
-  El estado de cada par (unidad, POI) se mantiene en memoria entre ciclos,
-  eliminando el SELECT por par en cada ciclo. Solo se persiste en r_poi_unidades
-  al detectar un cambio de estado relevante (entrada, salida, alerta).
-
-  Ventaja:
-    - Sin cache: 100 unidades × 50 POIs = 5,000 SELECT por ciclo.
-    - Con cache: 0 SELECT por par — solo 1 SELECT de sincronización al arrancar.
-
-  Expiración:
-    Las entradas del cache expiran tras UNIT_STATE_TTL_MIN minutos de inactividad
-    (GPS no recibido). Evita que unidades dadas de baja acumulen memoria.
 
 Eventos que genera este worker:
   Sistema B (eventos de negocio, generados por evaluación del backend):
@@ -35,13 +23,8 @@ Eventos que genera este worker:
      3 — Inicio exceso de velocidad global (vel > t_unidades.vel_max)
      4 — Fin exceso de velocidad global
 
-  Sistema A (tipo_alerta del GPS Suntech — NO generados aquí):
-    33/34 — Ignición ON/OFF (los maneja oreja al parsear la trama)
-
-Separación explícita Sistema A vs Sistema B:
-  Los eventos 1,2,5,6,18,21 (motor, pánico, desconexión, inmovilizador,
-  remolcado) vienen del tipo_alerta en t_data (Sistema A — generados por
-  el hardware Suntech). Este worker SOLO genera eventos del Sistema B.
+  Sistema A (tipo_alerta del GPS Suntech):
+    33/34 — Ignición ON/OFF
 """
 
 from __future__ import annotations
@@ -439,15 +422,9 @@ _SQL_INSERT_EVENTO = """
     RETURNING id_evento
 """
 
-# Inserta en t_alertas_whatsapp para todos los destinos activos de la empresa (BD principal).
-# Si no existen destinos activos para la empresa, inserta un registro con id_destino_whatsapp = NULL.
+# Inserta en t_alertas_whatsapp para todos los destinos activos de la empresa (grupos y personas).
+# Solo destinos reales y activos; si no hay ninguno, no inserta nada.
 _SQL_INSERT_ALERTA_WHATSAPP = """
-    WITH destinos AS (
-        SELECT id_destino_whatsapp
-        FROM public.t_destinos_whatsapp
-        WHERE id_empresa = %(id_empresa)s
-          AND status = 1
-    )
     INSERT INTO public.t_alertas_whatsapp (
         id_empresa,
         id_destino_whatsapp,
@@ -463,8 +440,9 @@ _SQL_INSERT_ALERTA_WHATSAPP = """
         %(mensaje)s,
         %(fecha_evento)s,
         0
-    FROM (SELECT 1) dummy
-    LEFT JOIN destinos d ON TRUE
+    FROM public.t_destinos_whatsapp d
+    WHERE d.id_empresa = %(id_empresa)s
+      AND d.status = 1
     ON CONFLICT DO NOTHING
 """
 
@@ -566,7 +544,8 @@ def _ciclo_interno() -> None:
                     # siguiente ciclo. Loggear en debug para no generar ruido en cada ciclo.
                     logger.debug(
                         "Rollback telemetría falló leyendo GPS empresa=%s: %s",
-                        id_empresa, repr(rb_exc)
+                        id_empresa,
+                        repr(rb_exc),
                     )
                 logger.error("Error leyendo GPS empresa=%s: %s", id_empresa, repr(exc))
                 continue
@@ -1126,7 +1105,8 @@ def _insertar_evento_bd(cur_telem, conn_telem, evento: dict) -> None:
             # para correlacionar con el error principal sin duplicar alertas.
             logger.debug(
                 "Rollback telemetría falló al insertar t_eventos tipo=%s: %s",
-                evento.get("evento"), repr(rb_exc)
+                evento.get("evento"),
+                repr(rb_exc),
             )
         logger.error(
             "Error insertando en t_eventos tipo=%s id_unidad=%s: %s",

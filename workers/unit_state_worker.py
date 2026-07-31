@@ -1,7 +1,3 @@
-# ══════════════════════════════════════════════════════════════════════════════
-# unit_state_worker.py — Detección de estados críticos de unidades
-# ══════════════════════════════════════════════════════════════════════════════
-
 from __future__ import annotations
 
 import json
@@ -76,15 +72,9 @@ _SQL_ULTIMA_TELEMETRIA = """
     ORDER BY imei, fecha_hora_sistema DESC, fecha_hora_gps DESC
 """
 
-# Inserta en t_alertas_whatsapp para todos los destinos activos de la empresa (BD principal).
-# Si no existen destinos activos para la empresa, inserta un registro con id_destino_whatsapp = NULL.
+# Inserta en t_alertas_whatsapp para todos los destinos activos de la empresa (grupos y personas).
+# Solo destinos reales y activos; si no hay ninguno, no inserta nada.
 _SQL_INSERT_ALERTA_WHATSAPP = """
-    WITH destinos AS (
-        SELECT id_destino_whatsapp
-        FROM public.t_destinos_whatsapp
-        WHERE id_empresa = %(id_empresa)s
-          AND status = 1
-    )
     INSERT INTO public.t_alertas_whatsapp (
         id_empresa,
         id_destino_whatsapp,
@@ -100,8 +90,9 @@ _SQL_INSERT_ALERTA_WHATSAPP = """
         %(mensaje)s,
         %(fecha_evento)s,
         0
-    FROM (SELECT 1) dummy
-    LEFT JOIN destinos d ON TRUE
+    FROM public.t_destinos_whatsapp d
+    WHERE d.id_empresa = %(id_empresa)s
+      AND d.status = 1
     ON CONFLICT DO NOTHING
 """
 
@@ -144,7 +135,7 @@ def _ahora_naive_utc6() -> datetime:
 def _insertar_alerta_whatsapp(id_empresa: int, payload: dict) -> None:
     """
     Inserta registros de alerta para WhatsApp en t_alertas_whatsapp para
-    todos los destinos activos de la empresa.
+    todos los grupos activos de la empresa.
     """
     from utils.db_cursor import main_cursor
 

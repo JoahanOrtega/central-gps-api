@@ -1,7 +1,7 @@
 import logging
 from flask import Blueprint, jsonify, request
 from utils.real_ip import get_real_ip
-from services.auth_service import authenticate_user
+from services.auth_service import authenticate_user, ERROR_EMPRESA_SUSPENDIDA
 from services.erp_service import _registrar_auditoria
 from db.connection import get_db_connection, release_db_connection
 from services.company_service import get_user_companies
@@ -117,6 +117,13 @@ def login():
         )
 
         if error:
+            # Si la empresa del usuario está suspendida, retornamos 403 con un
+            # mensaje claro para el usuario final
+            if error == ERROR_EMPRESA_SUSPENDIDA:
+                return (
+                    jsonify({"error": error, "code": "EMPRESA_SUSPENDIDA"}),
+                    403,
+                )
             return jsonify({"error": error}), 401
 
         refresh_token_crudo, _ = generate_refresh_token()
@@ -215,12 +222,8 @@ def refresh():
         connection = get_db_connection()
         cursor = connection.cursor()
         try:
-            # Query única: datos del usuario + empresa asignada.
-            # En el modelo 1:N, id_empresa vive en t_usuarios. El LEFT JOIN
-            # a t_empresas filtra e.status=1: si la empresa del usuario fue
-            # suspendida, nombre_empresa queda NULL pero el login continúa
-            # (la política de bloqueo por empresa suspendida se maneja
-            # idealmente antes, al suspender la empresa).
+            # Cargar datos del usuario + empresa. Se hace un solo query LEFT JOIN
+            # para obtener el nombre de la empresa y su status (activa/suspendida).
             cursor.execute(
                 """
                 SELECT
@@ -231,11 +234,11 @@ def refresh():
                     u.id_rol,
                     r.clave       AS rol,
                     u.id_empresa,
-                    e.nombre      AS nombre_empresa
+                    e.nombre      AS nombre_empresa,
+                    e.status      AS empresa_status
                 FROM t_usuarios u
                 LEFT JOIN t_roles    r ON r.id_rol     = u.id_rol
                 LEFT JOIN t_empresas e ON e.id_empresa = u.id_empresa
-                                       AND e.status    = 1
                 WHERE u.id     = %s
                   AND u.status = 1
                 """,
@@ -247,6 +250,20 @@ def refresh():
                 response = jsonify({"error": "Usuario no encontrado o inactivo"})
                 return _clear_refresh_cookie(response), 401
 
+            # Validar que la empresa del usuario no esté suspendida.
+            empresa_status = user_row[len(user_row) - 1]
+            rol_usuario = user_row[5]
+            if empresa_status == 0 and rol_usuario != "sudo_erp":
+                return (
+                    jsonify(
+                        {
+                            "error": ERROR_EMPRESA_SUSPENDIDA,
+                            "code": "EMPRESA_SUSPENDIDA",
+                        }
+                    ),
+                    403,
+                )
+
             (
                 user_id,
                 username,
@@ -256,6 +273,7 @@ def refresh():
                 rol,
                 id_empresa,
                 nombre_empresa,
+                empresa_status,
             ) = user_row
 
             # Validar invariante del modelo 1:N: cualquier rol que no sea
