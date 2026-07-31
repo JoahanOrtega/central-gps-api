@@ -273,6 +273,7 @@ def refresh():
                 rol,
                 id_empresa,
                 nombre_empresa,
+                empresa_status,
             ) = user_row
 
             # Validar invariante del modelo 1:N: cualquier rol que no sea
